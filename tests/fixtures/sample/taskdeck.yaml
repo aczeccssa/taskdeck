@@ -1,0 +1,4 @@
+version: 1
+tasks:
+  ticker:
+    stop_timeout_ms: 500

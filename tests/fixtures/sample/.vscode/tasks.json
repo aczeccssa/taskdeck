@@ -1,0 +1,17 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "ticker",
+      "type": "shell",
+      "command": "while true; do echo tick; sleep 0.2; done",
+      "presentation": { "reveal": "never" }
+    },
+    {
+      "label": "one-shot",
+      "type": "process",
+      "command": "/bin/echo",
+      "args": ["taskdeck-ready"]
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+[package]
+name = "taskdeck"
+version = "0.1.0"
+edition = "2024"
+description = "One daemon for project tasks, with TUI, Web UI, CLI, and MCP controls"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8.9"
+clap = { version = "4", features = ["derive"] }
+command-group = "5.0.1"
+crossterm = "0.29"
+daemonize = "0.5"
+fs2 = "0.4"
+json5 = "0.4"
+nix = { version = "0.30", features = ["signal", "process"] }
+ratatui = { version = "0.26", features = ["crossterm"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+shell-escape = "0.1"
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+tempfile = "3"

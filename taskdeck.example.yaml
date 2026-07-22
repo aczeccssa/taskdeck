@@ -1,0 +1,20 @@
+version: 1
+session: my-project
+
+tasks:
+  # Override an existing .vscode/tasks.json task by its label.
+  Run Backend API:
+    auto_start: true
+    stop_timeout_ms: 5000
+    env:
+      ASPNETCORE_ENVIRONMENT: Development
+
+  # Add a task that does not exist in VS Code.
+  worker:
+    command: cargo
+    args: [run, --bin, worker]
+    cwd: ./services/worker
+    shell: false
+    auto_start: false
+
+  # Set enabled: false to hide an imported VS Code task.
