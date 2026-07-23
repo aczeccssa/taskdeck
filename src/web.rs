@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response as AxumResponse};
@@ -10,9 +11,10 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::daemon::{DaemonState, McpCallHistoryEntry, dispatch_async};
+use crate::cluster::{self, RemoteRequest};
+use crate::daemon::{DaemonState, McpCallHistoryEntry};
 use crate::protocol::{
-    Action, EditableTaskInput, McpCallListItem, McpCallListPage, McpCallRecord, Request, Response,
+    Action, EditableTaskInput, McpCallListItem, McpCallListPage, McpCallRecord, Response,
     casefold_search_text,
 };
 
@@ -30,6 +32,8 @@ fn app(state: DaemonState) -> Router {
         .route("/favicon.svg", get(favicon))
         .route("/favicon.ico", get(favicon))
         .route("/healthz", get(health))
+        .route("/api/agent/connect", get(agent_connect))
+        .route("/api/nodes", get(list_nodes))
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/{session}", get(session_snapshot))
         .route("/api/sessions/{session}/tasks/{task}/logs", get(task_logs))
@@ -79,6 +83,22 @@ async fn health() -> StatusCode {
     StatusCode::OK
 }
 
+async fn agent_connect(
+    State(state): State<DaemonState>,
+    upgrade: WebSocketUpgrade,
+) -> AxumResponse {
+    if !state
+        .public_settings()
+        .role
+        .eq(&crate::state::NodeRole::Leader)
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    upgrade
+        .on_upgrade(move |socket| cluster::serve_agent_socket(state.cluster.clone(), socket))
+        .into_response()
+}
+
 async fn favicon() -> impl IntoResponse {
     (
         [
@@ -89,8 +109,40 @@ async fn favicon() -> impl IntoResponse {
     )
 }
 
-async fn list_sessions(State(state): State<DaemonState>) -> Json<Response> {
-    Json(dispatch_async(state, Request::ListSessions).await)
+async fn list_nodes(State(state): State<DaemonState>) -> Json<Response> {
+    Json(Response::ok("nodes", state.node_summaries()))
+}
+
+fn selected_node(
+    state: &DaemonState,
+    query: &HashMap<String, String>,
+) -> std::result::Result<String, Response> {
+    if let Some(node) = query.get("node").filter(|node| !node.trim().is_empty()) {
+        return Ok(node.clone());
+    }
+    if state.public_settings().role == crate::state::NodeRole::Worker {
+        Ok("self".to_string())
+    } else {
+        Err(Response::error_with_data(
+            "node is required for leader requests",
+            json!({"kind": "validation_error", "status": 400}),
+        ))
+    }
+}
+
+async fn list_sessions(
+    State(state): State<DaemonState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Response> {
+    let node = match selected_node(&state, &query) {
+        Ok(node) => node,
+        Err(response) => return Json(response),
+    };
+    Json(
+        state
+            .dispatch_node(&node, RemoteRequest::ListSessions)
+            .await,
+    )
 }
 
 async fn session_snapshot(
@@ -98,8 +150,16 @@ async fn session_snapshot(
     Path(session): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Json<Response> {
+    let node = match selected_node(&state, &query) {
+        Ok(node) => node,
+        Err(response) => return Json(response),
+    };
     let tail = query.get("tail").and_then(|value| value.parse().ok());
-    Json(dispatch_async(state, Request::Snapshot { session, tail }).await)
+    Json(
+        state
+            .dispatch_node(&node, RemoteRequest::Snapshot { session, tail })
+            .await,
+    )
 }
 
 async fn task_logs(
@@ -107,6 +167,10 @@ async fn task_logs(
     Path((session, task)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Json<Response> {
+    let node = match selected_node(&state, &query) {
+        Ok(node) => node,
+        Err(response) => return Json(response),
+    };
     let after = match query.get("after") {
         Some(value) => match value.parse::<u64>() {
             Ok(value) => Some(value),
@@ -132,16 +196,17 @@ async fn task_logs(
         None => 1_000,
     };
     Json(
-        dispatch_async(
-            state,
-            Request::TaskLogs {
-                session,
-                task,
-                after,
-                limit,
-            },
-        )
-        .await,
+        state
+            .dispatch_node(
+                &node,
+                RemoteRequest::TaskLogs {
+                    session,
+                    task,
+                    after,
+                    limit,
+                },
+            )
+            .await,
     )
 }
 
@@ -170,28 +235,42 @@ async fn task_metrics(
     Path((session, task)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Json<Response> {
+    let node = match selected_node(&state, &query) {
+        Ok(node) => node,
+        Err(response) => return Json(response),
+    };
     let window_seconds = match parse_metrics_window_seconds(&query) {
         Ok(window_seconds) => window_seconds,
         Err(response) => return Json(response),
     };
     Json(
-        dispatch_async(
-            state,
-            Request::TaskMetrics {
-                session,
-                task,
-                window_seconds,
-            },
-        )
-        .await,
+        state
+            .dispatch_node(
+                &node,
+                RemoteRequest::TaskMetrics {
+                    session,
+                    task,
+                    window_seconds,
+                },
+            )
+            .await,
     )
 }
 
 async fn session_config(
     State(state): State<DaemonState>,
     Path(session): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Json<Response> {
-    Json(dispatch_async(state, Request::GetSessionConfig { session }).await)
+    let node = match selected_node(&state, &query) {
+        Ok(node) => node,
+        Err(response) => return Json(response),
+    };
+    Json(
+        state
+            .dispatch_node(&node, RemoteRequest::GetSessionConfig { session })
+            .await,
+    )
 }
 
 #[derive(Deserialize)]
@@ -203,39 +282,57 @@ struct UpdateSessionConfigBody {
 async fn update_session_config(
     State(state): State<DaemonState>,
     Path(session): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
     Json(body): Json<UpdateSessionConfigBody>,
 ) -> Json<Response> {
+    let node = match selected_node(&state, &query) {
+        Ok(node) => node,
+        Err(response) => return Json(response),
+    };
     Json(
-        dispatch_async(
-            state,
-            Request::PutSessionConfig {
-                session,
-                revision: body.revision,
-                tasks: body.tasks,
-            },
-        )
-        .await,
+        state
+            .dispatch_node(
+                &node,
+                RemoteRequest::PutSessionConfig {
+                    session,
+                    revision: body.revision,
+                    tasks: body.tasks,
+                },
+            )
+            .await,
     )
 }
 
 #[derive(Deserialize)]
 struct ActionBody {
+    node: Option<String>,
     session: String,
     task: Option<String>,
     action: Action,
 }
 
 async fn action(State(state): State<DaemonState>, Json(body): Json<ActionBody>) -> Json<Response> {
+    let node = match body.node {
+        Some(node) if !node.trim().is_empty() => node,
+        _ if state.public_settings().role == crate::state::NodeRole::Worker => "self".to_string(),
+        _ => {
+            return Json(Response::error_with_data(
+                "node is required for leader actions",
+                json!({"kind": "validation_error", "status": 400}),
+            ));
+        }
+    };
     Json(
-        dispatch_async(
-            state,
-            Request::Action {
-                session: body.session,
-                task: body.task,
-                action: body.action,
-            },
-        )
-        .await,
+        state
+            .dispatch_node(
+                &node,
+                RemoteRequest::Action {
+                    session: body.session,
+                    task: body.task,
+                    action: body.action,
+                },
+            )
+            .await,
     )
 }
 
@@ -459,10 +556,14 @@ async fn mcp(State(state): State<DaemonState>, Json(rpc): Json<Value>) -> AxumRe
             "protocolVersion": "2025-03-26",
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "taskdeck", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "Use taskdeck_control to inspect and control tasks by global session name."
+            "instructions": if state.public_settings().role == crate::state::NodeRole::Leader {
+                "Use taskdeck_control with an explicit node to inspect and control this Taskdeck cluster."
+            } else {
+                "Use taskdeck_control to inspect and control tasks on this local Taskdeck worker."
+            }
         }),
         "ping" => json!({}),
-        "tools/list" => json!({"tools": [mcp_tool_definition()]}),
+        "tools/list" => json!({"tools": [mcp_tool_definition(&state)]}),
         "tools/call" => {
             let params = rpc.get("params").cloned().unwrap_or_else(|| json!({}));
             match call_mcp_tool(state.clone(), params).await {
@@ -510,26 +611,49 @@ async fn mcp(State(state): State<DaemonState>, Json(rpc): Json<Value>) -> AxumRe
     Json(response).into_response()
 }
 
-fn mcp_tool_definition() -> Value {
-    json!({
-        "name": "taskdeck_control",
-        "description": "List Taskdeck sessions, inspect task status/logs, or control one task/all tasks in a session.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["sessions", "status", "logs", "start", "stop", "restart", "pause", "resume"],
-                    "description": "Operation to perform."
+fn mcp_tool_definition(state: &DaemonState) -> Value {
+    if state.public_settings().role == crate::state::NodeRole::Leader {
+        json!({
+            "name": "taskdeck_control",
+            "description": "Inspect nodes, sessions, and discovered services or control a task on this Taskdeck cluster.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["nodes", "sessions", "services", "status", "logs", "start", "stop", "restart", "pause", "resume"],
+                        "description": "Cluster operation to perform."
+                    },
+                    "node": {"type": "string", "description": "Node ID. Required for targeted operations; use self for this standard leader."},
+                    "session": {"type": "string", "description": "Session name on the selected node."},
+                    "task": {"type": "string", "description": "Task label. Omit to target every task in a session."},
+                    "tail": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 200}
                 },
-                "session": {"type": "string", "description": "Global session name; required except for sessions."},
-                "task": {"type": "string", "description": "Task label. Omit for all tasks or a full session snapshot."},
-                "tail": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 200}
-            },
-            "required": ["action"],
-            "additionalProperties": false
-        }
-    })
+                "required": ["action"],
+                "additionalProperties": false
+            }
+        })
+    } else {
+        json!({
+            "name": "taskdeck_control",
+            "description": "List local Taskdeck sessions, inspect task status/logs, or control one local task/all tasks in a session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["sessions", "status", "logs", "start", "stop", "restart", "pause", "resume"],
+                        "description": "Local operation to perform."
+                    },
+                    "session": {"type": "string", "description": "Local session name; required except for sessions."},
+                    "task": {"type": "string", "description": "Task label. Omit for all tasks or a full session snapshot."},
+                    "tail": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 200}
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }
+        })
+    }
 }
 
 async fn call_mcp_tool(state: DaemonState, params: Value) -> std::result::Result<Value, String> {
@@ -544,6 +668,11 @@ async fn call_mcp_tool(state: DaemonState, params: Value) -> std::result::Result
         .get("action")
         .and_then(Value::as_str)
         .ok_or_else(|| "action is required".to_string())?;
+    let is_leader = state.public_settings().role == crate::state::NodeRole::Leader;
+    if !is_leader && arguments.get("node").is_some() {
+        return Err("worker MCP is local-only and does not accept node".to_string());
+    }
+    let node = arguments.get("node").and_then(Value::as_str);
     let session = arguments.get("session").and_then(Value::as_str);
     let task = arguments
         .get("task")
@@ -553,35 +682,76 @@ async fn call_mcp_tool(state: DaemonState, params: Value) -> std::result::Result
         .get("tail")
         .and_then(Value::as_u64)
         .map(|v| v as usize);
-    let request = match operation {
-        "sessions" => Request::ListSessions,
-        "status" | "logs" => Request::Snapshot {
-            session: session
-                .ok_or_else(|| "session is required".to_string())?
-                .to_string(),
-            tail: Some(if operation == "status" {
-                20
+    let response = match operation {
+        "nodes" if is_leader => Response::ok("nodes", state.node_summaries()),
+        "sessions" if is_leader && node.is_none() => {
+            let rows = state
+                .node_summaries()
+                .into_iter()
+                .flat_map(|node| {
+                    node.sessions.into_iter().map(move |session| {
+                        json!({"node": node.id, "node_name": node.name, "session": session, "online": node.online})
+                    })
+                })
+                .collect::<Vec<_>>();
+            Response::ok("cluster sessions", rows)
+        }
+        "services" if is_leader => Response::ok("services", state.service_rows(node)),
+        "sessions" => {
+            state
+                .dispatch_node(node.unwrap_or("self"), RemoteRequest::ListSessions)
+                .await
+        }
+        "status" | "logs" => {
+            let node = if is_leader {
+                node.ok_or_else(|| "node is required for targeted leader operations".to_string())?
             } else {
-                tail.unwrap_or(200)
-            }),
-        },
-        "start" | "stop" | "restart" | "pause" | "resume" => Request::Action {
-            session: session
-                .ok_or_else(|| "session is required".to_string())?
-                .to_string(),
-            task,
-            action: match operation {
-                "start" => Action::Start,
-                "stop" => Action::Stop,
-                "restart" => Action::Restart,
-                "pause" => Action::Pause,
-                "resume" => Action::Resume,
-                _ => unreachable!(),
-            },
-        },
+                "self"
+            };
+            state
+                .dispatch_node(
+                    node,
+                    RemoteRequest::Snapshot {
+                        session: session
+                            .ok_or_else(|| "session is required".to_string())?
+                            .to_string(),
+                        tail: Some(if operation == "status" {
+                            20
+                        } else {
+                            tail.unwrap_or(200)
+                        }),
+                    },
+                )
+                .await
+        }
+        "start" | "stop" | "restart" | "pause" | "resume" => {
+            let node = if is_leader {
+                node.ok_or_else(|| "node is required for targeted leader operations".to_string())?
+            } else {
+                "self"
+            };
+            state
+                .dispatch_node(
+                    node,
+                    RemoteRequest::Action {
+                        session: session
+                            .ok_or_else(|| "session is required".to_string())?
+                            .to_string(),
+                        task,
+                        action: match operation {
+                            "start" => Action::Start,
+                            "stop" => Action::Stop,
+                            "restart" => Action::Restart,
+                            "pause" => Action::Pause,
+                            "resume" => Action::Resume,
+                            _ => unreachable!(),
+                        },
+                    },
+                )
+                .await
+        }
         _ => return Err(format!("unsupported action: {operation}")),
     };
-    let response = dispatch_async(state, request).await;
     let text = serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?;
     Ok(json!({
         "content": [{"type": "text", "text": text}],
@@ -616,9 +786,32 @@ mod tests {
 
     #[test]
     fn mcp_exposes_one_control_tool() {
-        let tool = mcp_tool_definition();
+        let state = DaemonState::new();
+        let tool = mcp_tool_definition(&state);
         assert_eq!(tool["name"], "taskdeck_control");
         assert_eq!(tool["inputSchema"]["required"][0], "action");
+        assert!(tool["inputSchema"]["properties"].get("node").is_none());
+    }
+
+    #[test]
+    fn leader_mcp_schema_exposes_cluster_targeting() {
+        let state = DaemonState::new();
+        let settings = state
+            .store
+            .configure(crate::state::NodeSettingsUpdate {
+                role: Some(crate::state::NodeRole::Leader),
+                ..crate::state::NodeSettingsUpdate::default()
+            })
+            .unwrap();
+        *state.settings.lock().expect("node settings lock") = settings;
+        let tool = mcp_tool_definition(&state);
+        assert!(tool["inputSchema"]["properties"].get("node").is_some());
+        assert!(
+            tool["inputSchema"]["properties"]["action"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("nodes"))
+        );
     }
 
     #[test]
@@ -637,7 +830,8 @@ mod tests {
         assert!(APP_JS.contains("/api/mcp-calls"));
         assert!(APP_JS.contains("/config"));
         assert!(APP_JS.contains("/logs?"));
-        assert!(APP_JS.contains("/metrics?window=600"));
+        assert!(INDEX_HTML.contains("id=\"nodes\""));
+        assert!(APP_JS.contains("new URLSearchParams({ window: \"600\" })"));
         assert!(APP_JS.contains("requestFullscreen"));
         assert!(APP_JS.contains("taskdeck-log-tail"));
         assert!(FAVICON_SVG.contains("<svg"));

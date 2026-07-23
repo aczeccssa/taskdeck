@@ -13,8 +13,10 @@ use nix::unistd::Pid;
 
 use crate::config::{ProjectDefinition, TaskSpec};
 use crate::protocol::{
-    Action, LogLine, SessionSnapshot, TaskLogsSnapshot, TaskSnapshot, TaskStatus,
+    Action, LogLine, ServiceEndpoint, ServiceInspectionState, ServiceObservation, SessionSnapshot,
+    TaskLogsSnapshot, TaskSnapshot, TaskStatus,
 };
+use crate::service;
 
 const MAX_LOG_LINES: usize = 5_000;
 static NEXT_LOG_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -93,10 +95,12 @@ pub struct TaskRuntime {
     start_generation: u64,
     last_exit: Option<String>,
     logs: Arc<Mutex<LogBuffer>>,
+    service: ServiceObservation,
 }
 
 impl TaskRuntime {
     fn new(spec: TaskSpec) -> Self {
+        let service = service::infer_service(&spec);
         Self {
             spec,
             status: TaskStatus::Idle,
@@ -105,11 +109,19 @@ impl TaskRuntime {
             start_generation: 0,
             last_exit: None,
             logs: Arc::new(Mutex::new(LogBuffer::default())),
+            service,
         }
     }
 
     fn push_system(&self, text: impl Into<String>) {
         self.logs.lock().expect("log lock").push("system", text);
+    }
+
+    fn reset_runtime_service(&mut self, inspection: ServiceInspectionState) {
+        self.service
+            .endpoints
+            .retain(|endpoint| endpoint.source == "config");
+        self.service.inspection = inspection;
     }
 
     fn start(&mut self) -> Result<()> {
@@ -123,6 +135,7 @@ impl TaskRuntime {
                 self.spec.cwd.display()
             );
         }
+        self.reset_runtime_service(ServiceInspectionState::Pending);
 
         let rendered = self.spec.display_command();
         self.push_system(format!("starting: {rendered}"));
@@ -209,6 +222,7 @@ impl TaskRuntime {
         let Some(mut child) = self.child.take() else {
             self.status = TaskStatus::Idle;
             self.pid = None;
+            self.reset_runtime_service(ServiceInspectionState::NotRunning);
             return Ok(());
         };
         let pgid = child.id() as i32;
@@ -229,6 +243,7 @@ impl TaskRuntime {
         };
         self.pid = None;
         self.status = TaskStatus::Idle;
+        self.reset_runtime_service(ServiceInspectionState::NotRunning);
         self.last_exit = Some(status.to_string());
         self.push_system(format!("stopped ({status})"));
         Ok(())
@@ -250,6 +265,7 @@ impl TaskRuntime {
                 TaskStatus::Failed
             };
             self.pid = None;
+            self.reset_runtime_service(ServiceInspectionState::NotRunning);
             self.last_exit = Some(status.to_string());
             self.logs
                 .lock()
@@ -273,14 +289,45 @@ impl TaskRuntime {
     fn update_spec(&mut self, spec: TaskSpec) {
         if self.spec != spec {
             self.spec = spec;
+            self.service = service::infer_service(&self.spec);
             self.push_system("configuration updated; changes apply on next start");
         }
+    }
+
+    fn set_service_observation(
+        &mut self,
+        endpoints: Vec<ServiceEndpoint>,
+        inspection: ServiceInspectionState,
+    ) {
+        self.service
+            .endpoints
+            .retain(|endpoint| endpoint.source == "config");
+        if !endpoints.is_empty() {
+            self.service.endpoints.extend(endpoints);
+            self.service.classification = crate::protocol::ServiceClassification::Service;
+        }
+        self.service.inspection = inspection;
     }
 
     fn snapshot(&mut self, tail: usize) -> Result<TaskSnapshot> {
         self.poll()?;
         let logs = self.logs.lock().expect("log lock");
         let skip = logs.lines.len().saturating_sub(tail);
+        let mut service = self.service.clone();
+        if !service
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.state == "listening")
+        {
+            service.endpoints.extend(service::endpoints_from_logs(
+                logs.lines
+                    .iter()
+                    .rev()
+                    .take(100)
+                    .map(|line| line.text.as_str()),
+            ));
+            service::deduplicate_endpoints(&mut service.endpoints);
+        }
         Ok(TaskSnapshot {
             label: self.spec.label.clone(),
             status: self.status.clone(),
@@ -290,6 +337,7 @@ impl TaskRuntime {
             auto_start: self.spec.auto_start,
             last_exit: self.last_exit.clone(),
             logs: logs.lines.iter().skip(skip).cloned().collect(),
+            service,
         })
     }
 
@@ -371,6 +419,17 @@ impl SessionRuntime {
                 (label.clone(), pid, task.start_generation)
             })
             .collect()
+    }
+
+    pub fn set_service_observation(
+        &mut self,
+        label: &str,
+        endpoints: Vec<ServiceEndpoint>,
+        inspection: ServiceInspectionState,
+    ) {
+        if let Some(task) = self.tasks.get_mut(label) {
+            task.set_service_observation(endpoints, inspection);
+        }
     }
 
     pub fn auto_start(&mut self) {
@@ -512,9 +571,22 @@ mod tests {
         assert_eq!(task.status, TaskStatus::Running);
         task.restart().unwrap();
         assert_eq!(task.status, TaskStatus::Running);
+        task.set_service_observation(
+            vec![ServiceEndpoint {
+                bind_host: "127.0.0.1".to_string(),
+                port: 41023,
+                protocol: "tcp".to_string(),
+                pid: task.pid,
+                source: "socket".to_string(),
+                state: "listening".to_string(),
+            }],
+            ServiceInspectionState::Listening,
+        );
         task.stop().unwrap();
         assert_eq!(task.status, TaskStatus::Idle);
         assert!(task.pid.is_none());
+        assert_eq!(task.service.inspection, ServiceInspectionState::NotRunning);
+        assert!(task.service.endpoints.is_empty());
     }
 
     #[test]

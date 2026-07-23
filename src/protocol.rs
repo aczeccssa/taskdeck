@@ -39,6 +39,62 @@ pub struct TaskLogsSnapshot {
     pub lines: Vec<LogLine>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceClassification {
+    Service,
+    Process,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceConfidence {
+    High,
+    Medium,
+    Low,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TechnologyProfile {
+    pub runtime: Option<String>,
+    pub framework: Option<String>,
+    pub confidence: ServiceConfidence,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceEndpoint {
+    pub bind_host: String,
+    pub port: u16,
+    pub protocol: String,
+    pub pid: Option<u32>,
+    pub source: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceInspectionState {
+    Listening,
+    NoListener,
+    NotRunning,
+    Unsupported,
+    #[default]
+    Pending,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ServiceObservation {
+    pub classification: ServiceClassification,
+    pub technology: TechnologyProfile,
+    pub endpoints: Vec<ServiceEndpoint>,
+    pub inspection: ServiceInspectionState,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskSnapshot {
     pub label: String,
@@ -49,6 +105,8 @@ pub struct TaskSnapshot {
     pub auto_start: bool,
     pub last_exit: Option<String>,
     pub logs: Vec<LogLine>,
+    #[serde(default)]
+    pub service: ServiceObservation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +115,18 @@ pub struct SessionSnapshot {
     pub project: PathBuf,
     pub source: String,
     pub tasks: BTreeMap<String, TaskSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeSummary {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub mode: String,
+    pub online: bool,
+    pub is_self: bool,
+    pub last_seen_ms: Option<u64>,
+    pub sessions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -250,7 +320,7 @@ pub enum Request {
     Shutdown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Response {
     pub ok: bool,
     pub message: String,

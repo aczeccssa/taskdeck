@@ -5,13 +5,17 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
 const state = {
   view: "tasks",
+  nodes: [],
+  nodesSignature: "",
   sessions: [],
   sessionsSignature: "",
   snapshot: null,
+  snapshotNode: null,
   currentTask: null,
   renderedTask: null,
   tabsSignature: "",
   headerSignature: "",
+  nodesRequest: 0,
   sessionsRequest: 0,
   snapshotRequest: 0,
   metricsRequest: 0,
@@ -39,6 +43,7 @@ const state = {
   callsDebounce: null,
   config: null,
   configSession: null,
+  configNode: null,
   configTasks: [],
   configTaskIndex: 0,
   configSaving: false,
@@ -75,7 +80,10 @@ function showToast(message) {
   toast.textContent = message;
   toast.classList.add("visible");
   clearTimeout(state.toastTimer);
-  state.toastTimer = setTimeout(() => toast.classList.remove("visible"), 2200);
+  state.toastTimer = setTimeout(() => {
+    toast.classList.remove("visible");
+    toast.textContent = "";
+  }, 2200);
 }
 
 function setConnection(connected) {
@@ -119,9 +127,54 @@ function setView(view) {
     panel.classList.toggle("active", active);
   });
   $("#sessions").hidden = view !== "tasks";
+  $("#nodes").hidden = view !== "tasks";
   $("#page-title").textContent = view === "calls" ? "MCP Calls" : view === "docs" ? "MCP Guide" : "Task workspace";
   if (view === "calls") loadMcpCalls();
   updateMeta();
+}
+
+function selectedNode() {
+  return $("#nodes").value;
+}
+
+function selectedNodeState() {
+  return state.nodes.find((node) => node.id === selectedNode()) || null;
+}
+
+function addNodeQuery(query = new URLSearchParams()) {
+  const node = selectedNode();
+  if (node) query.set("node", node);
+  return query;
+}
+
+async function loadNodes() {
+  const requestId = ++state.nodesRequest;
+  try {
+    const response = await requestJson("/api/nodes");
+    if (requestId !== state.nodesRequest) return;
+    if (!response.ok) throw new Error(response.message);
+    const nodes = response.data || [];
+    const select = $("#nodes");
+    const selected = select.value;
+    state.nodes = nodes;
+    const signature = JSON.stringify(nodes);
+    if (signature !== state.nodesSignature) {
+      state.nodesSignature = signature;
+      select.innerHTML = nodes.length
+        ? nodes.map((node) => `<option value="${escapeAttr(node.id)}">${escapeHtml(node.is_self ? `This device · ${node.name}` : `${node.name}${node.online ? "" : " · offline"}`)}</option>`).join("")
+        : '<option value="">No nodes</option>';
+      state.headerSignature = "";
+    }
+    if (nodes.some((node) => node.id === selected)) select.value = selected;
+    else if (nodes.length) select.value = nodes[0].id;
+    if (state.snapshot && state.snapshotNode === select.value) renderTask();
+    await loadSessions();
+    setConnection(true);
+  } catch (error) {
+    if (requestId !== state.nodesRequest) return;
+    setConnection(false);
+    if (state.view === "tasks") $("#meta").textContent = error.message || "Daemon unavailable";
+  }
 }
 
 function updateMeta() {
@@ -139,9 +192,39 @@ function updateMeta() {
 
 async function loadSessions() {
   const requestId = ++state.sessionsRequest;
+  const node = selectedNode();
+  let daemonReached = false;
+  if (!node) {
+    clearWorkspace();
+    return;
+  }
+  const nodeState = selectedNodeState();
+  if (nodeState?.online === false) {
+    const sessions = nodeState.sessions || [];
+    const select = $("#sessions");
+    const selected = select.value;
+    state.sessions = sessions;
+    state.sessionsSignature = JSON.stringify(sessions);
+    select.innerHTML = sessions.length
+      ? sessions.map((name) => `<option value="${escapeAttr(name)}">${escapeHtml(name)}</option>`).join("")
+      : '<option value="">No cached sessions</option>';
+    if (sessions.includes(selected)) select.value = selected;
+    else if (sessions.length) select.value = sessions[0];
+    setConnection(true);
+    if (state.snapshot && state.snapshotNode === node) {
+      renderTask();
+    } else {
+      clearWorkspace();
+      const lastSeen = nodeState.last_seen_ms ? new Date(nodeState.last_seen_ms).toLocaleString() : "Unknown";
+      $("#task-pane").innerHTML = `<div class="empty-state"><div><h1>Worker offline</h1><p>Last seen ${escapeHtml(lastSeen)}</p></div></div>`;
+    }
+    $("#meta").textContent = `${nodeState.name} is offline`;
+    return;
+  }
   try {
-    const response = await requestJson("/api/sessions");
-    if (requestId !== state.sessionsRequest) return;
+    const response = await requestJson(`/api/sessions?${addNodeQuery()}`);
+    daemonReached = true;
+    if (requestId !== state.sessionsRequest || selectedNode() !== node) return;
     if (!response.ok) throw new Error(response.message);
     const sessions = response.data || [];
     const select = $("#sessions");
@@ -157,7 +240,7 @@ async function loadSessions() {
     if (sessions.includes(selected)) select.value = selected;
     else if (sessions.length) select.value = sessions[0];
     setConnection(true);
-    if (sessions.length && (!state.snapshot || state.snapshot.name !== select.value)) {
+    if (sessions.length && (!state.snapshot || state.snapshot.name !== select.value || state.snapshotNode !== node)) {
       state.currentTask = null;
       state.renderedTask = null;
       await loadSnapshot();
@@ -165,9 +248,9 @@ async function loadSessions() {
       clearWorkspace();
     }
   } catch (error) {
-    if (requestId !== state.sessionsRequest) return;
-    setConnection(false);
-    if (state.view === "tasks") $("#meta").textContent = "Daemon unavailable";
+    if (requestId !== state.sessionsRequest || selectedNode() !== node) return;
+    setConnection(daemonReached);
+    if (state.view === "tasks") $("#meta").textContent = daemonReached ? error.message : "Daemon unavailable";
   }
 }
 
@@ -176,6 +259,7 @@ function clearWorkspace() {
   state.metricsRequest += 1;
   state.logsRequest += 1;
   state.snapshot = null;
+  state.snapshotNode = null;
   state.currentTask = null;
   state.renderedTask = null;
   state.metrics = null;
@@ -189,13 +273,16 @@ function clearWorkspace() {
 
 async function loadSnapshot() {
   const session = $("#sessions").value;
-  if (!session) return;
+  const node = selectedNode();
+  if (!session || !node) return;
   const requestId = ++state.snapshotRequest;
   try {
-    const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}?tail=0`);
-    if (requestId !== state.snapshotRequest || $("#sessions").value !== session) return;
+    const query = addNodeQuery(new URLSearchParams({ tail: "0" }));
+    const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}?${query}`);
+    if (requestId !== state.snapshotRequest || $("#sessions").value !== session || selectedNode() !== node) return;
     if (!response.ok) throw new Error(response.message);
     state.snapshot = response.data;
+    state.snapshotNode = node;
     const labels = Object.keys(state.snapshot.tasks || {});
     if (!labels.includes(state.currentTask)) {
       state.currentTask = labels[0] || null;
@@ -249,7 +336,7 @@ function ensureTaskScaffold() {
         </div>
         <div class="logs" id="logs" tabindex="0"></div>
       </section>
-      <aside class="monitor-panel" id="monitor-panel" aria-label="Worker performance">
+      <aside class="monitor-panel" id="monitor-panel" aria-label="Task performance">
         <header class="monitor-header"><strong>Performance</strong><span id="monitor-state">Waiting</span></header>
         <div class="monitor-body" id="monitor-body"><div class="monitor-empty">No samples</div></div>
       </aside>
@@ -272,7 +359,10 @@ function renderTask() {
 
 function renderTaskHeader(task) {
   const status = task.status || "unknown";
-  const signature = JSON.stringify([state.currentTask, status, task.pid, task.cwd, task.label]);
+  const service = task.service || {};
+  const node = selectedNodeState();
+  const online = node?.online !== false;
+  const signature = JSON.stringify([state.currentTask, status, task.pid, task.cwd, task.label, service, online]);
   if (signature === state.headerSignature) {
     applyWorkspaceMode();
     return;
@@ -284,20 +374,29 @@ function renderTaskHeader(task) {
   const canPause = status === "running";
   const canResume = status === "paused";
   const canStop = ["running", "paused"].includes(status);
+  const technology = service.technology || {};
+  const technologyLabel = technology.framework || technology.runtime || "";
+  const endpointMarkup = (service.endpoints || []).map((endpoint) => {
+    const label = `${endpoint.bind_host}:${endpoint.port}`;
+    const isLink = endpoint.state === "listening" && ["http", "https"].includes(endpoint.protocol);
+    return isLink
+      ? `<a class="endpoint-chip listening" href="${escapeAttr(`${endpoint.protocol}://${endpoint.bind_host}:${endpoint.port}`)}" target="_blank" rel="noreferrer">${escapeHtml(label)}</a>`
+      : `<span class="endpoint-chip ${escapeAttr(endpoint.state || "")}" title="${escapeAttr(`${endpoint.source || "unknown"} · ${endpoint.state || "unknown"}`)}">${escapeHtml(label)}</span>`;
+  }).join("");
   $("#task-header").innerHTML = `
-    <div class="task-heading"><div class="eyebrow">Selected task</div><h1>${escapeHtml(task.label)}</h1><div class="task-detail"><span class="status ${escapeAttr(status)}">${escapeHtml(status)}</span>${task.pid ? `<span>PID ${task.pid}</span>` : ""}<span class="cwd">${escapeHtml(task.cwd)}</span></div></div>
+    <div class="task-heading"><div class="eyebrow">${online ? "Selected task" : "Offline snapshot"}</div><h1>${escapeHtml(task.label)}</h1><div class="task-detail"><span class="status ${escapeAttr(status)}">${escapeHtml(status)}</span>${task.pid ? `<span>PID ${task.pid}</span>` : ""}${technologyLabel ? `<span class="technology-chip" title="${escapeAttr((technology.evidence || []).join(" · "))}">${escapeHtml(technologyLabel)}</span>` : ""}${endpointMarkup}<span class="cwd">${escapeHtml(task.cwd)}</span></div></div>
     <div class="view-modes" aria-label="Workspace layout">
       <button class="mobile-log-mode" type="button" data-mode="log">Logs</button>
       <button class="desktop-split-mode" type="button" data-mode="split">Split</button>
       <button type="button" data-mode="monitor">Monitor</button>
     </div>
     <div class="actions">
-      <button class="button primary" type="button" data-action="start" ${canStart ? "" : "disabled"}>${icons.play}Start</button>
-      <button class="button" type="button" data-action="pause" ${canPause ? "" : "disabled"}>${icons.pause}Pause</button>
-      <button class="button" type="button" data-action="resume" ${canResume ? "" : "disabled"}>${icons.play}Resume</button>
-      <button class="button" type="button" data-action="restart">${icons.restart}Restart</button>
-      <button class="button danger" type="button" data-action="stop" ${canStop ? "" : "disabled"}>${icons.stop}Stop</button>
-      <button class="icon-button" type="button" data-config aria-label="Edit configuration" title="Edit configuration">${icons.settings}</button>
+      <button class="button primary" type="button" data-action="start" ${online && canStart ? "" : "disabled"}>${icons.play}Start</button>
+      <button class="button" type="button" data-action="pause" ${online && canPause ? "" : "disabled"}>${icons.pause}Pause</button>
+      <button class="button" type="button" data-action="resume" ${online && canResume ? "" : "disabled"}>${icons.play}Resume</button>
+      <button class="button" type="button" data-action="restart" ${online ? "" : "disabled"}>${icons.restart}Restart</button>
+      <button class="button danger" type="button" data-action="stop" ${online && canStop ? "" : "disabled"}>${icons.stop}Stop</button>
+      <button class="icon-button" type="button" data-config aria-label="Edit configuration" title="Edit configuration" ${online ? "" : "disabled"}>${icons.settings}</button>
     </div>`;
   applyWorkspaceMode();
   if (focusSelector) $(focusSelector, $("#task-header"))?.focus();
@@ -345,8 +444,9 @@ function resetLogCursor() {
 async function loadLogs() {
   const session = $("#sessions").value;
   const task = state.currentTask;
-  if (!session || !task) return;
-  const context = `${session}\u0000${task}\u0000${state.tail}`;
+  const node = selectedNode();
+  if (!session || !task || !node) return;
+  const context = `${node}\u0000${session}\u0000${task}\u0000${state.tail}`;
   if (state.logContext !== context) {
     state.logContext = context;
     state.logLines = [];
@@ -354,11 +454,11 @@ async function loadLogs() {
     state.lastLogSeq = null;
   }
   const requestId = ++state.logsRequest;
-  const query = new URLSearchParams({ limit: String(state.tail) });
+  const query = addNodeQuery(new URLSearchParams({ limit: String(state.tail) }));
   if (state.lastLogSeq != null) query.set("after", String(state.lastLogSeq));
   try {
     const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}/tasks/${encodeURIComponent(task)}/logs?${query}`);
-    if (requestId !== state.logsRequest || $("#sessions").value !== session || state.currentTask !== task || state.logContext !== context) return;
+    if (requestId !== state.logsRequest || selectedNode() !== node || $("#sessions").value !== session || state.currentTask !== task || state.logContext !== context) return;
     if (!response.ok) throw new Error(response.message);
     const payload = response.data || { generation: null, reset: false, lines: [] };
     const generationChanged = state.logGeneration != null && payload.generation !== state.logGeneration;
@@ -573,13 +673,14 @@ function setWorkspaceMode(mode) {
 async function act(action, button) {
   const session = state.snapshot?.name;
   const task = state.currentTask;
-  if (!session || !task || $("#sessions").value !== session || button.disabled) return;
+  const node = selectedNode();
+  if (!node || !session || !task || $("#sessions").value !== session || button.disabled) return;
   button.disabled = true;
   try {
     const response = await requestJson("/api/action", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ session, task, action }),
+      body: JSON.stringify({ node, session, task, action }),
     });
     if (!response.ok) throw new Error(response.message);
     if ($("#sessions").value === session && state.currentTask === task) await loadSnapshot();
@@ -593,11 +694,13 @@ async function act(action, button) {
 async function loadMetrics() {
   const session = $("#sessions").value;
   const task = state.currentTask;
-  if (!session || !task) return;
+  const node = selectedNode();
+  if (!node || !session || !task) return;
   const requestId = ++state.metricsRequest;
   try {
-    const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}/tasks/${encodeURIComponent(task)}/metrics?window=600`);
-    if (requestId !== state.metricsRequest || $("#sessions").value !== session || state.currentTask !== task) return;
+    const query = addNodeQuery(new URLSearchParams({ window: "600" }));
+    const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}/tasks/${encodeURIComponent(task)}/metrics?${query}`);
+    if (requestId !== state.metricsRequest || selectedNode() !== node || $("#sessions").value !== session || state.currentTask !== task) return;
     if (!response.ok) throw new Error(response.message);
     state.metrics = response.data;
     renderMetrics();
@@ -774,11 +877,13 @@ async function loadConfig(session, confirmDiscard) {
   const requestId = ++state.configRequest;
   showConfigMessage("Loading configuration...");
   try {
-    const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}/config`);
-    if (requestId !== state.configRequest || !$("#config-dialog").open || $("#sessions").value !== session) return;
+    const node = selectedNode();
+    const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}/config?${addNodeQuery()}`);
+    if (requestId !== state.configRequest || !$("#config-dialog").open || $("#sessions").value !== session || selectedNode() !== node) return;
     if (!response.ok) throw new Error(response.message);
     state.config = response.data;
     state.configSession = session;
+    state.configNode = node;
     state.configTasks = (response.data.tasks || []).map(taskToDraft);
     state.configTaskIndex = Math.max(0, state.configTasks.findIndex((task) => task.label === state.currentTask));
     state.configDirty = false;
@@ -805,7 +910,8 @@ function requestCloseConfig() {
 
 function renderConfig() {
   if (!state.config) return;
-  $("#config-context").innerHTML = `<div><span>Session</span><strong>${escapeHtml(state.config.session)}</strong></div><div><span>Project</span><strong title="${escapeAttr(state.config.project)}">${escapeHtml(state.config.project)}</strong></div><div><span>Revision</span><strong>${escapeHtml(String(state.config.revision).slice(0, 12))}</strong></div>`;
+  const node = state.nodes.find((candidate) => candidate.id === state.configNode);
+  $("#config-context").innerHTML = `<div><span>Node</span><strong>${escapeHtml(node?.name || state.configNode || "Unknown")}</strong></div><div><span>Session</span><strong>${escapeHtml(state.config.session)}</strong></div><div><span>Project</span><strong title="${escapeAttr(state.config.project)}">${escapeHtml(state.config.project)}</strong></div><div><span>Revision</span><strong>${escapeHtml(String(state.config.revision).slice(0, 12))}</strong></div>`;
   renderConfigTaskList();
   renderConfigForm();
 }
@@ -886,8 +992,8 @@ async function saveConfig() {
   hideConfigMessage();
   try {
     const session = state.configSession;
-    if (!session || $("#sessions").value !== session) throw new Error("The selected session changed. Reopen configuration before saving.");
-    const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}/config`, {
+    if (!session || $("#sessions").value !== session || selectedNode() !== state.configNode) throw new Error("The selected node or session changed. Reopen configuration before saving.");
+    const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}/config?${addNodeQuery()}`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ revision: state.config.revision, tasks }),
@@ -928,6 +1034,17 @@ function bindEvents() {
   $("#sidebar").addEventListener("click", (event) => {
     const button = event.target.closest("[data-view]");
     if (button) setView(button.dataset.view);
+  });
+  $("#nodes").addEventListener("change", () => {
+    if ($("#config-dialog").open && !requestCloseConfig()) {
+      $("#nodes").value = state.configNode || state.snapshotNode || "";
+      return;
+    }
+    clearWorkspace();
+    state.sessions = [];
+    state.sessionsSignature = "";
+    $("#sessions").innerHTML = '<option value="">Loading sessions</option>';
+    loadSessions();
   });
   $("#sessions").addEventListener("change", () => {
     if ($("#config-dialog").open && !requestCloseConfig()) {
@@ -1077,6 +1194,7 @@ function updateEndpoint() {
 
 function tick() {
   if (state.view === "tasks") {
+    if (selectedNodeState()?.online === false) return;
     loadSnapshot();
     loadLogs();
     loadMetrics();
@@ -1089,6 +1207,6 @@ applySavedPreferences();
 bindEvents();
 updateEndpoint();
 setView("tasks");
-loadSessions();
+loadNodes();
 setInterval(tick, 1000);
-setInterval(loadSessions, 5000);
+setInterval(loadNodes, 5000);

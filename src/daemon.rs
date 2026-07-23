@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -13,23 +13,28 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::cluster::{LeaderCluster, RemoteRequest, spawn_worker_client};
 use crate::config;
 use crate::protocol::{
     McpCallRecord, Request, Response, TaskMetricsAggregate, TaskMetricsSample, TaskMetricsSnapshot,
     TaskProcessSnapshot, casefold_search_text,
 };
 use crate::runtime::{SessionRuntime, Sessions};
+use crate::service;
+use crate::state::{NodeRole, NodeSettings, StateStore};
 use crate::web;
 
-pub const DEFAULT_WEB_HOST: &str = "127.0.0.1";
-pub const DEFAULT_WEB_PORT: u16 = 9837;
 pub const MAX_MCP_CALLS: usize = 500;
 pub const TASK_METRICS_SAMPLE_INTERVAL_MS: u64 = 1_000;
 pub const MAX_TASK_METRIC_SAMPLES: usize = 600;
 
 #[derive(Clone)]
 pub struct DaemonState {
+    pub store: Arc<StateStore>,
+    pub settings: Arc<Mutex<NodeSettings>>,
+    pub cluster: LeaderCluster,
     pub sessions: Arc<Mutex<Sessions>>,
+    pub unavailable_sessions: Arc<Mutex<BTreeMap<String, UnavailableSession>>>,
     pub mcp_calls: Arc<Mutex<VecDeque<Arc<McpCallHistoryEntry>>>>,
     pub next_mcp_call_id: Arc<AtomicU64>,
     pub task_metrics: Arc<Mutex<TaskMetricsStore>>,
@@ -43,10 +48,26 @@ pub struct DaemonState {
     pub put_config_runtime_failure_after: Arc<Mutex<Option<usize>>>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UnavailableSession {
+    pub session: String,
+    pub project: PathBuf,
+    pub error: String,
+}
+
 impl DaemonState {
+    #[cfg(test)]
     pub fn new() -> Self {
+        let store = Arc::new(StateStore::open_in_memory().expect("in-memory state store"));
+        let settings = store.node_settings().expect("default node settings");
+        let cluster = LeaderCluster::new(store.clone(), settings.enrollment_token.clone())
+            .expect("test leader cluster");
         Self {
+            store,
+            settings: Arc::new(Mutex::new(settings)),
+            cluster,
             sessions: Arc::new(Mutex::new(Sessions::new())),
+            unavailable_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             mcp_calls: Arc::new(Mutex::new(VecDeque::new())),
             next_mcp_call_id: Arc::new(AtomicU64::new(1)),
             task_metrics: Arc::new(Mutex::new(TaskMetricsStore::default())),
@@ -59,6 +80,183 @@ impl DaemonState {
             #[cfg(test)]
             put_config_runtime_failure_after: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn load(paths: &GlobalPaths) -> Result<Self> {
+        let store = Arc::new(StateStore::open(&paths.root)?);
+        let settings = store.node_settings()?;
+        let cluster = LeaderCluster::new(store.clone(), settings.enrollment_token.clone())?;
+        let mut sessions = Sessions::new();
+        let mut unavailable_sessions = BTreeMap::new();
+        if settings.execution_enabled() {
+            for registration in store.registrations()? {
+                match config::discover(&registration.project, Some(&registration.session)) {
+                    Ok(definition) => {
+                        let mut runtime = SessionRuntime::new(definition);
+                        runtime.auto_start();
+                        sessions.insert(registration.session, runtime);
+                    }
+                    Err(error) => {
+                        unavailable_sessions.insert(
+                            registration.session.clone(),
+                            UnavailableSession {
+                                session: registration.session,
+                                project: registration.project,
+                                error: format!("{error:#}"),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            store,
+            settings: Arc::new(Mutex::new(settings)),
+            cluster,
+            sessions: Arc::new(Mutex::new(sessions)),
+            unavailable_sessions: Arc::new(Mutex::new(unavailable_sessions)),
+            mcp_calls: Arc::new(Mutex::new(VecDeque::new())),
+            next_mcp_call_id: Arc::new(AtomicU64::new(1)),
+            task_metrics: Arc::new(Mutex::new(TaskMetricsStore::default())),
+            config_mutations: Arc::new(Mutex::new(())),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            put_config_post_check_delay: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            put_config_before_finalize_content: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            put_config_runtime_failure_after: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    pub fn execution_enabled(&self) -> bool {
+        self.settings
+            .lock()
+            .expect("node settings lock")
+            .execution_enabled()
+    }
+
+    pub fn public_settings(&self) -> crate::state::PublicNodeSettings {
+        self.settings.lock().expect("node settings lock").public()
+    }
+
+    pub fn local_inventory(&self) -> Vec<crate::protocol::SessionSnapshot> {
+        if !self.execution_enabled() {
+            return Vec::new();
+        }
+        self.sessions
+            .lock()
+            .expect("sessions lock")
+            .values_mut()
+            .filter_map(|runtime| runtime.snapshot(0).ok())
+            .collect()
+    }
+
+    pub fn node_summaries(&self) -> Vec<crate::protocol::NodeSummary> {
+        let settings = self.settings.lock().expect("node settings lock").clone();
+        let mut nodes = Vec::new();
+        if settings.execution_enabled() {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .expect("sessions lock")
+                .keys()
+                .cloned()
+                .chain(
+                    self.unavailable_sessions
+                        .lock()
+                        .expect("unavailable sessions lock")
+                        .keys()
+                        .cloned(),
+                )
+                .collect::<Vec<_>>();
+            sessions.sort();
+            sessions.dedup();
+            nodes.push(crate::protocol::NodeSummary {
+                id: "self".to_string(),
+                name: settings.name.clone(),
+                role: settings.role.as_label().to_string(),
+                mode: if settings.role == NodeRole::Leader {
+                    settings.leader_mode.as_label().to_string()
+                } else {
+                    "local_executor".to_string()
+                },
+                online: true,
+                is_self: true,
+                last_seen_ms: Some(current_timestamp_ms()),
+                sessions,
+            });
+        }
+        if settings.role == NodeRole::Leader {
+            nodes.extend(self.cluster.remote_nodes());
+        }
+        nodes
+    }
+
+    pub async fn dispatch_node(&self, node: &str, request: RemoteRequest) -> Response {
+        let settings = self.settings.lock().expect("node settings lock").clone();
+        if node == "self" {
+            if !settings.execution_enabled() {
+                return Response::error("pure master does not have a self executor");
+            }
+            return dispatch_async(self.clone(), request.into_local()).await;
+        }
+        if settings.role != NodeRole::Leader {
+            return Response::error("worker nodes can only control their local self executor");
+        }
+        self.cluster.request(node, request).await
+    }
+
+    pub fn service_rows(&self, node: Option<&str>) -> Vec<serde_json::Value> {
+        let inventories = match node {
+            Some("self") => vec![("self".to_string(), self.local_inventory())],
+            Some(node) => self
+                .cluster
+                .cached_inventory(node)
+                .map(|inventory| vec![(node.to_string(), inventory)])
+                .unwrap_or_default(),
+            None => {
+                let mut inventories = Vec::new();
+                let settings = self.settings.lock().expect("node settings lock");
+                if settings.execution_enabled() {
+                    inventories.push(("self".to_string(), self.local_inventory()));
+                }
+                if settings.role == NodeRole::Leader {
+                    for node in self.cluster.remote_nodes() {
+                        if let Some(inventory) = self.cluster.cached_inventory(&node.id) {
+                            inventories.push((node.id, inventory));
+                        }
+                    }
+                }
+                inventories
+            }
+        };
+        inventories
+            .into_iter()
+            .flat_map(|(node_id, sessions)| {
+                sessions.into_iter().flat_map(move |session| {
+                    let node_id = node_id.clone();
+                    session
+                        .tasks
+                        .into_iter()
+                        .filter_map(move |(task, snapshot)| {
+                            let service = snapshot.service;
+                            if service.classification
+                                == crate::protocol::ServiceClassification::Unknown
+                                && service.endpoints.is_empty()
+                            {
+                                return None;
+                            }
+                            Some(serde_json::json!({
+                                "node": node_id,
+                                "session": session.name,
+                                "task": task,
+                                "service": service,
+                            }))
+                        })
+                })
+            })
+            .collect()
     }
 
     pub fn record_mcp_call(&self, mut record: McpCallRecord) {
@@ -469,6 +667,45 @@ fn record_task_metrics_for_targets(
         }
     }
 
+    let service_updates = targets
+        .iter()
+        .map(|target| {
+            let key = TaskMetricsKey {
+                session: target.session.clone(),
+                task: target.task.clone(),
+            };
+            let pids = observations
+                .get(&key)
+                .and_then(Option::as_ref)
+                .map(|observation| {
+                    observation
+                        .processes
+                        .iter()
+                        .map(|process| process.pid)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let (endpoints, inspection) = service::inspect_listeners(&pids);
+            (target, endpoints, inspection)
+        })
+        .collect::<Vec<_>>();
+    {
+        let mut sessions = state.sessions.lock().expect("sessions lock");
+        for (target, endpoints, inspection) in service_updates {
+            let is_current = sessions
+                .get(&target.session)
+                .and_then(|runtime| runtime.task_metric_identity(&target.task))
+                .is_some_and(|(pid, generation)| {
+                    pid == target.root_pid && generation == target.start_generation
+                });
+            if is_current {
+                if let Some(runtime) = sessions.get_mut(&target.session) {
+                    runtime.set_service_observation(&target.task, endpoints, inspection);
+                }
+            }
+        }
+    }
+
     let mut metrics = state.task_metrics.lock().expect("task metrics lock");
     metrics.retain_current_tasks(&current_keys);
     for target in targets {
@@ -579,7 +816,7 @@ impl GlobalPaths {
     }
 }
 
-pub async fn run(web_port: u16) -> Result<()> {
+pub async fn run(web_port_override: Option<u16>) -> Result<()> {
     let paths = GlobalPaths::discover()?;
     paths.prepare()?;
     let lock = OpenOptions::new()
@@ -597,11 +834,26 @@ pub async fn run(web_port: u16) -> Result<()> {
     }
     let listener = UnixListener::bind(&paths.socket)
         .with_context(|| format!("failed to bind {}", paths.socket.display()))?;
-    let web_listener = tokio::net::TcpListener::bind((DEFAULT_WEB_HOST, web_port))
-        .await
-        .with_context(|| format!("failed to bind Web UI to {DEFAULT_WEB_HOST}:{web_port}"))?;
-    let state = DaemonState::new();
+    let state = DaemonState::load(&paths)?;
+    let public_settings = state.public_settings();
+    let worker_settings = state.settings.lock().expect("node settings lock").clone();
+    let web_port = web_port_override.unwrap_or(public_settings.web_port);
+    let web_listener =
+        tokio::net::TcpListener::bind((public_settings.bind_host.as_str(), web_port))
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to bind Web UI to {}:{web_port}",
+                    public_settings.bind_host
+                )
+            })?;
     let metrics_sampler = spawn_task_metrics_sampler(state.clone());
+    let worker_client =
+        if worker_settings.role == NodeRole::Worker && worker_settings.leader_url.is_some() {
+            Some(spawn_worker_client(state.clone(), worker_settings))
+        } else {
+            None
+        };
     let web_state = state.clone();
     let web_task = tokio::spawn(async move { web::serve(web_state, web_listener).await });
 
@@ -626,6 +878,9 @@ pub async fn run(web_port: u16) -> Result<()> {
     }
 
     web_task.abort();
+    if let Some(worker_client) = worker_client {
+        worker_client.abort();
+    }
     if let Err(payload) = metrics_sampler.join() {
         let message = panic_message(payload);
         eprintln!("task metrics sampler thread panicked: {message}");
@@ -729,6 +984,7 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
     match request {
         Request::Ping => Ok(Response::empty("pong")),
         Request::Register { project, session } => {
+            require_local_execution(state)?;
             let _config_mutation = state
                 .config_mutations
                 .lock()
@@ -753,13 +1009,20 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
             let mut runtime = SessionRuntime::new(definition);
             runtime.auto_start();
             let snapshot = runtime.snapshot(200)?;
+            state.store.upsert_registration(&name, &project)?;
             sessions.insert(name.clone(), runtime);
+            state
+                .unavailable_sessions
+                .lock()
+                .expect("unavailable sessions lock")
+                .remove(&name);
             Ok(Response::ok(
                 format!("registered session '{name}'"),
                 snapshot,
             ))
         }
         Request::Update { project, session } => {
+            require_local_execution(state)?;
             let _config_mutation = state
                 .config_mutations
                 .lock()
@@ -801,11 +1064,24 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
             Ok(Response::ok(format!("updated session '{name}'"), snapshot))
         }
         Request::ListSessions => {
+            require_local_execution(state)?;
             let sessions = state.sessions.lock().expect("sessions lock");
-            let names = sessions.keys().cloned().collect::<Vec<_>>();
+            let unavailable = state
+                .unavailable_sessions
+                .lock()
+                .expect("unavailable sessions lock");
+            let mut names = sessions
+                .keys()
+                .chain(unavailable.keys())
+                .cloned()
+                .collect::<Vec<_>>();
+            names.sort();
+            names.dedup();
             Ok(Response::ok("sessions", names))
         }
         Request::Snapshot { session, tail } => {
+            require_local_execution(state)?;
+            reject_unavailable_session(state, &session)?;
             let mut sessions = state.sessions.lock().expect("sessions lock");
             let runtime = sessions
                 .get_mut(&session)
@@ -821,6 +1097,8 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
             after,
             limit,
         } => {
+            require_local_execution(state)?;
+            reject_unavailable_session(state, &session)?;
             let mut sessions = state.sessions.lock().expect("sessions lock");
             let runtime = sessions
                 .get_mut(&session)
@@ -835,6 +1113,8 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
             task,
             window_seconds,
         } => {
+            require_local_execution(state)?;
+            reject_unavailable_session(state, &session)?;
             {
                 let sessions = state.sessions.lock().expect("sessions lock");
                 let runtime = sessions
@@ -851,6 +1131,8 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
             ))
         }
         Request::GetSessionConfig { session } => {
+            require_local_execution(state)?;
+            reject_unavailable_session(state, &session)?;
             let sessions = state.sessions.lock().expect("sessions lock");
             let runtime = sessions
                 .get(&session)
@@ -863,6 +1145,8 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
             revision,
             tasks,
         } => {
+            require_local_execution(state)?;
+            reject_unavailable_session(state, &session)?;
             let _config_mutation = state
                 .config_mutations
                 .lock()
@@ -962,6 +1246,8 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
             task,
             action,
         } => {
+            require_local_execution(state)?;
+            reject_unavailable_session(state, &session)?;
             let mut sessions = state.sessions.lock().expect("sessions lock");
             let runtime = sessions
                 .get_mut(&session)
@@ -973,11 +1259,20 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
             ))
         }
         Request::RemoveSession { session } => {
+            require_local_execution(state)?;
             let mut sessions = state.sessions.lock().expect("sessions lock");
-            let mut runtime = sessions
+            if let Some(mut runtime) = sessions.remove(&session) {
+                runtime.stop_all();
+            } else if state
+                .unavailable_sessions
+                .lock()
+                .expect("unavailable sessions lock")
                 .remove(&session)
-                .with_context(|| format!("session '{session}' not found"))?;
-            runtime.stop_all();
+                .is_none()
+            {
+                bail!("session '{session}' not found");
+            }
+            state.store.remove_registration(&session)?;
             drop(sessions);
             state
                 .task_metrics
@@ -991,6 +1286,31 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
             Ok(Response::empty("daemon shutdown requested"))
         }
     }
+}
+
+fn require_local_execution(state: &DaemonState) -> Result<()> {
+    if state.execution_enabled() {
+        Ok(())
+    } else {
+        bail!("this node is a pure master and does not provide local task execution")
+    }
+}
+
+fn reject_unavailable_session(state: &DaemonState, session: &str) -> Result<()> {
+    if let Some(unavailable) = state
+        .unavailable_sessions
+        .lock()
+        .expect("unavailable sessions lock")
+        .get(session)
+    {
+        bail!(
+            "session '{}' is unavailable from {}: {}",
+            unavailable.session,
+            unavailable.project.display(),
+            unavailable.error
+        );
+    }
+    Ok(())
 }
 
 pub async fn request(request: &Request) -> Result<Response> {
@@ -1030,6 +1350,11 @@ pub fn socket_path() -> Result<PathBuf> {
 
 pub fn root_path() -> Result<PathBuf> {
     Ok(GlobalPaths::discover()?.root)
+}
+
+pub fn configured_settings() -> Result<crate::state::PublicNodeSettings> {
+    let paths = GlobalPaths::discover()?;
+    Ok(StateStore::open(&paths.root)?.node_settings()?.public())
 }
 
 #[cfg(test)]
@@ -1076,8 +1401,60 @@ mod tests {
     }
 
     #[test]
-    fn web_server_binds_to_loopback_by_default() {
-        assert_eq!(DEFAULT_WEB_HOST, "127.0.0.1");
+    fn worker_binds_to_all_interfaces_by_default() {
+        let state = DaemonState::new();
+        assert_eq!(state.public_settings().bind_host, "0.0.0.0");
+    }
+
+    #[test]
+    fn restores_registered_project_after_state_recreation() {
+        let root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        fs::write(
+            project.path().join("taskdeck.yaml"),
+            "version: 1\nsession: restored\ntasks:\n  idle:\n    command: echo\n    args: [ready]\n",
+        )
+        .unwrap();
+        let project = project.path().canonicalize().unwrap();
+        let paths = GlobalPaths {
+            root: root.path().to_path_buf(),
+            socket: root.path().join("taskdeck.sock"),
+            lock: root.path().join("daemon.lock"),
+            log: root.path().join("daemon.log"),
+        };
+        StateStore::open(root.path())
+            .unwrap()
+            .upsert_registration("restored", &project)
+            .unwrap();
+
+        let state = DaemonState::load(&paths).unwrap();
+        let response = dispatch(&state, Request::ListSessions);
+        assert!(response.ok);
+        assert_eq!(response.data.unwrap(), json!(["restored"]));
+    }
+
+    #[test]
+    fn pure_master_rejects_local_registration() {
+        let state = DaemonState::new();
+        let settings = state
+            .store
+            .configure(crate::state::NodeSettingsUpdate {
+                role: Some(crate::state::NodeRole::Leader),
+                leader_mode: Some(crate::state::LeaderMode::PureMaster),
+                ..crate::state::NodeSettingsUpdate::default()
+            })
+            .unwrap();
+        *state.settings.lock().expect("node settings lock") = settings;
+
+        let response = dispatch(
+            &state,
+            Request::Register {
+                project: PathBuf::from("/tmp/missing"),
+                session: None,
+            },
+        );
+        assert!(!response.ok);
+        assert!(response.message.contains("pure master"));
     }
 
     fn task_input(label: &str, command: &str) -> EditableTaskInput {

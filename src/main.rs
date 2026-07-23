@@ -1,7 +1,10 @@
+mod cluster;
 mod config;
 mod daemon;
 mod protocol;
 mod runtime;
+mod service;
+mod state;
 mod tui;
 mod web;
 
@@ -13,6 +16,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::protocol::{Action, Request, Response};
+use crate::state::{LeaderMode, NodeRole, NodeSettingsUpdate, StateStore};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -40,10 +44,15 @@ fn parse_project_path(value: &str) -> std::result::Result<PathBuf, String> {
 enum Commands {
     /// Run the singleton daemon in the foreground.
     Daemon {
-        #[arg(long, default_value_t = daemon::DEFAULT_WEB_PORT)]
-        web_port: u16,
+        #[arg(long)]
+        web_port: Option<u16>,
         #[arg(long, hide = true)]
         background: bool,
+    },
+    /// Inspect or configure this Taskdeck installation.
+    Node {
+        #[command(subcommand)]
+        command: NodeCommands,
     },
     /// Open the terminal interface (default command).
     Tui,
@@ -91,6 +100,33 @@ enum Commands {
     Shutdown,
 }
 
+#[derive(Subcommand)]
+enum NodeCommands {
+    /// Print the persisted node role and connection settings.
+    Show,
+    /// Configure this installation as a worker or leader.
+    Configure {
+        #[arg(long)]
+        role: Option<NodeRole>,
+        #[arg(long)]
+        leader_mode: Option<LeaderMode>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, conflicts_with = "clear_leader")]
+        leader_url: Option<String>,
+        #[arg(long)]
+        clear_leader: bool,
+        #[arg(long, conflicts_with = "clear_token")]
+        token: Option<String>,
+        #[arg(long)]
+        clear_token: bool,
+        #[arg(long)]
+        bind_host: Option<String>,
+        #[arg(long)]
+        web_port: Option<u16>,
+    },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if matches!(
@@ -115,8 +151,11 @@ fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    if let Some(Commands::Daemon { web_port, .. }) = cli.command {
-        return daemon::run(web_port).await;
+    if let Some(Commands::Daemon { web_port, .. }) = &cli.command {
+        return daemon::run(*web_port).await;
+    }
+    if let Some(Commands::Node { command }) = cli.command {
+        return run_node_command(command).await;
     }
 
     ensure_daemon().await?;
@@ -159,14 +198,67 @@ async fn run(cli: Cli) -> Result<()> {
             print_response(daemon::request(&Request::RemoveSession { session }).await?)
         }
         Commands::Endpoints => {
-            println!("Web UI: http://127.0.0.1:{}", daemon::DEFAULT_WEB_PORT);
-            println!("MCP:    http://127.0.0.1:{}/mcp", daemon::DEFAULT_WEB_PORT);
+            let settings = daemon::configured_settings()?;
+            let display_host = if settings.bind_host == "0.0.0.0" {
+                "127.0.0.1"
+            } else {
+                settings.bind_host.as_str()
+            };
+            println!("Web UI: http://{}:{}", display_host, settings.web_port);
+            println!("MCP:    http://{}:{}/mcp", display_host, settings.web_port);
             println!("IPC:    {}", daemon::socket_path()?.display());
             Ok(())
         }
         Commands::Shutdown => print_response(daemon::request(&Request::Shutdown).await?),
-        Commands::Daemon { .. } => unreachable!(),
+        Commands::Daemon { .. } | Commands::Node { .. } => unreachable!(),
     }
+}
+
+async fn run_node_command(command: NodeCommands) -> Result<()> {
+    let root = daemon::root_path()?;
+    let store = StateStore::open(&root)?;
+    match command {
+        NodeCommands::Show => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store.node_settings()?.public())?
+            );
+        }
+        NodeCommands::Configure {
+            role,
+            leader_mode,
+            name,
+            leader_url,
+            clear_leader,
+            token,
+            clear_token,
+            bind_host,
+            web_port,
+        } => {
+            let settings = store.configure(NodeSettingsUpdate {
+                role,
+                leader_mode,
+                name,
+                leader_url: if clear_leader {
+                    Some(None)
+                } else {
+                    leader_url.map(Some)
+                },
+                enrollment_token: if clear_token {
+                    Some(None)
+                } else {
+                    token.map(Some)
+                },
+                bind_host,
+                web_port,
+            })?;
+            if daemon::is_running().await {
+                let _ = daemon::request(&Request::Shutdown).await;
+            }
+            println!("{}", serde_json::to_string_pretty(&settings.public())?);
+        }
+    }
+    Ok(())
 }
 
 async fn control(
@@ -264,5 +356,30 @@ mod tests {
             cli.project,
             std::env::current_dir().unwrap().canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn parses_pure_master_configuration() {
+        let cli = Cli::try_parse_from([
+            "taskdeck",
+            "node",
+            "configure",
+            "--role",
+            "leader",
+            "--leader-mode",
+            "pure-master",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Node {
+                command: NodeCommands::Configure {
+                    role: Some(NodeRole::Leader),
+                    leader_mode: Some(LeaderMode::PureMaster),
+                    ..
+                }
+            })
+        ));
     }
 }
