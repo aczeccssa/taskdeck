@@ -70,6 +70,10 @@ pub enum RemoteRequest {
         task: String,
         window_seconds: usize,
     },
+    ClearTaskHistory {
+        session: String,
+        task: String,
+    },
     GetSessionConfig {
         session: String,
     },
@@ -113,6 +117,7 @@ impl RemoteRequest {
                 task,
                 window_seconds,
             },
+            Self::ClearTaskHistory { session, task } => Request::ClearTaskHistory { session, task },
             Self::GetSessionConfig { session } => Request::GetSessionConfig { session },
             Self::PutSessionConfig {
                 session,

@@ -85,6 +85,17 @@ impl LogBuffer {
             lines: candidates.into_iter().skip(skip).cloned().collect(),
         }
     }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskActionEffect {
+    pub task: String,
+    pub restarted: bool,
+    pub history_cleared: bool,
 }
 
 pub struct TaskRuntime {
@@ -93,6 +104,7 @@ pub struct TaskRuntime {
     child: Option<GroupChild>,
     pid: Option<u32>,
     start_generation: u64,
+    history_generation: u64,
     last_exit: Option<String>,
     logs: Arc<Mutex<LogBuffer>>,
     service: ServiceObservation,
@@ -107,6 +119,7 @@ impl TaskRuntime {
             child: None,
             pid: None,
             start_generation: 0,
+            history_generation: 1,
             last_exit: None,
             logs: Arc::new(Mutex::new(LogBuffer::default())),
             service,
@@ -249,9 +262,14 @@ impl TaskRuntime {
         Ok(())
     }
 
-    fn restart(&mut self) -> Result<()> {
+    fn restart(&mut self) -> Result<bool> {
         self.stop()?;
-        self.start()
+        let cleared = self.spec.clear_logs_on_restart;
+        if cleared {
+            self.clear_history();
+        }
+        self.start()?;
+        Ok(cleared)
     }
 
     fn poll(&mut self) -> Result<()> {
@@ -276,14 +294,19 @@ impl TaskRuntime {
         Ok(())
     }
 
-    fn apply(&mut self, action: Action) -> Result<()> {
+    fn apply(&mut self, action: Action) -> Result<(bool, bool)> {
         match action {
-            Action::Start => self.start(),
-            Action::Stop => self.stop(),
-            Action::Restart => self.restart(),
-            Action::Pause => self.pause(),
-            Action::Resume => self.resume(),
+            Action::Start => self.start().map(|()| (false, false)),
+            Action::Stop => self.stop().map(|()| (false, false)),
+            Action::Restart => self.restart().map(|cleared| (true, cleared)),
+            Action::Pause => self.pause().map(|()| (false, false)),
+            Action::Resume => self.resume().map(|()| (false, false)),
         }
+    }
+
+    fn clear_history(&mut self) {
+        self.history_generation = self.history_generation.wrapping_add(1).max(1);
+        self.logs.lock().expect("log lock").clear();
     }
 
     fn update_spec(&mut self, spec: TaskSpec) {
@@ -337,6 +360,7 @@ impl TaskRuntime {
             auto_start: self.spec.auto_start,
             last_exit: self.last_exit.clone(),
             logs: logs.lines.iter().skip(skip).cloned().collect(),
+            run_generation: self.start_generation,
             service,
         })
     }
@@ -371,10 +395,12 @@ pub struct SessionRuntime {
     project: std::path::PathBuf,
     source: String,
     tasks: BTreeMap<String, TaskRuntime>,
+    task_order: Vec<String>,
 }
 
 impl SessionRuntime {
     pub fn new(definition: ProjectDefinition) -> Self {
+        let task_order = definition.task_order;
         Self {
             name: definition.session,
             project: definition.project,
@@ -384,6 +410,7 @@ impl SessionRuntime {
                 .into_iter()
                 .map(|(label, spec)| (label, TaskRuntime::new(spec)))
                 .collect(),
+            task_order,
         }
     }
 
@@ -399,13 +426,13 @@ impl SessionRuntime {
         self.tasks.contains_key(label)
     }
 
-    pub fn task_metric_identity(&self, label: &str) -> Option<(Option<u32>, u64)> {
+    pub fn task_metric_identity(&self, label: &str) -> Option<(Option<u32>, u64, u64)> {
         self.tasks
             .get(label)
-            .map(|task| (task.pid, task.start_generation))
+            .map(|task| (task.pid, task.start_generation, task.history_generation))
     }
 
-    pub fn task_root_pids_for_metrics(&mut self) -> Vec<(String, Option<u32>, u64)> {
+    pub fn task_root_pids_for_metrics(&mut self) -> Vec<(String, Option<u32>, u64, u64)> {
         self.tasks
             .iter_mut()
             .map(|(label, task)| {
@@ -416,7 +443,12 @@ impl SessionRuntime {
                         None
                     }
                 };
-                (label.clone(), pid, task.start_generation)
+                (
+                    label.clone(),
+                    pid,
+                    task.start_generation,
+                    task.history_generation,
+                )
             })
             .collect()
     }
@@ -439,6 +471,7 @@ impl SessionRuntime {
     }
 
     pub fn update(&mut self, definition: ProjectDefinition) -> Result<()> {
+        self.task_order = definition.task_order;
         let updated_tasks = definition.tasks;
         let removed = self
             .tasks
@@ -471,22 +504,33 @@ impl SessionRuntime {
         Ok(())
     }
 
-    pub fn apply(&mut self, task: Option<&str>, action: Action) -> Result<()> {
+    pub fn apply(&mut self, task: Option<&str>, action: Action) -> Result<Vec<TaskActionEffect>> {
         if let Some(label) = task {
-            return self
+            let (restarted, history_cleared) = self
                 .tasks
                 .get_mut(label)
                 .with_context(|| format!("task '{label}' not found in session '{}'", self.name))?
-                .apply(action);
+                .apply(action)?;
+            return Ok(vec![TaskActionEffect {
+                task: label.to_string(),
+                restarted,
+                history_cleared,
+            }]);
         }
         let mut failures = Vec::new();
+        let mut effects = Vec::new();
         for (label, runtime) in &mut self.tasks {
-            if let Err(error) = runtime.apply(action.clone()) {
-                failures.push(format!("{label}: {error}"));
+            match runtime.apply(action.clone()) {
+                Ok((restarted, history_cleared)) => effects.push(TaskActionEffect {
+                    task: label.clone(),
+                    restarted,
+                    history_cleared,
+                }),
+                Err(error) => failures.push(format!("{label}: {error}")),
             }
         }
         if failures.is_empty() {
-            Ok(())
+            Ok(effects)
         } else {
             bail!(failures.join("; "))
         }
@@ -503,7 +547,17 @@ impl SessionRuntime {
             project: self.project.clone(),
             source: self.source.clone(),
             tasks,
+            task_order: self.task_order.clone(),
         })
+    }
+
+    pub fn clear_task_history(&mut self, label: &str) -> Result<u64> {
+        let task = self
+            .tasks
+            .get_mut(label)
+            .with_context(|| format!("task '{label}' not found in session '{}'", self.name))?;
+        task.clear_history();
+        Ok(task.history_generation)
     }
 
     pub fn task_logs(
@@ -542,6 +596,7 @@ mod tests {
             shell: true,
             auto_start: false,
             stop_timeout_ms: 500,
+            clear_logs_on_restart: false,
         })
     }
 
@@ -555,6 +610,7 @@ mod tests {
             shell: true,
             auto_start,
             stop_timeout_ms: 500,
+            clear_logs_on_restart: false,
         }
     }
 
@@ -659,6 +715,7 @@ mod tests {
                     task_spec("remove", "echo remove", false),
                 ),
             ]),
+            task_order: vec!["keep".to_string(), "remove".to_string()],
         });
         runtime
             .tasks
@@ -675,6 +732,7 @@ mod tests {
                     ("keep".to_string(), task_spec("keep", "echo new", false)),
                     ("add".to_string(), task_spec("add", "echo add", false)),
                 ]),
+                task_order: vec!["keep".to_string(), "add".to_string()],
             })
             .unwrap();
 
@@ -707,6 +765,7 @@ mod tests {
             project: PathBuf::from("/tmp"),
             source: "taskdeck.yaml".to_string(),
             tasks: BTreeMap::from([("existing".to_string(), task_spec("existing", program, true))]),
+            task_order: vec!["existing".to_string()],
         });
         runtime.auto_start();
         runtime
@@ -722,6 +781,7 @@ mod tests {
                     ("existing".to_string(), task_spec("existing", program, true)),
                     ("new".to_string(), task_spec("new", program, true)),
                 ]),
+                task_order: vec!["existing".to_string(), "new".to_string()],
             })
             .expect("update with new auto-start task");
 
@@ -738,9 +798,64 @@ mod tests {
                 project: PathBuf::from("/tmp"),
                 source: "taskdeck.yaml".to_string(),
                 tasks: BTreeMap::from([("broken".to_string(), invalid)]),
+                task_order: vec!["broken".to_string()],
             })
             .unwrap_err();
         assert!(error.to_string().contains("failed to auto-start new task"));
         assert!(!runtime.has_task("broken"));
+    }
+
+    #[test]
+    fn clearing_history_replaces_log_generation_and_invalidates_metric_identity() {
+        let mut task = TaskRuntime::new(task_spec("api", "echo ready", false));
+        task.push_system("old output");
+        let before_logs = task.logs(None, 20).unwrap();
+        let before_history = task.history_generation;
+
+        task.clear_history();
+
+        let after_logs = task.logs(None, 20).unwrap();
+        assert_ne!(after_logs.generation, before_logs.generation);
+        assert!(after_logs.lines.is_empty());
+        assert_ne!(task.history_generation, before_history);
+    }
+
+    #[test]
+    fn restart_clear_setting_replaces_history_between_stop_and_start() {
+        let mut task = long_running_task();
+        task.spec.clear_logs_on_restart = true;
+        task.start().unwrap();
+        task.push_system("old output");
+        let before_logs = task.logs(None, 20).unwrap();
+        let before_history = task.history_generation;
+
+        assert!(task.restart().unwrap());
+
+        let after_logs = task.logs(None, 20).unwrap();
+        assert_ne!(after_logs.generation, before_logs.generation);
+        assert_ne!(task.history_generation, before_history);
+        assert!(
+            after_logs
+                .lines
+                .iter()
+                .all(|line| line.text != "old output")
+        );
+        assert_eq!(task.status, TaskStatus::Running);
+        task.stop().unwrap();
+    }
+
+    #[test]
+    fn snapshot_exposes_configured_order() {
+        let mut runtime = SessionRuntime::new(ProjectDefinition {
+            session: "demo".to_string(),
+            project: PathBuf::from("/tmp"),
+            source: "taskdeck.yaml".to_string(),
+            tasks: BTreeMap::from([
+                ("api".to_string(), task_spec("api", "echo api", false)),
+                ("web".to_string(), task_spec("web", "echo web", false)),
+            ]),
+            task_order: vec!["web".to_string(), "api".to_string()],
+        });
+        assert_eq!(runtime.snapshot(0).unwrap().task_order, ["web", "api"]);
     }
 }

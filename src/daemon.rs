@@ -370,6 +370,7 @@ impl McpCallHistoryEntry {
         let searchable_text = build_mcp_call_searchable_text(
             &record.tool,
             record.operation.as_deref(),
+            record.target_node.as_deref(),
             session.as_deref(),
             task.as_deref(),
             &input,
@@ -387,14 +388,16 @@ impl McpCallHistoryEntry {
 fn build_mcp_call_searchable_text(
     tool: &str,
     operation: Option<&str>,
+    target_node: Option<&str>,
     session: Option<&str>,
     task: Option<&str>,
     input: &serde_json::Value,
 ) -> String {
     let serialized_input = serde_json::to_string(input).unwrap_or_default();
     casefold_search_text(&format!(
-        "{tool}\u{1f}{operation}\u{1f}{session}\u{1f}{task}\u{1f}{serialized_input}",
+        "{tool}\u{1f}{operation}\u{1f}{target_node}\u{1f}{session}\u{1f}{task}\u{1f}{serialized_input}",
         operation = operation.unwrap_or(""),
+        target_node = target_node.unwrap_or(""),
         session = session.unwrap_or(""),
         task = task.unwrap_or(""),
     ))
@@ -412,6 +415,7 @@ struct TaskMetricsTarget {
     task: String,
     root_pid: Option<u32>,
     start_generation: u64,
+    history_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -437,6 +441,7 @@ struct TaskMetricsEntry {
     current: TaskMetricsAggregate,
     processes: Vec<TaskProcessSnapshot>,
     samples: VecDeque<TaskMetricsSample>,
+    restart_markers_ms: VecDeque<u64>,
 }
 
 impl TaskMetricsEntry {
@@ -467,6 +472,8 @@ impl TaskMetricsEntry {
     fn snapshot(&self, window_seconds: usize) -> TaskMetricsSnapshot {
         let sample_count = window_seconds.min(MAX_TASK_METRIC_SAMPLES);
         let skip = self.samples.len().saturating_sub(sample_count);
+        let samples = self.samples.iter().skip(skip).cloned().collect::<Vec<_>>();
+        let first_timestamp = samples.first().map(|sample| sample.timestamp_ms);
         TaskMetricsSnapshot {
             sample_interval_ms: TASK_METRICS_SAMPLE_INTERVAL_MS,
             window_seconds: sample_count as u64,
@@ -475,8 +482,21 @@ impl TaskMetricsEntry {
                     .to_string(),
             running: self.running,
             current: self.current.clone(),
-            samples: self.samples.iter().skip(skip).cloned().collect(),
+            samples,
             processes: self.processes.clone(),
+            restart_markers_ms: self
+                .restart_markers_ms
+                .iter()
+                .copied()
+                .filter(|timestamp| first_timestamp.is_none_or(|first| *timestamp >= first))
+                .collect(),
+        }
+    }
+
+    fn mark_restart(&mut self, timestamp_ms: u64) {
+        self.restart_markers_ms.push_back(timestamp_ms);
+        while self.restart_markers_ms.len() > MAX_TASK_METRIC_SAMPLES {
+            self.restart_markers_ms.pop_front();
         }
     }
 }
@@ -518,6 +538,23 @@ impl TaskMetricsStore {
         self.entries.retain(|key, _| key.session != session);
     }
 
+    fn clear_task(&mut self, session: &str, task: &str) {
+        self.entries.remove(&TaskMetricsKey {
+            session: session.to_string(),
+            task: task.to_string(),
+        });
+    }
+
+    fn mark_restart(&mut self, session: &str, task: &str, timestamp_ms: u64) {
+        self.entries
+            .entry(TaskMetricsKey {
+                session: session.to_string(),
+                task: task.to_string(),
+            })
+            .or_default()
+            .mark_restart(timestamp_ms);
+    }
+
     fn retain_current_tasks(&mut self, current: &HashSet<TaskMetricsKey>) {
         self.entries.retain(|key, _| current.contains(key));
     }
@@ -536,11 +573,12 @@ fn collect_metric_targets(state: &DaemonState) -> Vec<TaskMetricsTarget> {
         .iter_mut()
         .flat_map(|(session, runtime)| {
             runtime.task_root_pids_for_metrics().into_iter().map(
-                |(task, root_pid, start_generation)| TaskMetricsTarget {
+                |(task, root_pid, start_generation, history_generation)| TaskMetricsTarget {
                     session: session.clone(),
                     task,
                     root_pid,
                     start_generation,
+                    history_generation,
                 },
             )
         })
@@ -647,8 +685,10 @@ fn record_task_metrics_for_targets(
             let is_current = sessions
                 .get(&target.session)
                 .and_then(|runtime| runtime.task_metric_identity(&target.task))
-                .is_some_and(|(pid, generation)| {
-                    pid == target.root_pid && generation == target.start_generation
+                .is_some_and(|(pid, generation, history_generation)| {
+                    pid == target.root_pid
+                        && generation == target.start_generation
+                        && history_generation == target.history_generation
                 });
             let observation = if is_current {
                 target
@@ -695,8 +735,10 @@ fn record_task_metrics_for_targets(
             let is_current = sessions
                 .get(&target.session)
                 .and_then(|runtime| runtime.task_metric_identity(&target.task))
-                .is_some_and(|(pid, generation)| {
-                    pid == target.root_pid && generation == target.start_generation
+                .is_some_and(|(pid, generation, history_generation)| {
+                    pid == target.root_pid
+                        && generation == target.start_generation
+                        && history_generation == target.history_generation
                 });
             if is_current {
                 if let Some(runtime) = sessions.get_mut(&target.session) {
@@ -706,9 +748,33 @@ fn record_task_metrics_for_targets(
         }
     }
 
+    // History can be cleared while listener inspection is running. Revalidate while
+    // holding the same sessions -> metrics lock order as clear/restart so a stale
+    // observation cannot repopulate a newly cleared metrics entry.
+    let sessions = state.sessions.lock().expect("sessions lock");
+    let current_keys = current_keys
+        .into_iter()
+        .filter(|key| {
+            sessions
+                .get(&key.session)
+                .and_then(|runtime| runtime.task_metric_identity(&key.task))
+                .is_some()
+        })
+        .collect::<HashSet<_>>();
     let mut metrics = state.task_metrics.lock().expect("task metrics lock");
     metrics.retain_current_tasks(&current_keys);
     for target in targets {
+        let is_current = sessions
+            .get(&target.session)
+            .and_then(|runtime| runtime.task_metric_identity(&target.task))
+            .is_some_and(|(pid, generation, history_generation)| {
+                pid == target.root_pid
+                    && generation == target.start_generation
+                    && history_generation == target.history_generation
+            });
+        if !is_current {
+            continue;
+        }
         let key = TaskMetricsKey {
             session: target.session.clone(),
             task: target.task.clone(),
@@ -1130,6 +1196,23 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
                 metrics.snapshot(&session, &task, window_seconds),
             ))
         }
+        Request::ClearTaskHistory { session, task } => {
+            require_local_execution(state)?;
+            reject_unavailable_session(state, &session)?;
+            let mut sessions = state.sessions.lock().expect("sessions lock");
+            let runtime = sessions
+                .get_mut(&session)
+                .with_context(|| format!("session '{session}' not found"))?;
+            runtime.clear_task_history(&task)?;
+            state
+                .task_metrics
+                .lock()
+                .expect("task metrics lock")
+                .clear_task(&session, &task);
+            Ok(Response::empty(format!(
+                "cleared history for task '{task}'"
+            )))
+        }
         Request::GetSessionConfig { session } => {
             require_local_execution(state)?;
             reject_unavailable_session(state, &session)?;
@@ -1252,7 +1335,17 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
             let runtime = sessions
                 .get_mut(&session)
                 .with_context(|| format!("session '{session}' not found"))?;
-            runtime.apply(task.as_deref(), action.clone())?;
+            let effects = runtime.apply(task.as_deref(), action.clone())?;
+            let timestamp_ms = current_timestamp_ms();
+            let mut metrics = state.task_metrics.lock().expect("task metrics lock");
+            for effect in effects.iter().filter(|effect| effect.restarted) {
+                if effect.history_cleared {
+                    metrics.clear_task(&session, &effect.task);
+                } else {
+                    metrics.mark_restart(&session, &effect.task, timestamp_ms);
+                }
+            }
+            drop(metrics);
             Ok(Response::ok(
                 format!("{action:?} completed"),
                 runtime.snapshot(50)?,
@@ -1377,6 +1470,7 @@ mod tests {
             started_at_ms: 1,
             duration_ms: 2,
             success: true,
+            target_node: None,
             request: json!({"method": "tools/call"}),
             response: json!({"result": {"isError": false}}),
         }
@@ -1467,6 +1561,7 @@ mod tests {
             shell: true,
             auto_start: false,
             stop_timeout_ms: 3_000,
+            clear_logs_on_restart: false,
         }
     }
 
@@ -1572,6 +1667,31 @@ mod tests {
     }
 
     #[test]
+    fn task_metrics_restart_markers_are_windowed_and_clear_with_history() {
+        let mut store = TaskMetricsStore::default();
+        for timestamp_ms in [100, 200, 300] {
+            store.record(
+                "demo",
+                "api",
+                timestamp_ms,
+                Some(AggregatedProcessTree {
+                    aggregate: TaskMetricsAggregate::zero(),
+                    processes: Vec::new(),
+                }),
+            );
+        }
+        store.mark_restart("demo", "api", 150);
+        store.mark_restart("demo", "api", 250);
+
+        assert_eq!(store.snapshot("demo", "api", 2).restart_markers_ms, [250]);
+        store.clear_task("demo", "api");
+        let cleared = store.snapshot("demo", "api", 600);
+        assert!(cleared.samples.is_empty());
+        assert!(cleared.restart_markers_ms.is_empty());
+        assert!(cleared.processes.is_empty());
+    }
+
+    #[test]
     fn task_metrics_prune_deleted_tasks_but_keep_existing_stopped_history() {
         let state = DaemonState::new();
         state.sessions.lock().expect("sessions lock").insert(
@@ -1591,8 +1711,10 @@ mod tests {
                         shell: false,
                         auto_start: false,
                         stop_timeout_ms: 500,
+                        clear_logs_on_restart: false,
                     },
                 )]),
+                task_order: vec!["worker".to_string()],
             }),
         );
 
@@ -1651,8 +1773,10 @@ mod tests {
                         shell: false,
                         auto_start: false,
                         stop_timeout_ms: 500,
+                        clear_logs_on_restart: false,
                     },
                 )]),
+                task_order: vec!["idle".to_string()],
             }),
         );
 
@@ -1682,8 +1806,10 @@ mod tests {
                     shell: true,
                     auto_start: false,
                     stop_timeout_ms: 500,
+                    clear_logs_on_restart: false,
                 },
             )]),
+            task_order: vec!["clock".to_string()],
         });
         runtime
             .apply(Some("clock"), crate::protocol::Action::Start)
@@ -1751,8 +1877,10 @@ mod tests {
                     shell: true,
                     auto_start: false,
                     stop_timeout_ms: 500,
+                    clear_logs_on_restart: false,
                 },
             )]),
+            task_order: vec!["flash".to_string()],
         });
         runtime
             .apply(Some("flash"), crate::protocol::Action::Start)

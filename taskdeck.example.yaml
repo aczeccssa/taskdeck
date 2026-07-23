@@ -1,11 +1,15 @@
 version: 1
 session: my-project
+task_order:
+  - Run Backend API
+  - worker
 
 tasks:
   # Override an existing .vscode/tasks.json task by its label.
   Run Backend API:
     auto_start: true
     stop_timeout_ms: 5000
+    clear_logs_on_restart: false
     env:
       ASPNETCORE_ENVIRONMENT: Development
 

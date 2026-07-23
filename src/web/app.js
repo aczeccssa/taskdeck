@@ -23,6 +23,7 @@ const state = {
   callsRequest: 0,
   callDetailRequest: 0,
   callDetailId: null,
+  callDetailMode: "result",
   configRequest: 0,
   tail: Number(localStorage.getItem("taskdeck-log-tail")) || 1000,
   logLines: [],
@@ -48,6 +49,9 @@ const state = {
   configTaskIndex: 0,
   configSaving: false,
   configDirty: false,
+  tabOrderSaving: false,
+  suppressTabClick: false,
+  seenExits: loadSeenExits(),
   toastTimer: null,
 };
 
@@ -57,7 +61,31 @@ const icons = {
   restart: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 8V4m0 0h-4m4 0-3 3a7 7 0 1 0 2 8"/></svg>',
   stop: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>',
   settings: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.4-2.4 1A7 7 0 0 0 15 6l-.3-2.6h-4L10.4 6A7 7 0 0 0 9 7.1l-2.4-1-2 3.4 2 1.5a7 7 0 0 0 0 2l-2 1.5 2 3.4 2.4-1A7 7 0 0 0 10.4 18l.3 2.6h4L15 18a7 7 0 0 0 1.5-1.1l2.4 1 2-3.4-2-1.5a7 7 0 0 0 .1-1z"/></svg>',
+  trash: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"/></svg>',
+  grip: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="7" r="1"/><circle cx="15" cy="7" r="1"/><circle cx="9" cy="12" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="9" cy="17" r="1"/><circle cx="15" cy="17" r="1"/></svg>',
 };
+
+function loadSeenExits() {
+  try {
+    const value = JSON.parse(localStorage.getItem("taskdeck-seen-exits") || "{}");
+    return value && typeof value === "object" ? value : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function exitKey(task) {
+  return `${selectedNode()}\u0000${state.snapshot?.name || ""}\u0000${task}`;
+}
+
+function markExitSeen(task) {
+  const snapshot = state.snapshot?.tasks?.[task];
+  if (!snapshot || snapshot.status !== "exited") return;
+  state.seenExits[exitKey(task)] = Number(snapshot.run_generation || 0);
+  const keys = Object.keys(state.seenExits);
+  keys.slice(0, Math.max(0, keys.length - 500)).forEach((key) => delete state.seenExits[key]);
+  localStorage.setItem("taskdeck-seen-exits", JSON.stringify(state.seenExits));
+}
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -283,7 +311,7 @@ async function loadSnapshot() {
     if (!response.ok) throw new Error(response.message);
     state.snapshot = response.data;
     state.snapshotNode = node;
-    const labels = Object.keys(state.snapshot.tasks || {});
+    const labels = orderedTaskLabels(state.snapshot);
     if (!labels.includes(state.currentTask)) {
       state.currentTask = labels[0] || null;
       state.renderedTask = null;
@@ -301,10 +329,139 @@ async function loadSnapshot() {
 }
 
 function renderTabs(labels) {
-  const signature = JSON.stringify([labels, state.currentTask]);
+  const taskStates = labels.map((label) => {
+    const task = state.snapshot?.tasks?.[label] || {};
+    return [label, task.status, task.run_generation, state.seenExits[exitKey(label)] || 0];
+  });
+  const signature = JSON.stringify([taskStates, state.currentTask, state.tabOrderSaving]);
   if (signature === state.tabsSignature) return;
   state.tabsSignature = signature;
-  $("#tabs").innerHTML = labels.map((label) => `<button class="tab ${label === state.currentTask ? "active" : ""}" type="button" role="tab" tabindex="${label === state.currentTask ? "0" : "-1"}" aria-selected="${label === state.currentTask}" data-task="${escapeAttr(label)}">${escapeHtml(label)}</button>`).join("");
+  $("#tabs").classList.toggle("saving-order", state.tabOrderSaving);
+  $("#tabs").innerHTML = labels.map((label) => {
+    const task = state.snapshot.tasks[label] || {};
+    const dot = taskStateDot(label, task);
+    const statusLabel = dot ? `, ${dot.label}` : "";
+    return `<button class="tab ${label === state.currentTask ? "active" : ""}" type="button" role="tab" tabindex="${label === state.currentTask ? "0" : "-1"}" aria-selected="${label === state.currentTask}" aria-label="${escapeAttr(label + statusLabel)}" data-task="${escapeAttr(label)}" data-order-key="${escapeAttr(label)}">${dot ? `<span class="task-state-dot ${dot.className}" title="${escapeAttr(dot.label)}"></span>` : ""}<span>${escapeHtml(label)}</span></button>`;
+  }).join("");
+}
+
+function orderedTaskLabels(snapshot) {
+  const tasks = snapshot?.tasks || {};
+  const labels = [];
+  (snapshot?.task_order || []).forEach((label) => {
+    if (Object.hasOwn(tasks, label) && !labels.includes(label)) labels.push(label);
+  });
+  Object.keys(tasks).forEach((label) => { if (!labels.includes(label)) labels.push(label); });
+  return labels;
+}
+
+function taskStateDot(label, task) {
+  if (task.status === "running") return { className: "running", label: "Running" };
+  if (task.status === "failed") return { className: "failed", label: "Exited with error" };
+  const generation = Number(task.run_generation || 0);
+  if (task.status === "exited" && Number(state.seenExits[exitKey(label)] || 0) !== generation) {
+    return { className: "exited", label: "Finished" };
+  }
+  return null;
+}
+
+function editableTaskPayload(task) {
+  return {
+    label: task.label,
+    command: task.command,
+    args: [...(task.args || [])],
+    cwd: task.cwd || ".",
+    env: { ...(task.env || {}) },
+    shell: Boolean(task.shell),
+    auto_start: Boolean(task.auto_start),
+    stop_timeout_ms: Number(task.stop_timeout_ms || 3000),
+    clear_logs_on_restart: Boolean(task.clear_logs_on_restart),
+  };
+}
+
+async function persistWorkspaceOrder(order, previousOrder) {
+  if (state.tabOrderSaving || !state.snapshot) return;
+  const session = state.snapshot.name;
+  const node = selectedNode();
+  state.tabOrderSaving = true;
+  state.snapshot.task_order = [...order];
+  state.tabsSignature = "";
+  renderTabs(order);
+  try {
+    const query = new URLSearchParams({ node });
+    const current = await requestJson(`/api/sessions/${encodeURIComponent(session)}/config?${query}`);
+    if (!current.ok) throw new Error(current.message);
+    if (selectedNode() !== node || state.snapshot?.name !== session) throw new Error("The selected workspace changed");
+    const byLabel = new Map((current.data.tasks || []).map((task) => [task.label, task]));
+    if (order.some((label) => !byLabel.has(label)) || byLabel.size !== order.length) {
+      throw new Error("Task configuration changed; reload before reordering");
+    }
+    const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}/config?${query}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        revision: current.data.revision,
+        tasks: order.map((label) => editableTaskPayload(byLabel.get(label))),
+      }),
+    });
+    if (!response.ok) throw new Error(response.message);
+    showToast("Task order saved");
+  } catch (error) {
+    if (state.snapshot?.name === session && selectedNode() === node) {
+      state.snapshot.task_order = [...previousOrder];
+    }
+    showToast(error.message || "Unable to save task order");
+  } finally {
+    state.tabOrderSaving = false;
+    state.tabsSignature = "";
+    if (state.snapshot) renderTabs(orderedTaskLabels(state.snapshot));
+  }
+}
+
+function bindPointerSorter(container, itemSelector, handleSelector, onReorder) {
+  let drag = null;
+  container.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || state.tabOrderSaving) return;
+    if (handleSelector && !event.target.closest(handleSelector)) return;
+    const item = event.target.closest(itemSelector);
+    if (!item || !container.contains(item)) return;
+    drag = {
+      item,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      active: false,
+      original: $$(itemSelector, container).map((element) => element.dataset.orderKey),
+    };
+    item.setPointerCapture?.(event.pointerId);
+  });
+  container.addEventListener("pointermove", (event) => {
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    if (!drag.active && Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < 6) return;
+    drag.active = true;
+    drag.item.classList.add("dragging");
+    event.preventDefault();
+    const target = document.elementFromPoint(event.clientX, event.clientY)?.closest(itemSelector);
+    if (!target || target === drag.item || !container.contains(target)) return;
+    const rect = target.getBoundingClientRect();
+    const horizontal = container.id === "tabs";
+    const before = horizontal ? event.clientX < rect.left + rect.width / 2 : event.clientY < rect.top + rect.height / 2;
+    container.insertBefore(drag.item, before ? target : target.nextSibling);
+  });
+  const finish = (event) => {
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    drag.item.releasePointerCapture?.(event.pointerId);
+    drag.item.classList.remove("dragging");
+    if (drag.active) {
+      state.suppressTabClick = container.id === "tabs";
+      const order = $$(itemSelector, container).map((element) => element.dataset.orderKey);
+      onReorder(order, drag.original);
+      setTimeout(() => { state.suppressTabClick = false; }, 80);
+    }
+    drag = null;
+  };
+  container.addEventListener("pointerup", finish);
+  container.addEventListener("pointercancel", finish);
 }
 
 function ensureTaskScaffold() {
@@ -327,11 +484,12 @@ function ensureTaskScaffold() {
           </div>
           <button class="icon-button" type="button" data-log="previous" aria-label="Previous match" title="Previous match">&#8593;</button>
           <button class="icon-button" type="button" data-log="next" aria-label="Next match" title="Next match">&#8595;</button>
-          <button class="icon-button" type="button" data-log="clear" aria-label="Clear search" title="Clear search">&#215;</button>
+          <button class="icon-button" type="button" data-log="clear-search" aria-label="Clear search" title="Clear search">&#215;</button>
           <button class="icon-button" type="button" data-log="top" aria-label="Go to top" title="Go to top">&#8679;</button>
           <button class="icon-button" type="button" data-log="bottom" aria-label="Go to bottom" title="Go to bottom">&#8681;</button>
           <button class="button compact" id="follow-button" type="button" data-log="follow">Focus</button>
           <button class="icon-button" type="button" data-log="fullscreen" aria-label="Full screen logs" title="Full screen logs">&#x26F6;</button>
+          <button class="icon-button danger-icon" type="button" data-log="clear-history" aria-label="Clear logs and performance history" title="Clear logs and performance history">${icons.trash}</button>
           <span class="log-line-count" id="log-line-count">0 lines</span>
         </div>
         <div class="logs" id="logs" tabindex="0"></div>
@@ -601,7 +759,7 @@ function handleLogAction(action) {
   if (!logs) return;
   if (action === "previous") moveMatch(-1);
   if (action === "next") moveMatch(1);
-  if (action === "clear") {
+  if (action === "clear-search") {
     state.search = "";
     state.matchIndex = 0;
     $("#log-search").value = "";
@@ -624,6 +782,28 @@ function handleLogAction(action) {
     updateFollowButton();
   }
   if (action === "fullscreen") toggleLogFullscreen();
+  if (action === "clear-history") clearTaskHistory();
+}
+
+async function clearTaskHistory() {
+  const session = state.snapshot?.name;
+  const task = state.currentTask;
+  const node = selectedNode();
+  if (!session || !task || !node || selectedNodeState()?.online === false) return;
+  try {
+    const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}/tasks/${encodeURIComponent(task)}/history?${addNodeQuery()}`, {
+      method: "DELETE",
+    });
+    if (!response.ok) throw new Error(response.message);
+    resetLogCursor();
+    state.metrics = null;
+    renderLogs([]);
+    renderMetrics();
+    await Promise.all([loadLogs(), loadMetrics()]);
+    showToast("Logs and performance history cleared");
+  } catch (error) {
+    showToast(error.message || "Unable to clear history");
+  }
 }
 
 async function toggleLogFullscreen() {
@@ -727,7 +907,7 @@ function formatRuntime(seconds) {
   return `${Math.floor(value / 3600)}h ${Math.floor((value % 3600) / 60)}m`;
 }
 
-function chartMarkup(samples, key, lineClass, formatter) {
+function chartMarkup(samples, key, lineClass, formatter, restartMarkers = []) {
   const values = samples.map((sample) => Number(sample[key] || 0));
   const max = Math.max(...values, 1);
   const points = values.map((value, index) => {
@@ -735,7 +915,16 @@ function chartMarkup(samples, key, lineClass, formatter) {
     const y = 70 - (value / max) * 64;
     return `${x.toFixed(2)},${y.toFixed(2)}`;
   }).join(" ");
-  return `<svg viewBox="0 0 300 72" preserveAspectRatio="none" aria-hidden="true"><path class="chart-grid" d="M0 70H300M0 38H300M0 6H300"/>${points ? `<polyline class="chart-line ${lineClass}" points="${points}"/>` : ""}</svg><div class="chart-title"><span>10 minute history</span><strong>${formatter(max)}</strong></div>`;
+  const firstTimestamp = Number(samples[0]?.timestamp_ms || 0);
+  const lastTimestamp = Number(samples.at(-1)?.timestamp_ms || firstTimestamp);
+  const span = Math.max(lastTimestamp - firstTimestamp, 1);
+  const markers = restartMarkers
+    .map(Number)
+    .filter((timestamp) => timestamp >= firstTimestamp && timestamp <= lastTimestamp)
+    .map((timestamp) => ((timestamp - firstTimestamp) / span) * 300)
+    .map((x) => `<path class="chart-restart" d="M${x.toFixed(2)} 4V70"/>`)
+    .join("");
+  return `<svg viewBox="0 0 300 72" preserveAspectRatio="none" aria-hidden="true"><path class="chart-grid" d="M0 70H300M0 38H300M0 6H300"/>${markers}${points ? `<polyline class="chart-line ${lineClass}" points="${points}"/>` : ""}</svg><div class="chart-title"><span>10 minute history</span><strong>${formatter(max)}</strong></div>`;
 }
 
 function renderMetrics() {
@@ -750,21 +939,23 @@ function renderMetrics() {
   }
   const current = metrics.current || { cpu_percent: 0, memory_bytes: 0, process_count: 0 };
   const samples = metrics.samples || [];
+  const restartMarkers = metrics.restart_markers_ms || [];
   $("#monitor-state").textContent = metrics.running ? "Live - 1s" : "Stopped";
   const processRows = (metrics.processes || []).map((process) => `<tr><td>${process.pid}</td><td>${process.ppid ?? "-"}</td><td class="name" title="${escapeAttr(process.name)}">${escapeHtml(process.name)}</td><td>${Number(process.cpu_percent || 0).toFixed(1)}%</td><td>${formatBytes(process.memory_bytes)}</td><td>${escapeHtml(process.status)}</td><td>${formatRuntime(process.run_time_seconds)}</td></tr>`).join("");
   body.innerHTML = `
     <div class="metric-summary"><div><span>CPU</span><strong>${Number(current.cpu_percent || 0).toFixed(1)}%</strong></div><div><span>RSS</span><strong>${formatBytes(current.memory_bytes)}</strong></div><div><span>Processes</span><strong>${current.process_count || 0}</strong></div></div>
-    <div class="metric-charts"><div class="metric-chart"><div class="chart-title"><span>CPU</span><strong>${Number(current.cpu_percent || 0).toFixed(1)}%</strong></div>${chartMarkup(samples, "cpu_percent", "", (value) => `${value.toFixed(1)}%`)}</div><div class="metric-chart"><div class="chart-title"><span>Memory</span><strong>${formatBytes(current.memory_bytes)}</strong></div>${chartMarkup(samples, "memory_bytes", "memory", formatBytes)}</div></div>
+    <div class="metric-charts"><div class="metric-chart"><div class="chart-title"><span>CPU</span><strong>${Number(current.cpu_percent || 0).toFixed(1)}%</strong></div>${chartMarkup(samples, "cpu_percent", "", (value) => `${value.toFixed(1)}%`, restartMarkers)}</div><div class="metric-chart"><div class="chart-title"><span>Memory</span><strong>${formatBytes(current.memory_bytes)}</strong></div>${chartMarkup(samples, "memory_bytes", "memory", formatBytes, restartMarkers)}</div></div>
     <div class="process-table-wrap">${processRows ? `<table class="processes"><thead><tr><th>PID</th><th>PPID</th><th>Name</th><th>CPU</th><th>RSS</th><th>Status</th><th>Runtime</th></tr></thead><tbody>${processRows}</tbody></table>` : '<div class="monitor-empty">No running processes</div>'}</div>`;
   body.scrollTop = previousTop;
   body.scrollLeft = previousLeft;
 }
 
-function mcpTarget(input) {
-  if (input?.action === "sessions") return { primary: "All sessions", secondary: "Global daemon" };
-  if (input?.task) return { primary: input.task, secondary: input.session || "Task" };
-  if (input?.session) return { primary: input.session, secondary: input.tail ? `Last ${input.tail} lines` : "Session" };
-  return { primary: "Taskdeck daemon", secondary: "No target" };
+function mcpTarget(input, targetNode) {
+  const node = targetNode ? `Node ${targetNode}` : "Cluster";
+  if (input?.action === "sessions" && !targetNode) return { primary: "All sessions", secondary: node };
+  if (input?.task) return { primary: input.task, secondary: `${node} · ${input.session || "Task"}` };
+  if (input?.session) return { primary: input.session, secondary: `${node} · ${input.tail ? `Last ${input.tail} lines` : "Session"}` };
+  return { primary: targetNode || "Taskdeck cluster", secondary: targetNode ? "Node target" : "Cluster operation" };
 }
 
 function callsQuery() {
@@ -800,7 +991,7 @@ function renderMcpCalls() {
     state.callsSignature = signature;
     const focusedCall = document.activeElement?.closest?.("[data-call-id]")?.dataset.callId;
     body.innerHTML = state.calls.length ? state.calls.map((call) => {
-      const target = mcpTarget(call.input || {});
+      const target = mcpTarget(call.input || {}, call.target_node);
       return `<tr><td><div class="cell-stack"><strong>${escapeHtml(titleCase(call.operation || "MCP call"))}</strong><span>${escapeHtml(call.tool)}</span></div></td><td><div class="cell-stack"><strong>${escapeHtml(target.primary)}</strong><span>${escapeHtml(target.secondary)}</span></div></td><td><span class="status-pill ${call.success ? "" : "error"}">${call.success ? "Success" : "Error"}</span></td><td>${escapeHtml(new Date(call.started_at_ms).toLocaleString())}</td><td>${call.duration_ms} ms</td><td><button class="button compact" type="button" data-call-id="${call.id}">View</button></td></tr>`;
     }).join("") : '<tr class="empty-row"><td colspan="6">No matching MCP calls.</td></tr>';
     if (focusedCall) $(`[data-call-id="${CSS.escape(focusedCall)}"]`, body)?.focus();
@@ -833,14 +1024,93 @@ async function openCallDetails(id) {
     if (!response.ok) throw new Error(response.message);
     const call = response.data;
     if (String(call.id) !== targetId) throw new Error("Call detail response did not match the requested call");
+    const input = call.request?.params?.arguments || {};
+    const target = mcpTarget(input, call.target_node);
     $("#call-dialog-title").textContent = `${titleCase(call.operation || "MCP")} request`;
     $("#call-dialog-subtitle").textContent = `${call.tool} - Call #${call.id}`;
-    $("#call-request").textContent = JSON.stringify(call.request, null, 2);
-    $("#call-response").textContent = JSON.stringify(call.response, null, 2);
-    $("#call-dialog").showModal();
+    const icon = $("#detail-status-icon");
+    icon.classList.toggle("error", !call.success);
+    icon.innerHTML = call.success ? '<svg viewBox="0 0 24 24"><path d="m7.5 12 3 3 6-7"/></svg>' : '<svg viewBox="0 0 24 24"><path d="m8 8 8 8m0-8-8 8"/></svg>';
+    $("#call-overview").innerHTML = `<div class="overview-item"><span>Started</span><strong>${escapeHtml(new Date(call.started_at_ms).toLocaleString())}</strong></div><div class="overview-item"><span>Duration</span><strong>${Number(call.duration_ms || 0)} ms</strong></div><div class="overview-item"><span>Request ID</span><strong>${escapeHtml(call.request?.id ?? "-")}</strong></div>`;
+    $("#request-fields").innerHTML = requestFields(call, target);
+    const result = structuredCallResult(call);
+    const message = result && typeof result === "object" && typeof result.message === "string" ? result.message : typeof result === "string" ? result : call.success ? "The request completed successfully." : "The request could not be completed.";
+    const data = result && typeof result === "object" && Object.hasOwn(result, "data") ? result.data : result;
+    $("#response-summary").innerHTML = `<div class="outcome ${call.success ? "" : "error"}"><span class="outcome-icon">${call.success ? "✓" : "×"}</span><strong>${call.success ? "Completed successfully" : "Request failed"}</strong><p>${escapeHtml(message)}</p></div>`;
+    $("#response-data").innerHTML = renderResultData(data);
+    $("#call-request").textContent = formatCallValue(call.request);
+    $("#call-response").textContent = formatCallValue(call.response);
+    setCallDetailMode("result");
+    if (!$("#call-dialog").open) $("#call-dialog").showModal();
   } catch (error) {
     if (requestId === state.callDetailRequest && state.callDetailId === targetId) showToast(error.message || "Unable to load call");
   }
+}
+
+function requestFields(call, target) {
+  const input = call.request?.params?.arguments || {};
+  const fields = [["Operation", titleCase(input.action || call.operation || "Unknown"), false], ["Target", target.primary, true]];
+  if (call.target_node) fields.push(["Target node", call.target_node, true]);
+  if (input.session) fields.push(["Session", input.session, true]);
+  if (input.task) fields.push(["Task", input.task, false]);
+  else if (["start", "stop", "restart", "pause", "resume"].includes(input.action)) fields.push(["Task", "All tasks in the session", false]);
+  if (input.tail != null) fields.push(["Log lines", input.tail, false]);
+  Object.entries(input).filter(([key]) => !["action", "session", "task", "tail"].includes(key)).forEach(([key, value]) => fields.push([titleCase(key), displayValue(value), typeof value === "string"]));
+  return fields.map(([label, value, mono]) => `<div class="field-row"><span class="field-label">${escapeHtml(label)}</span><strong class="field-value ${mono ? "mono" : ""}">${escapeHtml(value)}</strong></div>`).join("");
+}
+
+function displayValue(value) {
+  if (value == null) return "Not set";
+  if (Array.isArray(value)) return value.map(displayValue).join(", ");
+  if (typeof value === "object") return Object.entries(value).map(([key, item]) => `${titleCase(key)}: ${displayValue(item)}`).join(" - ");
+  return String(value);
+}
+
+function renderResultData(data) {
+  if (data == null || data === "") return '<div class="result-empty">No structured result data.</div>';
+  if (Array.isArray(data)) return `<div class="result-data">${data.length ? `<div class="value-list">${data.map((item) => `<div class="value-list-item">${escapeHtml(displayValue(item))}</div>`).join("")}</div>` : '<div class="result-empty">No items returned.</div>'}</div>`;
+  if (typeof data === "object" && data.tasks) {
+    const facts = [["Session", data.name], ["Project", data.project], ["Source", data.source]].filter(([, value]) => value != null).map(([label, value]) => `<div class="field-row"><span class="field-label">${escapeHtml(label)}</span><strong class="field-value ${label !== "Source" ? "mono" : ""}">${escapeHtml(value)}</strong></div>`).join("");
+    const tasks = Object.entries(data.tasks).map(([name, task]) => renderTaskResult(name, task)).join("");
+    return `<div class="result-data"><div class="session-facts"><div class="field-list">${facts}</div></div>${tasks || '<div class="result-empty">This session has no tasks.</div>'}</div>`;
+  }
+  if (typeof data === "object") return `<div class="result-data"><div class="field-list">${Object.entries(data).filter(([key]) => !["ok", "message"].includes(key)).map(([key, value]) => `<div class="field-row"><span class="field-label">${escapeHtml(titleCase(key))}</span><strong class="field-value">${escapeHtml(displayValue(value))}</strong></div>`).join("")}</div></div>`;
+  return `<div class="result-data"><div class="value-list-item">${escapeHtml(displayValue(data))}</div></div>`;
+}
+
+function renderTaskResult(name, task) {
+  const logs = Array.isArray(task.logs) ? task.logs : [];
+  const status = task.status || "unknown";
+  const statusClass = status === "failed" ? "error" : status === "paused" ? "paused" : "success";
+  return `<article class="task-result"><div class="task-result-header"><strong>${escapeHtml(name)}</strong><span class="status-pill ${statusClass}">${escapeHtml(titleCase(status))}</span></div><div class="task-result-meta">${task.pid ? `<span>PID ${task.pid}</span>` : ""}${task.command ? `<span>${escapeHtml(task.command)}</span>` : ""}${task.cwd ? `<span>${escapeHtml(task.cwd)}</span>` : ""}${task.last_exit ? `<span>Last exit: ${escapeHtml(task.last_exit)}</span>` : ""}</div>${logs.length ? `<details class="log-disclosure"><summary>${logs.length} recent log line${logs.length === 1 ? "" : "s"}</summary><div class="human-logs">${logs.map((line) => `<div class="human-log"><span>${escapeHtml(line.stream)}</span><span>${escapeHtml(line.text)}</span></div>`).join("")}</div></details>` : ""}</article>`;
+}
+
+function structuredCallResult(call) {
+  const result = call.response?.result;
+  if (result?.structuredContent !== undefined) return result.structuredContent;
+  const content = Array.isArray(result?.content) ? result.content : [];
+  for (const item of content) {
+    if (item?.type !== "text" || typeof item.text !== "string") continue;
+    try { return JSON.parse(item.text); } catch (_) { /* plain text fallback */ }
+  }
+  const text = content.filter((item) => item?.type === "text").map((item) => item.text).join("\n");
+  return text || result || call.response;
+}
+
+function formatCallValue(value) {
+  return typeof value === "string" ? value : JSON.stringify(value ?? null, null, 2);
+}
+
+function setCallDetailMode(mode) {
+  state.callDetailMode = mode;
+  $$("[data-call-mode]", $("#call-dialog")).forEach((button) => {
+    const active = button.dataset.callMode === mode;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+  });
+  $$("[data-call-panel]", $("#call-dialog")).forEach((panel) => {
+    panel.hidden = panel.dataset.callPanel !== mode;
+  });
 }
 
 function closeCallDetails() {
@@ -851,6 +1121,7 @@ function closeCallDetails() {
 
 function taskToDraft(task) {
   return {
+    _key: globalThis.crypto?.randomUUID?.() || `task-${Date.now()}-${Math.random()}`,
     label: task.label,
     command: task.command,
     args: [...(task.args || [])],
@@ -859,6 +1130,7 @@ function taskToDraft(task) {
     shell: Boolean(task.shell),
     auto_start: Boolean(task.auto_start),
     stop_timeout_ms: Number(task.stop_timeout_ms || 3000),
+    clear_logs_on_restart: Boolean(task.clear_logs_on_restart),
     origin: task.origin || { imported: false, has_yaml_override: false },
   };
 }
@@ -917,7 +1189,7 @@ function renderConfig() {
 }
 
 function renderConfigTaskList() {
-  $("#config-task-list").innerHTML = state.configTasks.length ? state.configTasks.map((task, index) => `<button class="config-task-button ${index === state.configTaskIndex ? "active" : ""}" type="button" data-config-task="${index}"><span>${escapeHtml(task.label || "Untitled task")}</span><small>${task.origin.imported ? "VS Code import" : "YAML task"}</small></button>`).join("") : '<div class="monitor-empty">No tasks</div>';
+  $("#config-task-list").innerHTML = state.configTasks.length ? state.configTasks.map((task, index) => `<div class="config-task-item" data-order-key="${escapeAttr(task._key)}"><button class="drag-handle" type="button" data-drag-handle aria-label="Drag ${escapeAttr(task.label || "Untitled task")}" title="Drag to reorder">${icons.grip}</button><button class="config-task-button ${index === state.configTaskIndex ? "active" : ""}" type="button" data-config-task="${index}"><span>${escapeHtml(task.label || "Untitled task")}</span><small>${task.origin.imported ? "VS Code import" : "YAML task"}</small></button></div>`).join("") : '<div class="monitor-empty">No tasks</div>';
 }
 
 function renderConfigForm() {
@@ -931,7 +1203,7 @@ function renderConfigForm() {
     <label class="field"><span>Label</span><input data-field="label" value="${escapeAttr(task.label)}" required></label>
     <label class="field"><span>Command</span><input data-field="command" value="${escapeAttr(task.command)}" required></label>
     <div class="field-grid"><label class="field"><span>Working directory</span><input data-field="cwd" value="${escapeAttr(task.cwd)}"></label><label class="field"><span>Stop timeout (ms)</span><input data-field="stop_timeout_ms" type="number" min="1" max="300000" value="${task.stop_timeout_ms}"></label></div>
-    <div class="toggle-row"><label><input data-field="shell" type="checkbox" ${task.shell ? "checked" : ""}> Run through shell</label><label><input data-field="auto_start" type="checkbox" ${task.auto_start ? "checked" : ""}> Auto start</label></div>
+    <div class="toggle-row"><label><input data-field="shell" type="checkbox" ${task.shell ? "checked" : ""}> Run through shell</label><label><input data-field="auto_start" type="checkbox" ${task.auto_start ? "checked" : ""}> Auto start</label><label><input data-field="clear_logs_on_restart" type="checkbox" ${task.clear_logs_on_restart ? "checked" : ""}> Clear logs and performance history on restart</label></div>
     <div class="origin-note">${task.origin.imported ? "Imported from .vscode/tasks.json; Taskdeck saves only overrides." : "Defined in taskdeck.yaml."}</div>
     <fieldset class="field"><legend>Arguments</legend><div class="repeater" id="args-rows">${task.args.map((arg, index) => `<div class="repeater-row"><input data-arg="${index}" value="${escapeAttr(arg)}" aria-label="Argument ${index + 1}"><button class="icon-button" type="button" data-remove-arg="${index}" aria-label="Remove argument" title="Remove">&#215;</button></div>`).join("")}</div><button class="button compact" type="button" data-add-arg>Add argument</button></fieldset>
     <fieldset class="field"><legend>Environment</legend><div class="repeater" id="env-rows">${task.envRows.map((row, index) => `<div class="repeater-row env"><input data-env-key="${index}" value="${escapeAttr(row.key)}" placeholder="NAME" aria-label="Environment key"><input data-env-value="${index}" value="${escapeAttr(row.value)}" placeholder="Value" aria-label="Environment value"><button class="icon-button" type="button" data-remove-env="${index}" aria-label="Remove environment variable" title="Remove">&#215;</button></div>`).join("")}</div><button class="button compact" type="button" data-add-env>Add variable</button></fieldset>
@@ -952,7 +1224,7 @@ function hideConfigMessage() {
 }
 
 function addConfigTask() {
-  state.configTasks.push({ label: "new-task", command: "", args: [], cwd: ".", envRows: [], shell: true, auto_start: false, stop_timeout_ms: 3000, origin: { imported: false, has_yaml_override: false } });
+  state.configTasks.push({ _key: globalThis.crypto?.randomUUID?.() || `task-${Date.now()}-${Math.random()}`, label: "new-task", command: "", args: [], cwd: ".", envRows: [], shell: true, auto_start: false, stop_timeout_ms: 3000, clear_logs_on_restart: false, origin: { imported: false, has_yaml_override: false } });
   state.configTaskIndex = state.configTasks.length - 1;
   state.configDirty = true;
   renderConfig();
@@ -976,7 +1248,7 @@ function validateConfigTasks() {
       if (Object.hasOwn(env, key)) throw new Error(`${label}: duplicate environment key ${key}`);
       env[key] = row.value;
     });
-    return { label, command, args: [...task.args], cwd: task.cwd.trim() || ".", env, shell: task.shell, auto_start: task.auto_start, stop_timeout_ms: timeout };
+    return { label, command, args: [...task.args], cwd: task.cwd.trim() || ".", env, shell: task.shell, auto_start: task.auto_start, stop_timeout_ms: timeout, clear_logs_on_restart: Boolean(task.clear_logs_on_restart) };
   });
 }
 
@@ -1067,13 +1339,14 @@ function bindEvents() {
   });
   $("#tabs").addEventListener("click", (event) => {
     const button = event.target.closest("[data-task]");
-    if (!button) return;
+    if (!button || state.suppressTabClick) return;
+    markExitSeen(button.dataset.task);
     state.currentTask = button.dataset.task;
     state.renderedTask = null;
     state.metrics = null;
     state.headerSignature = "";
     resetLogCursor();
-    renderTabs(Object.keys(state.snapshot.tasks));
+    renderTabs(orderedTaskLabels(state.snapshot));
     renderTask();
     loadLogs();
     loadMetrics();
@@ -1084,6 +1357,17 @@ function bindEvents() {
     const index = tabs.indexOf(document.activeElement);
     if (index < 0 || !tabs.length) return;
     event.preventDefault();
+    if (event.altKey) {
+      const direction = event.key === "ArrowRight" ? 1 : -1;
+      const target = index + direction;
+      if (target < 0 || target >= tabs.length) return;
+      const previous = tabs.map((tab) => tab.dataset.task);
+      const order = [...previous];
+      [order[index], order[target]] = [order[target], order[index]];
+      persistWorkspaceOrder(order, previous);
+      requestAnimationFrame(() => $(`[data-task="${CSS.escape(state.currentTask)}"]`, $("#tabs"))?.focus());
+      return;
+    }
     tabs[(index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length].click();
     $("[data-task].active", $("#tabs"))?.focus();
   });
@@ -1115,6 +1399,10 @@ function bindEvents() {
   $("#calls-prev").addEventListener("click", () => { if (state.callPage.has_previous) { state.callFilters.page -= 1; loadMcpCalls(); } });
   $("#calls-next").addEventListener("click", () => { if (state.callPage.has_next) { state.callFilters.page += 1; loadMcpCalls(); } });
   $("#close-call-dialog").addEventListener("click", closeCallDetails);
+  $("#call-dialog").addEventListener("click", (event) => {
+    const mode = event.target.closest("[data-call-mode]");
+    if (mode) setCallDetailMode(mode.dataset.callMode);
+  });
   $("#close-config").addEventListener("click", requestCloseConfig);
   $("#call-dialog").addEventListener("click", (event) => { if (event.target === $("#call-dialog")) closeCallDetails(); });
   $("#call-dialog").addEventListener("close", () => { state.callDetailRequest += 1; state.callDetailId = null; });
@@ -1128,6 +1416,17 @@ function bindEvents() {
     state.configTaskIndex = Number(button.dataset.configTask);
     renderConfigTaskList();
     renderConfigForm();
+  });
+  bindPointerSorter($("#tabs"), ".tab", null, (order, previous) => {
+    if (order.join("\u0000") !== previous.join("\u0000")) persistWorkspaceOrder(order, previous);
+  });
+  bindPointerSorter($("#config-task-list"), ".config-task-item", "[data-drag-handle]", (order) => {
+    const selectedKey = state.configTasks[state.configTaskIndex]?._key;
+    const byKey = new Map(state.configTasks.map((task) => [task._key, task]));
+    state.configTasks = order.map((key) => byKey.get(key)).filter(Boolean);
+    state.configTaskIndex = Math.max(0, state.configTasks.findIndex((task) => task._key === selectedKey));
+    state.configDirty = true;
+    renderConfigTaskList();
   });
   $("#config-form").addEventListener("submit", (event) => { event.preventDefault(); saveConfig(); });
   $("#config-form-body").addEventListener("input", handleConfigInput);

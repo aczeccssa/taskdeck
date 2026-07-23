@@ -348,6 +348,7 @@ mod tests {
             shell: false,
             auto_start: false,
             stop_timeout_ms: 3_000,
+            clear_logs_on_restart: false,
         }
     }
 

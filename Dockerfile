@@ -5,6 +5,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --locked --release
 
+FROM scratch AS artifact
+COPY --from=builder /build/target/release/taskdeck /taskdeck
+
 FROM debian:bookworm-slim
 
 RUN apt-get update \

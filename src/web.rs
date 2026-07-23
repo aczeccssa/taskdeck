@@ -6,7 +6,7 @@ use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response as AxumResponse};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -40,6 +40,10 @@ fn app(state: DaemonState) -> Router {
         .route(
             "/api/sessions/{session}/tasks/{task}/metrics",
             get(task_metrics),
+        )
+        .route(
+            "/api/sessions/{session}/tasks/{task}/history",
+            delete(clear_task_history),
         )
         .route(
             "/api/sessions/{session}/config",
@@ -253,6 +257,22 @@ async fn task_metrics(
                     window_seconds,
                 },
             )
+            .await,
+    )
+}
+
+async fn clear_task_history(
+    State(state): State<DaemonState>,
+    Path((session, task)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Response> {
+    let node = match selected_node(&state, &query) {
+        Ok(node) => node,
+        Err(response) => return Json(response),
+    };
+    Json(
+        state
+            .dispatch_node(&node, RemoteRequest::ClearTaskHistory { session, task })
             .await,
     )
 }
@@ -529,6 +549,7 @@ fn mcp_call_summary(call: &McpCallHistoryEntry) -> McpCallListItem {
         started_at_ms: call.record.started_at_ms,
         duration_ms: call.record.duration_ms,
         success: call.record.success,
+        target_node: call.record.target_node.clone(),
         input: call.input.clone(),
     }
 }
@@ -589,6 +610,15 @@ async fn mcp(State(state): State<DaemonState>, Json(rpc): Json<Value>) -> AxumRe
     let response = json!({"jsonrpc": "2.0", "id": id, "result": result});
     if method == "tools/call" {
         let params = rpc.get("params").unwrap_or(&Value::Null);
+        let target_node = params
+            .get("arguments")
+            .and_then(|arguments| arguments.get("node"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                (state.public_settings().role == crate::state::NodeRole::Worker)
+                    .then(|| "self".to_string())
+            });
         state.record_mcp_call(McpCallRecord {
             id: 0,
             tool: params
@@ -604,6 +634,7 @@ async fn mcp(State(state): State<DaemonState>, Json(rpc): Json<Value>) -> AxumRe
             started_at_ms,
             duration_ms: started.elapsed().as_millis() as u64,
             success,
+            target_node,
             request: rpc,
             response: response.clone(),
         });
@@ -834,7 +865,36 @@ mod tests {
         assert!(APP_JS.contains("new URLSearchParams({ window: \"600\" })"));
         assert!(APP_JS.contains("requestFullscreen"));
         assert!(APP_JS.contains("taskdeck-log-tail"));
+        assert!(APP_JS.contains("taskdeck-seen-exits"));
+        assert!(APP_JS.contains("restart_markers_ms"));
+        assert!(INDEX_HTML.contains("data-call-mode=\"result\""));
         assert!(FAVICON_SVG.contains("<svg"));
+    }
+
+    #[test]
+    fn mcp_drawer_preserves_human_readable_details_alongside_raw_payloads() {
+        for id in [
+            "detail-status-icon",
+            "call-overview",
+            "request-fields",
+            "response-summary",
+            "response-data",
+            "call-request",
+            "call-response",
+        ] {
+            assert!(
+                INDEX_HTML.contains(&format!("id=\"{id}\"")),
+                "missing MCP detail element #{id}"
+            );
+        }
+        assert!(INDEX_HTML.contains("data-call-mode=\"result\""));
+        assert!(INDEX_HTML.contains("data-call-mode=\"raw\""));
+        assert!(STYLES_CSS.contains(".detail-status-icon"));
+        assert!(STYLES_CSS.contains(".call-overview"));
+        assert!(STYLES_CSS.contains(".field-row"));
+        assert!(STYLES_CSS.contains(".outcome"));
+        assert!(APP_JS.contains("requestFields(call, target)"));
+        assert!(APP_JS.contains("renderResultData("));
     }
 
     fn metrics_test_state() -> DaemonState {
@@ -856,8 +916,10 @@ mod tests {
                         shell: false,
                         auto_start: false,
                         stop_timeout_ms: 500,
+                        clear_logs_on_restart: false,
                     },
                 )]),
+                task_order: vec!["api".to_string()],
             }),
         );
         state
@@ -903,6 +965,125 @@ mod tests {
             assert!(!response.ok);
             assert_eq!(response.data.as_ref().unwrap()["status"], 400);
         }
+    }
+
+    #[tokio::test]
+    async fn task_history_route_replaces_log_generation() {
+        let app = app(metrics_test_state());
+        let read_generation = |body: axum::body::Bytes| async move {
+            let response: Response = serde_json::from_slice(&body).unwrap();
+            response.data.unwrap()["generation"].as_u64().unwrap()
+        };
+        let before = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions/demo/tasks/api/logs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let before = read_generation(to_bytes(before.into_body(), usize::MAX).await.unwrap()).await;
+
+        let cleared = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("DELETE")
+                    .uri("/api/sessions/demo/tasks/api/history")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cleared: Response =
+            serde_json::from_slice(&to_bytes(cleared.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(cleared.ok);
+
+        let after = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions/demo/tasks/api/logs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let after = read_generation(to_bytes(after.into_body(), usize::MAX).await.unwrap()).await;
+        assert_ne!(before, after);
+    }
+
+    #[tokio::test]
+    async fn worker_mcp_audit_records_self_target() {
+        let state = DaemonState::new();
+        let response = app(state.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": "taskdeck_control", "arguments": {"action": "sessions"}}
+                    }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(
+            state.recent_mcp_calls(1)[0].record.target_node.as_deref(),
+            Some("self")
+        );
+    }
+
+    #[tokio::test]
+    async fn leader_mcp_audit_preserves_self_and_worker_targets() {
+        let state = DaemonState::new();
+        let settings = state
+            .store
+            .configure(crate::state::NodeSettingsUpdate {
+                role: Some(crate::state::NodeRole::Leader),
+                ..crate::state::NodeSettingsUpdate::default()
+            })
+            .unwrap();
+        *state.settings.lock().expect("node settings lock") = settings;
+        let app = app(state.clone());
+
+        for (id, node) in [(1, "self"), (2, "worker-7")] {
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "method": "tools/call",
+                                "params": {
+                                    "name": "taskdeck_control",
+                                    "arguments": {"action": "sessions", "node": node}
+                                }
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+        }
+
+        let calls = state.recent_mcp_calls(2);
+        assert_eq!(calls[0].record.target_node.as_deref(), Some("worker-7"));
+        assert_eq!(calls[1].record.target_node.as_deref(), Some("self"));
     }
 
     #[tokio::test]
@@ -995,6 +1176,7 @@ mod tests {
             started_at_ms,
             duration_ms: started_at_ms + 5,
             success,
+            target_node: None,
             request: json!({
                 "params": {
                     "arguments": arguments
@@ -1095,6 +1277,7 @@ mod tests {
             started_at_ms: 77,
             duration_ms: 9,
             success: true,
+            target_node: None,
             request: json!({
                 "id": 123,
                 "params": {

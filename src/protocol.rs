@@ -106,6 +106,8 @@ pub struct TaskSnapshot {
     pub last_exit: Option<String>,
     pub logs: Vec<LogLine>,
     #[serde(default)]
+    pub run_generation: u64,
+    #[serde(default)]
     pub service: ServiceObservation,
 }
 
@@ -115,6 +117,8 @@ pub struct SessionSnapshot {
     pub project: PathBuf,
     pub source: String,
     pub tasks: BTreeMap<String, TaskSnapshot>,
+    #[serde(default)]
+    pub task_order: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -174,6 +178,8 @@ pub struct TaskMetricsSnapshot {
     pub current: TaskMetricsAggregate,
     pub samples: Vec<TaskMetricsSample>,
     pub processes: Vec<TaskProcessSnapshot>,
+    #[serde(default)]
+    pub restart_markers_ms: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -192,6 +198,8 @@ pub struct EditableTask {
     pub shell: bool,
     pub auto_start: bool,
     pub stop_timeout_ms: u64,
+    #[serde(default)]
+    pub clear_logs_on_restart: bool,
     pub origin: EditableTaskOrigin,
 }
 
@@ -205,6 +213,8 @@ pub struct EditableTaskInput {
     pub shell: bool,
     pub auto_start: bool,
     pub stop_timeout_ms: u64,
+    #[serde(default)]
+    pub clear_logs_on_restart: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -230,6 +240,7 @@ impl SessionConfigSnapshot {
                 shell: task.shell,
                 auto_start: task.auto_start,
                 stop_timeout_ms: task.stop_timeout_ms,
+                clear_logs_on_restart: task.clear_logs_on_restart,
             })
             .collect()
     }
@@ -243,6 +254,8 @@ pub struct McpCallRecord {
     pub started_at_ms: u64,
     pub duration_ms: u64,
     pub success: bool,
+    #[serde(default)]
+    pub target_node: Option<String>,
     pub request: Value,
     pub response: Value,
 }
@@ -255,6 +268,8 @@ pub struct McpCallListItem {
     pub started_at_ms: u64,
     pub duration_ms: u64,
     pub success: bool,
+    #[serde(default)]
+    pub target_node: Option<String>,
     pub input: Value,
 }
 
@@ -300,6 +315,10 @@ pub enum Request {
         session: String,
         task: String,
         window_seconds: usize,
+    },
+    ClearTaskHistory {
+        session: String,
+        task: String,
     },
     GetSessionConfig {
         session: String,

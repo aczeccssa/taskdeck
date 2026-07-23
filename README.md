@@ -8,7 +8,7 @@ operate on the daemon's live state.
 ## Install and standalone use
 
 ```bash
-./install.sh
+./scripts/install-local.sh
 cd /path/to/project
 taskdeck
 ```
@@ -26,6 +26,11 @@ Taskdeck imports `.vscode/tasks.json` and applies optional `taskdeck.yaml`
 overrides. It supports process and shell tasks, `command`, `args`, `options.cwd`,
 `options.env`, JSON comments/trailing commas, and common workspace/environment
 variables. See [taskdeck.example.yaml](taskdeck.example.yaml).
+
+Use the optional top-level `task_order` list to share the Web/TUI tab order.
+Each task may set `clear_logs_on_restart: true` to clear its retained logs and
+performance history whenever it restarts; the default preserves history and
+marks restarts in the performance charts.
 
 ```bash
 taskdeck register --project /path/to/project --session api
@@ -94,7 +99,7 @@ volume.
 
 ```bash
 export TASKDECK_ENROLLMENT_TOKEN='replace-with-a-long-random-token'
-docker compose up --build -d
+./scripts/deploy-compose.sh
 ```
 
 Open `http://127.0.0.1:9837`. Override the host port with `TASKDECK_PORT` and the
@@ -105,6 +110,35 @@ Those roles execute project commands and must live in the project's actual
 development image/toolchain. Install the Taskdeck binary into that environment,
 persist its `TASKDECK_HOME`, and configure it as a worker pointing at the pure
 master. The deployment does not mount the Docker socket.
+
+## Deployment scripts
+
+The deployment helpers resolve the repository from their own location, so they
+work from either the project root or the `scripts` directory:
+
+```bash
+# Install this checkout on the current macOS or Linux machine.
+./scripts/install-local.sh
+
+# Rebuild and recreate the default Compose service.
+./scripts/deploy-compose.sh
+
+# Deploy through another Docker engine/context.
+./scripts/deploy-compose.sh --context production
+
+# Detect a remote macOS/Linux target, build or reuse its binary, then install it.
+./scripts/deploy-ssh.sh user@example.com
+```
+
+From inside `scripts`, use `./install-local.sh`, `./deploy-compose.sh`, or
+`./deploy-ssh.sh` directly. Run any command with `--help` for its complete
+options and environment variables. Local installation rejects Windows; SSH
+deployment also reports Windows targets as unsupported.
+
+All three commands accept `--sync`. Sync is deliberately opt-in: it requires a
+clean worktree and a configured upstream, then runs a fetch followed by a
+fast-forward-only merge before building or deploying. It never creates merge
+commits, rebases, stashes, or discards local changes.
 
 ## Service discovery
 
