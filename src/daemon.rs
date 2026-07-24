@@ -10,8 +10,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 
 use crate::cluster::{LeaderCluster, RemoteRequest, spawn_worker_client};
 use crate::config;
@@ -865,11 +870,13 @@ impl GlobalPaths {
         let root = if let Some(path) = std::env::var_os("TASKDECK_HOME") {
             PathBuf::from(path)
         } else {
-            let home = std::env::var_os("HOME").context("HOME is not set")?;
+            let home = std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .context("neither HOME nor USERPROFILE is set")?;
             PathBuf::from(home).join(".taskdeck")
         };
         Ok(Self {
-            socket: root.join("taskdeck.sock"),
+            socket: ipc_path(&root),
             lock: root.join("daemon.lock"),
             log: root.join("daemon.log"),
             root,
@@ -880,6 +887,23 @@ impl GlobalPaths {
         fs::create_dir_all(&self.root)
             .with_context(|| format!("failed to create {}", self.root.display()))
     }
+}
+
+#[cfg(unix)]
+fn ipc_path(root: &std::path::Path) -> PathBuf {
+    root.join("taskdeck.sock")
+}
+
+#[cfg(windows)]
+fn ipc_path(root: &std::path::Path) -> PathBuf {
+    let hash = root
+        .to_string_lossy()
+        .to_lowercase()
+        .bytes()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        });
+    PathBuf::from(format!(r"\\.\pipe\taskdeck-{hash:016x}"))
 }
 
 pub async fn run(web_port_override: Option<u16>) -> Result<()> {
@@ -895,11 +919,19 @@ pub async fn run(web_port_override: Option<u16>) -> Result<()> {
     lock.try_lock_exclusive()
         .map_err(|_| anyhow::anyhow!("taskdeck daemon is already running"))?;
 
-    if paths.socket.exists() {
-        let _ = fs::remove_file(&paths.socket);
-    }
-    let listener = UnixListener::bind(&paths.socket)
-        .with_context(|| format!("failed to bind {}", paths.socket.display()))?;
+    #[cfg(unix)]
+    let listener = {
+        if paths.socket.exists() {
+            let _ = fs::remove_file(&paths.socket);
+        }
+        UnixListener::bind(&paths.socket)
+            .with_context(|| format!("failed to bind {}", paths.socket.display()))?
+    };
+    #[cfg(windows)]
+    let mut listener = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&paths.socket)
+        .with_context(|| format!("failed to create named pipe {}", paths.socket.display()))?;
     let state = DaemonState::load(&paths)?;
     let public_settings = state.public_settings();
     let worker_settings = state.settings.lock().expect("node settings lock").clone();
@@ -924,10 +956,38 @@ pub async fn run(web_port_override: Option<u16>) -> Result<()> {
     let web_task = tokio::spawn(async move { web::serve(web_state, web_listener).await });
 
     while !state.shutdown.load(Ordering::SeqCst) {
+        #[cfg(unix)]
         tokio::select! {
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _)) => {
+                        let connection_state = state.clone();
+                        tokio::spawn(async move {
+                            let _ = serve_connection(connection_state, stream).await;
+                        });
+                    }
+                    Err(error) => eprintln!("IPC accept error: {error}"),
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                state.shutdown.store(true, Ordering::SeqCst);
+            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+        #[cfg(windows)]
+        tokio::select! {
+            connected = listener.connect() => {
+                match connected {
+                    Ok(()) => {
+                        let stream = listener;
+                        listener = ServerOptions::new()
+                            .create(&paths.socket)
+                            .with_context(|| {
+                                format!(
+                                    "failed to create named pipe {}",
+                                    paths.socket.display()
+                                )
+                            })?;
                         let connection_state = state.clone();
                         tokio::spawn(async move {
                             let _ = serve_connection(connection_state, stream).await;
@@ -951,11 +1011,13 @@ pub async fn run(web_port_override: Option<u16>) -> Result<()> {
         let message = panic_message(payload);
         eprintln!("task metrics sampler thread panicked: {message}");
         stop_all(&state);
+        #[cfg(unix)]
         let _ = fs::remove_file(&paths.socket);
         drop(lock);
         bail!("task metrics sampler thread panicked: {message}");
     }
     stop_all(&state);
+    #[cfg(unix)]
     let _ = fs::remove_file(&paths.socket);
     drop(lock);
     Ok(())
@@ -968,8 +1030,11 @@ fn stop_all(state: &DaemonState) {
     }
 }
 
-async fn serve_connection(state: DaemonState, stream: UnixStream) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
+async fn serve_connection<S>(state: DaemonState, stream: S) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
         let response = match serde_json::from_str::<Request>(&line) {
@@ -1408,10 +1473,32 @@ fn reject_unavailable_session(state: &DaemonState, session: &str) -> Result<()> 
 
 pub async fn request(request: &Request) -> Result<Response> {
     let paths = GlobalPaths::discover()?;
+    #[cfg(unix)]
     let stream = UnixStream::connect(&paths.socket)
         .await
         .with_context(|| format!("cannot connect to daemon at {}", paths.socket.display()))?;
-    let (reader, mut writer) = stream.into_split();
+    #[cfg(windows)]
+    let stream = loop {
+        match ClientOptions::new().open(&paths.socket) {
+            Ok(stream) => break stream,
+            Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("cannot connect to daemon at {}", paths.socket.display())
+                });
+            }
+        }
+    };
+    request_on_stream(request, stream).await
+}
+
+async fn request_on_stream<S>(request: &Request, stream: S) -> Result<Response>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut payload = serde_json::to_vec(request)?;
     payload.push(b'\n');
     writer.write_all(&payload).await?;

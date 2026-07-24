@@ -23,8 +23,8 @@ taskdeck_normalize_os() {
 
 taskdeck_normalize_arch() {
     case "$1" in
-        x86_64|amd64|x64) printf '%s\n' x86_64 ;;
-        arm64|aarch64) printf '%s\n' aarch64 ;;
+        x86_64|X86_64|amd64|AMD64|x64|X64) printf '%s\n' x86_64 ;;
+        arm64|ARM64|aarch64|AARCH64) printf '%s\n' aarch64 ;;
         armv7l|armv7) printf '%s\n' armv7 ;;
         *) printf '%s\n' unknown ;;
     esac

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -10,7 +10,15 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::fs::File;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+};
 
 use crate::protocol::{EditableTask, EditableTaskInput, EditableTaskOrigin, SessionConfigSnapshot};
 
@@ -870,10 +878,12 @@ fn write_temp_config_file(path: &Path, content: &str) -> Result<PathBuf> {
             .with_context(|| format!("failed to create {}", temp.display()))?;
         file.write_all(content.as_bytes())
             .with_context(|| format!("failed to write {}", temp.display()))?;
-        let permissions = target_permissions(path)
-            .with_context(|| format!("failed to determine permissions for {}", path.display()))?;
-        fs::set_permissions(&temp, permissions)
-            .with_context(|| format!("failed to apply permissions to {}", temp.display()))?;
+        if let Some(permissions) = target_permissions(path)
+            .with_context(|| format!("failed to determine permissions for {}", path.display()))?
+        {
+            fs::set_permissions(&temp, permissions)
+                .with_context(|| format!("failed to apply permissions to {}", temp.display()))?;
+        }
         file.sync_all()
             .with_context(|| format!("failed to sync {}", temp.display()))?;
         Ok(temp.clone())
@@ -884,22 +894,12 @@ fn write_temp_config_file(path: &Path, content: &str) -> Result<PathBuf> {
     result
 }
 
-fn target_permissions(path: &Path) -> Result<fs::Permissions> {
+fn target_permissions(path: &Path) -> Result<Option<fs::Permissions>> {
     match fs::metadata(path) {
-        Ok(metadata) => Ok(metadata.permissions()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(default_permissions()),
+        Ok(metadata) => Ok(Some(metadata.permissions())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
-}
-
-#[cfg(unix)]
-fn default_permissions() -> fs::Permissions {
-    fs::Permissions::from_mode(0o600)
-}
-
-#[cfg(not(unix))]
-fn default_permissions() -> fs::Permissions {
-    fs::Permissions::readonly(false)
 }
 
 fn sync_parent_directory(path: &Path) -> Result<()> {
@@ -913,6 +913,8 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
             .sync_all()
             .with_context(|| format!("failed to sync {}", parent.display()))?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -920,6 +922,7 @@ fn revision_for_project(project: &Path) -> Result<String> {
     load_project_state(project).map(|state| state.revision())
 }
 
+#[cfg(unix)]
 fn rename_temp_file(temp: &Path, path: &Path) -> Result<()> {
     match fs::rename(temp, path) {
         Ok(()) => Ok(()),
@@ -934,6 +937,39 @@ fn rename_temp_file(temp: &Path, path: &Path) -> Result<()> {
             })
         }
     }
+}
+
+#[cfg(windows)]
+fn rename_temp_file(temp: &Path, path: &Path) -> Result<()> {
+    let temp_wide = temp
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let path_wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let replaced = unsafe {
+        MoveFileExW(
+            temp_wide.as_ptr(),
+            path_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced != 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    let _ = fs::remove_file(temp);
+    Err(error).with_context(|| {
+        format!(
+            "failed to replace {} with {}",
+            path.display(),
+            temp.display()
+        )
+    })
 }
 
 fn yaml_key(key: &str) -> Value {

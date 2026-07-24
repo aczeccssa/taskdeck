@@ -1,13 +1,21 @@
 #!/usr/bin/env sh
-# Build a Taskdeck binary for a remote Unix host and install it over SSH.
+# Build a Taskdeck binary for a remote host and install it over SSH.
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 . "$SCRIPT_DIR/lib/common.sh"
 
-REMOTE_INSTALL_PATH=${TASKDECK_REMOTE_PATH:-/usr/local/bin/taskdeck}
+REMOTE_INSTALL_PATH=${TASKDECK_REMOTE_PATH:-}
 SSH_CONNECT_TIMEOUT=${TASKDECK_SSH_CONNECT_TIMEOUT:-10}
 SSH_CONTROL_PATH="${TMPDIR:-/tmp}/taskdeck-ssh.$$.sock"
+SSH_BIN=${TASKDECK_SSH_BIN:-ssh}
+SCP_BIN=${TASKDECK_SCP_BIN:-scp}
+if [ -z "${TASKDECK_SSH_BIN:-}" ] && [ "$(taskdeck_local_os)" = macos ] && [ -x /usr/bin/ssh ]; then
+    SSH_BIN=/usr/bin/ssh
+fi
+if [ -z "${TASKDECK_SCP_BIN:-}" ] && [ "$(taskdeck_local_os)" = macos ] && [ -x /usr/bin/scp ]; then
+    SCP_BIN=/usr/bin/scp
+fi
 
 usage() {
     cat <<'EOF'
@@ -27,8 +35,10 @@ Options:
   -h, --help          Show this help text.
 
 Environment:
-  TASKDECK_REMOTE_PATH          Alternative remote installation path.
+  TASKDECK_REMOTE_PATH          Alternative absolute installation path.
   TASKDECK_SSH_CONNECT_TIMEOUT  Alternative SSH connection timeout.
+  TASKDECK_SSH_BIN              Alternative ssh executable.
+  TASKDECK_SCP_BIN              Alternative scp executable.
 EOF
 }
 
@@ -76,26 +86,23 @@ case "$SSH_CONNECT_TIMEOUT" in
     0) taskdeck_error '--timeout must be greater than zero' ;;
 esac
 
-taskdeck_require ssh
-taskdeck_require scp
+taskdeck_require "$SSH_BIN"
+taskdeck_require "$SCP_BIN"
 [ "$sync_git" = false ] || taskdeck_git_sync
-
-case "$REMOTE_INSTALL_PATH" in
-    /*) ;;
-    *) taskdeck_error 'remote installation path must be absolute' ;;
-esac
-case "$REMOTE_INSTALL_PATH" in
-    *[!A-Za-z0-9_./-]*) taskdeck_error 'remote installation path contains unsupported characters' ;;
-esac
 
 build_dir=''
 remote_tmp=''
+remote_os=''
 
 cleanup() {
     if [ -n "$remote_tmp" ]; then
-        ssh -o ControlPath="$SSH_CONTROL_PATH" -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" "$REMOTE_TARGET" "rm -f '$remote_tmp'" >/dev/null 2>&1 || true
+        if [ "$remote_os" = windows ]; then
+            powershell_remote "Remove-Item -LiteralPath (Join-Path \$HOME '$remote_tmp') -Force -ErrorAction SilentlyContinue" >/dev/null 2>&1 || true
+        else
+            "$SSH_BIN" -o ControlPath="$SSH_CONTROL_PATH" -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" "$REMOTE_TARGET" "rm -f '$remote_tmp'" >/dev/null 2>&1 || true
+        fi
     fi
-    ssh -O exit -o ControlPath="$SSH_CONTROL_PATH" "$REMOTE_TARGET" >/dev/null 2>&1 || true
+    "$SSH_BIN" -O exit -o ControlPath="$SSH_CONTROL_PATH" "$REMOTE_TARGET" >/dev/null 2>&1 || true
     if [ -n "$build_dir" ]; then
         [ ! -e "$build_dir/taskdeck" ] || unlink "$build_dir/taskdeck"
         [ ! -d "$build_dir" ] || rmdir "$build_dir"
@@ -104,7 +111,7 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 ssh_remote() {
-    ssh \
+    "$SSH_BIN" \
         -o ControlMaster=auto \
         -o ControlPersist=60 \
         -o ControlPath="$SSH_CONTROL_PATH" \
@@ -112,52 +119,94 @@ ssh_remote() {
         "$REMOTE_TARGET" "$@"
 }
 
+powershell_remote() {
+    script="\$ProgressPreference = 'SilentlyContinue'; $1"
+    encoded=$(printf '%s' "$script" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\r\n')
+    ssh_remote "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded"
+}
+
 local_os=$(taskdeck_local_os)
 local_arch=$(taskdeck_local_arch)
 
-remote_os_raw=''
-if remote_os_raw=$(ssh_remote 'uname -s 2>/dev/null' 2>/dev/null); then
-    :
-fi
-remote_os=$(taskdeck_normalize_os "$(printf '%s' "$remote_os_raw" | sed -n '1p')")
-
-if [ "$remote_os" = unknown ]; then
-    windows_probe=''
-    if windows_probe=$(ssh_remote 'cmd.exe /c ver' 2>/dev/null); then
-        case "$windows_probe" in
-            *Windows*|*Microsoft*) remote_os=windows ;;
-        esac
+windows_probe=''
+if command -v iconv >/dev/null 2>&1 \
+    && command -v base64 >/dev/null 2>&1 \
+    && windows_probe=$(powershell_remote "[Console]::Out.Write('windows')" 2>/dev/null) \
+    && [ "$windows_probe" = windows ]; then
+    remote_os=windows
+else
+    remote_os_raw=''
+    if remote_os_raw=$(ssh_remote 'uname -s 2>/dev/null' 2>/dev/null); then
+        :
     fi
+    remote_os=$(taskdeck_normalize_os "$(printf '%s' "$remote_os_raw" | sed -n '1p')")
 fi
 
-[ "$remote_os" != windows ] || taskdeck_error 'Windows targets are not supported yet'
-[ "$remote_os" != unknown ] || taskdeck_error 'could not identify the remote OS (uname failed)'
+[ "$remote_os" != unknown ] || taskdeck_error 'could not identify the remote OS with PowerShell or uname'
 
 remote_arch_raw=''
-if remote_arch_raw=$(ssh_remote 'uname -m 2>/dev/null' 2>/dev/null); then
-    :
+if [ "$remote_os" = windows ]; then
+    if remote_arch_raw=$(powershell_remote '[Console]::Out.Write($env:PROCESSOR_ARCHITECTURE)' 2>/dev/null); then
+        :
+    fi
+else
+    if remote_arch_raw=$(ssh_remote 'uname -m 2>/dev/null' 2>/dev/null); then
+        :
+    fi
 fi
 remote_arch=$(taskdeck_normalize_arch "$(printf '%s' "$remote_arch_raw" | sed -n '1p')")
-[ "$remote_arch" != unknown ] || taskdeck_error 'could not identify the remote architecture (uname -m failed)'
+[ "$remote_arch" != unknown ] || taskdeck_error 'could not identify the remote architecture'
 
 case "$remote_os/$remote_arch" in
     macos/x86_64) target_triple=x86_64-apple-darwin ;;
     macos/aarch64) target_triple=aarch64-apple-darwin ;;
     linux/x86_64) target_triple=x86_64-unknown-linux-gnu ;;
     linux/aarch64) target_triple=aarch64-unknown-linux-gnu ;;
+    windows/x86_64) target_triple=x86_64-pc-windows-msvc ;;
+    windows/aarch64) target_triple=aarch64-pc-windows-msvc ;;
     *) taskdeck_error "unsupported target platform: $remote_os/$remote_arch" ;;
 esac
 
+if [ -z "$REMOTE_INSTALL_PATH" ]; then
+    if [ "$remote_os" = windows ]; then
+        remote_local_app_data=$(powershell_remote '[Console]::Out.Write($env:LOCALAPPDATA)')
+        [ -n "$remote_local_app_data" ] || taskdeck_error 'PowerShell did not report LOCALAPPDATA'
+        REMOTE_INSTALL_PATH="$remote_local_app_data/Taskdeck/taskdeck.exe"
+    else
+        REMOTE_INSTALL_PATH=/usr/local/bin/taskdeck
+    fi
+fi
+if [ "$remote_os" = windows ]; then
+    case "$REMOTE_INSTALL_PATH" in
+        [A-Za-z]:[\\/]*.exe) ;;
+        *) taskdeck_error 'Windows installation path must be an absolute .exe path' ;;
+    esac
+    case "$REMOTE_INSTALL_PATH" in
+        *"'"*) taskdeck_error "Windows installation path cannot contain '" ;;
+    esac
+else
+    case "$REMOTE_INSTALL_PATH" in
+        /*) ;;
+        *) taskdeck_error 'remote installation path must be absolute' ;;
+    esac
+    case "$REMOTE_INSTALL_PATH" in
+        *[!A-Za-z0-9_./-]*) taskdeck_error 'remote installation path contains unsupported characters' ;;
+    esac
+fi
+
 printf 'Remote target: %s (%s)\n' "$remote_os" "$remote_arch"
 
-artifact="$TASKDECK_REPO_ROOT/target/$target_triple/release/taskdeck"
+artifact_name=taskdeck
+[ "$remote_os" != windows ] || artifact_name=taskdeck.exe
+artifact="$TASKDECK_REPO_ROOT/target/$target_triple/release/$artifact_name"
 if [ "$remote_os" = "$local_os" ] && [ "$remote_arch" = "$local_arch" ]; then
-    artifact="$TASKDECK_REPO_ROOT/target/release/taskdeck"
+    artifact="$TASKDECK_REPO_ROOT/target/release/$artifact_name"
 fi
 
 artifact_is_current() {
     [ "$force_build" = false ] || return 1
-    [ -x "$1" ] || return 1
+    [ -f "$1" ] || return 1
+    [ "$remote_os" = windows ] || [ -x "$1" ] || return 1
     if find "$TASKDECK_REPO_ROOT/src" "$TASKDECK_REPO_ROOT/Cargo.toml" "$TASKDECK_REPO_ROOT/Cargo.lock" -type f -newer "$1" -print -quit | grep -q .; then
         return 1
     fi
@@ -171,6 +220,14 @@ else
     if [ "$remote_os" = "$local_os" ] && [ "$remote_arch" = "$local_arch" ]; then
         taskdeck_require cargo
         cargo build --locked --release --manifest-path "$TASKDECK_REPO_ROOT/Cargo.toml"
+    elif [ "$remote_os" = windows ]; then
+        taskdeck_require rustup
+        taskdeck_require cargo-xwin
+        rustup run stable cargo xwin build \
+            --locked \
+            --release \
+            --target "$target_triple" \
+            --manifest-path "$TASKDECK_REPO_ROOT/Cargo.toml"
     elif [ "$remote_os" = linux ] && command -v docker >/dev/null 2>&1 && docker buildx version >/dev/null 2>&1; then
         build_dir=$(mktemp -d "${TMPDIR:-/tmp}/taskdeck-build.XXXXXX")
         case "$remote_arch" in
@@ -193,26 +250,54 @@ else
         rustup target list --installed | grep -qx "$target_triple" || rustup target add "$target_triple"
         cargo build --locked --release --target "$target_triple" --manifest-path "$TASKDECK_REPO_ROOT/Cargo.toml"
     fi
-    [ -x "$artifact" ] || taskdeck_error "build did not produce $artifact"
+    [ -f "$artifact" ] || taskdeck_error "build did not produce $artifact"
+    [ "$remote_os" = windows ] || [ -x "$artifact" ] || taskdeck_error "build artifact is not executable: $artifact"
 fi
 
-remote_tmp="/tmp/taskdeck.$$.bin"
+if [ "$remote_os" = windows ]; then
+    remote_tmp="taskdeck.$$.exe"
+else
+    remote_tmp="/tmp/taskdeck.$$.bin"
+fi
 
 printf 'Uploading %s to %s...\n' "$(basename "$artifact")" "$REMOTE_TARGET"
-scp \
+"$SCP_BIN" \
     -o ControlMaster=auto \
     -o ControlPersist=60 \
     -o ControlPath="$SSH_CONTROL_PATH" \
     -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" \
     "$artifact" "$REMOTE_TARGET:$remote_tmp"
 
-printf 'Installing at %s (sudo may prompt for a password)...\n' "$REMOTE_INSTALL_PATH"
-ssh -tt \
-    -o ControlMaster=auto \
-    -o ControlPersist=60 \
-    -o ControlPath="$SSH_CONTROL_PATH" \
-    -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" \
-    "$REMOTE_TARGET" "set -eu
+if [ "$remote_os" = windows ]; then
+    printf 'Installing at %s...\n' "$REMOTE_INSTALL_PATH"
+    powershell_remote "\$ErrorActionPreference = 'Stop'
+\$source = Join-Path \$HOME '$remote_tmp'
+\$target = '$REMOTE_INSTALL_PATH'
+New-Item -ItemType Directory -Path (Split-Path -Parent \$target) -Force | Out-Null
+if (Test-Path -LiteralPath \$target) {
+    & \$target shutdown *> \$null
+    \$targetPath = [IO.Path]::GetFullPath(\$target)
+    Get-Process taskdeck -ErrorAction SilentlyContinue |
+        Where-Object { [IO.Path]::GetFullPath(\$_.Path) -eq \$targetPath } |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 1200
+}
+Copy-Item -LiteralPath \$source -Destination \$target -Force
+Remove-Item -LiteralPath \$source -Force
+\$installDir = Split-Path -Parent \$target
+\$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+\$pathEntries = @(\$userPath -split ';' | Where-Object { \$_ })
+if (\$pathEntries -notcontains \$installDir) {
+    [Environment]::SetEnvironmentVariable('Path', ((\$pathEntries + \$installDir) -join ';'), 'User')
+}"
+else
+    printf 'Installing at %s (sudo may prompt for a password)...\n' "$REMOTE_INSTALL_PATH"
+    "$SSH_BIN" -tt \
+        -o ControlMaster=auto \
+        -o ControlPersist=60 \
+        -o ControlPath="$SSH_CONTROL_PATH" \
+        -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" \
+        "$REMOTE_TARGET" "set -eu
 install_dir='${REMOTE_INSTALL_PATH%/*}'
 if [ \"\$(id -u)\" -eq 0 ]; then
     mkdir -p \"\$install_dir\"
@@ -225,7 +310,12 @@ else
     exit 1
 fi
 rm -f '$remote_tmp'"
+fi
 
 printf 'Installed version: '
-ssh_remote "$REMOTE_INSTALL_PATH --version"
+if [ "$remote_os" = windows ]; then
+    powershell_remote "& '$REMOTE_INSTALL_PATH' --version"
+else
+    ssh_remote "$REMOTE_INSTALL_PATH --version"
+fi
 printf '%s\n' 'Remote installation completed.'

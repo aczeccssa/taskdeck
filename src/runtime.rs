@@ -6,10 +6,26 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
+
 use anyhow::{Context, Result, bail};
 use command_group::{CommandGroup, GroupChild};
+#[cfg(unix)]
 use nix::sys::signal::{Signal, killpg};
+#[cfg(unix)]
 use nix::unistd::Pid;
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+    System::{
+        Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32, Process32First, Process32Next,
+            TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+        },
+        Threading::{OpenThread, ResumeThread, SuspendThread, THREAD_SUSPEND_RESUME},
+    },
+};
 
 use crate::config::{ProjectDefinition, TaskSpec};
 use crate::protocol::{
@@ -108,6 +124,8 @@ pub struct TaskRuntime {
     last_exit: Option<String>,
     logs: Arc<Mutex<LogBuffer>>,
     service: ServiceObservation,
+    #[cfg(windows)]
+    suspended_threads: Vec<u32>,
 }
 
 impl TaskRuntime {
@@ -123,6 +141,8 @@ impl TaskRuntime {
             last_exit: None,
             logs: Arc::new(Mutex::new(LogBuffer::default())),
             service,
+            #[cfg(windows)]
+            suspended_threads: Vec::new(),
         }
     }
 
@@ -152,24 +172,46 @@ impl TaskRuntime {
 
         let rendered = self.spec.display_command();
         self.push_system(format!("starting: {rendered}"));
-        self.push_system(format!("cwd: {}", self.spec.cwd.display()));
+        self.push_system(format!("cwd: {}", display_path(&self.spec.cwd)));
 
         let mut command = if self.spec.shell {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-            let escaped_args = self
-                .spec
-                .args
-                .iter()
-                .map(|part| shell_escape::escape(part.into()).into_owned())
-                .collect::<Vec<_>>();
-            let script = if escaped_args.is_empty() {
-                self.spec.program.clone()
-            } else {
-                format!("{} {}", self.spec.program, escaped_args.join(" "))
-            };
-            let mut command = Command::new(shell);
-            command.arg("-lc").arg(script);
-            command
+            #[cfg(unix)]
+            {
+                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+                let escaped_args = self
+                    .spec
+                    .args
+                    .iter()
+                    .map(|part| shell_escape::escape(part.into()).into_owned())
+                    .collect::<Vec<_>>();
+                let script = if escaped_args.is_empty() {
+                    self.spec.program.clone()
+                } else {
+                    format!("{} {}", self.spec.program, escaped_args.join(" "))
+                };
+                let mut command = Command::new(shell);
+                command.arg("-lc").arg(script);
+                command
+            }
+            #[cfg(windows)]
+            {
+                let escaped_args = self
+                    .spec
+                    .args
+                    .iter()
+                    .map(|part| powershell_quote(part))
+                    .collect::<Vec<_>>();
+                let script = if escaped_args.is_empty() {
+                    self.spec.program.clone()
+                } else {
+                    format!("{} {}", self.spec.program, escaped_args.join(" "))
+                };
+                let mut command = Command::new("powershell.exe");
+                command
+                    .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+                    .arg(script);
+                command
+            }
         } else {
             let mut command = Command::new(&self.spec.program);
             command.args(&self.spec.args);
@@ -201,6 +243,7 @@ impl TaskRuntime {
         Ok(())
     }
 
+    #[cfg(unix)]
     fn signal(&self, signal: Signal) -> Result<()> {
         let child = self.child.as_ref().context("task is not running")?;
         let pgid = child.id() as i32;
@@ -213,7 +256,13 @@ impl TaskRuntime {
         if self.status != TaskStatus::Running {
             bail!("task '{}' is not running", self.spec.label);
         }
+        #[cfg(unix)]
         self.signal(Signal::SIGSTOP)?;
+        #[cfg(windows)]
+        {
+            self.suspended_threads =
+                suspend_process_tree(self.pid.context("running task has no process identifier")?)?;
+        }
         self.status = TaskStatus::Paused;
         self.push_system("paused");
         Ok(())
@@ -224,7 +273,10 @@ impl TaskRuntime {
         if self.status != TaskStatus::Paused {
             bail!("task '{}' is not paused", self.spec.label);
         }
+        #[cfg(unix)]
         self.signal(Signal::SIGCONT)?;
+        #[cfg(windows)]
+        resume_threads(&mut self.suspended_threads);
         self.status = TaskStatus::Running;
         self.push_system("resumed");
         Ok(())
@@ -238,23 +290,37 @@ impl TaskRuntime {
             self.reset_runtime_service(ServiceInspectionState::NotRunning);
             return Ok(());
         };
-        let pgid = child.id() as i32;
-        self.push_system(format!("stopping process group {pgid}"));
-        killpg(Pid::from_raw(pgid), Signal::SIGTERM).ok();
+        let pid = child.id();
+        #[cfg(unix)]
+        self.push_system(format!("stopping process group {pid}"));
+        #[cfg(windows)]
+        self.push_system(format!("stopping process job {pid}"));
         let started = Instant::now();
         let timeout = Duration::from_millis(self.spec.stop_timeout_ms);
+        #[cfg(unix)]
+        killpg(Pid::from_raw(pid as i32), Signal::SIGTERM).ok();
+        #[cfg(windows)]
+        child.kill().ok();
         let status = loop {
             if let Some(status) = child.try_wait().context("failed to poll child")? {
                 break status;
             }
             if started.elapsed() >= timeout {
+                #[cfg(unix)]
                 self.push_system("stop timed out; sending SIGKILL");
-                killpg(Pid::from_raw(pgid), Signal::SIGKILL).ok();
+                #[cfg(windows)]
+                self.push_system("stop timed out; terminating process job");
+                #[cfg(unix)]
+                killpg(Pid::from_raw(pid as i32), Signal::SIGKILL).ok();
+                #[cfg(windows)]
+                child.kill().ok();
                 break child.wait().context("failed to reap child")?;
             }
             thread::sleep(Duration::from_millis(50));
         };
         self.pid = None;
+        #[cfg(windows)]
+        self.suspended_threads.clear();
         self.status = TaskStatus::Idle;
         self.reset_runtime_service(ServiceInspectionState::NotRunning);
         self.last_exit = Some(status.to_string());
@@ -371,14 +437,102 @@ impl TaskRuntime {
     }
 }
 
+#[cfg(windows)]
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(windows)]
+fn process_tree_pids(root_pid: u32) -> Result<std::collections::HashSet<u32>> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error()).context("failed to snapshot processes");
+    }
+    let mut entries = Vec::new();
+    let mut entry = PROCESSENTRY32 {
+        dwSize: std::mem::size_of::<PROCESSENTRY32>() as u32,
+        ..Default::default()
+    };
+    let mut has_entry = unsafe { Process32First(snapshot, &mut entry) } != 0;
+    while has_entry {
+        entries.push((entry.th32ProcessID, entry.th32ParentProcessID));
+        has_entry = unsafe { Process32Next(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+
+    let mut pids = std::collections::HashSet::from([root_pid]);
+    loop {
+        let previous_len = pids.len();
+        for &(pid, parent) in &entries {
+            if pids.contains(&parent) {
+                pids.insert(pid);
+            }
+        }
+        if pids.len() == previous_len {
+            return Ok(pids);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn suspend_process_tree(root_pid: u32) -> Result<Vec<u32>> {
+    let process_ids = process_tree_pids(root_pid)?;
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error()).context("failed to snapshot process threads");
+    }
+    let mut suspended = Vec::new();
+    let mut entry = THREADENTRY32 {
+        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    let mut has_entry = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    while has_entry {
+        if process_ids.contains(&entry.th32OwnerProcessID) {
+            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+            if !thread.is_null() {
+                if unsafe { SuspendThread(thread) } != u32::MAX {
+                    suspended.push(entry.th32ThreadID);
+                }
+                unsafe { CloseHandle(thread) };
+            }
+        }
+        has_entry = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+    if suspended.is_empty() {
+        bail!("failed to suspend any threads in process job {root_pid}");
+    }
+    Ok(suspended)
+}
+
+#[cfg(windows)]
+fn resume_threads(thread_ids: &mut Vec<u32>) {
+    for thread_id in thread_ids.drain(..) {
+        let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
+        if thread.is_null() {
+            continue;
+        }
+        unsafe { ResumeThread(thread) };
+        unsafe { CloseHandle(thread) };
+    }
+}
+
 fn spawn_reader<R>(reader: R, stream: &'static str, logs: Arc<Mutex<LogBuffer>>)
 where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
-        for line in BufReader::new(reader).lines() {
-            match line {
-                Ok(line) => logs.lock().expect("log lock").push(stream, line),
+        let mut reader = BufReader::new(reader);
+        let mut bytes = Vec::new();
+        loop {
+            bytes.clear();
+            match reader.read_until(b'\n', &mut bytes) {
+                Ok(0) => break,
+                Ok(_) => logs
+                    .lock()
+                    .expect("log lock")
+                    .push(stream, decode_log_line(&bytes)),
                 Err(error) => {
                     logs.lock()
                         .expect("log lock")
@@ -388,6 +542,47 @@ where
             }
         }
     });
+}
+
+fn decode_log_line(bytes: &[u8]) -> String {
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+    if let Ok(line) = std::str::from_utf8(bytes) {
+        return line.to_string();
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(length) = i32::try_from(bytes.len()) {
+            let wide_length = unsafe {
+                MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), length, std::ptr::null_mut(), 0)
+            };
+            if wide_length > 0 {
+                let mut wide = vec![0; wide_length as usize];
+                let written = unsafe {
+                    MultiByteToWideChar(
+                        CP_ACP,
+                        0,
+                        bytes.as_ptr(),
+                        length,
+                        wide.as_mut_ptr(),
+                        wide_length,
+                    )
+                };
+                if written > 0 {
+                    return String::from_utf16_lossy(&wide[..written as usize]);
+                }
+            }
+        }
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn display_path(path: &std::path::Path) -> String {
+    let path = path.display().to_string();
+    #[cfg(windows)]
+    return path.strip_prefix(r"\\?\").unwrap_or(&path).to_string();
+    #[cfg(not(windows))]
+    path
 }
 
 pub struct SessionRuntime {
@@ -700,6 +895,20 @@ mod tests {
 
         let replacement = LogBuffer::default().snapshot(None, 3);
         assert_ne!(replacement.generation, initial.generation);
+    }
+
+    #[test]
+    fn decodes_non_utf8_log_bytes_without_interrupting_the_log_reader() {
+        assert_eq!(decode_log_line(b"ready\r\n"), "ready");
+        assert!(!decode_log_line(&[0x81, 0x82, b'\n']).is_empty());
+    }
+
+    #[test]
+    fn preserves_ansi_sequences_for_the_log_renderer() {
+        assert_eq!(
+            decode_log_line(b"\x1b[32mVITE\x1b[0m ready\n"),
+            "\x1b[32mVITE\x1b[0m ready"
+        );
     }
 
     #[test]

@@ -195,6 +195,7 @@ fn configured_endpoint(host: String, port: u16, protocol: &str) -> ServiceEndpoi
     }
 }
 
+#[cfg(unix)]
 pub fn inspect_listeners(pids: &[u32]) -> (Vec<ServiceEndpoint>, ServiceInspectionState) {
     if pids.is_empty() {
         return (Vec::new(), ServiceInspectionState::NotRunning);
@@ -233,6 +234,43 @@ pub fn inspect_listeners(pids: &[u32]) -> (Vec<ServiceEndpoint>, ServiceInspecti
     (endpoints, state)
 }
 
+#[cfg(windows)]
+pub fn inspect_listeners(pids: &[u32]) -> (Vec<ServiceEndpoint>, ServiceInspectionState) {
+    if pids.is_empty() {
+        return (Vec::new(), ServiceInspectionState::NotRunning);
+    }
+    let output = match Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-NetTCPConnection -State Listen -ErrorAction Stop | ForEach-Object { '{0}`t{1}`t{2}' -f $_.OwningProcess,$_.LocalAddress,$_.LocalPort }",
+        ])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return (Vec::new(), ServiceInspectionState::Unsupported),
+    };
+    let process_ids = pids
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut endpoints = parse_powershell_tcp_listeners(&text)
+        .into_iter()
+        .filter(|endpoint| endpoint.pid.is_some_and(|pid| process_ids.contains(&pid)))
+        .collect::<Vec<_>>();
+    deduplicate_endpoints(&mut endpoints);
+    let state = if endpoints.is_empty() {
+        ServiceInspectionState::NoListener
+    } else {
+        ServiceInspectionState::Listening
+    };
+    (endpoints, state)
+}
+
+#[cfg(any(unix, test))]
 pub fn parse_lsof_fields(text: &str) -> Vec<ServiceEndpoint> {
     let mut pid = None;
     let mut endpoints = Vec::new();
@@ -255,6 +293,27 @@ pub fn parse_lsof_fields(text: &str) -> Vec<ServiceEndpoint> {
     endpoints
 }
 
+#[cfg(any(windows, test))]
+pub fn parse_powershell_tcp_listeners(text: &str) -> Vec<ServiceEndpoint> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.trim().split('\t');
+            let pid = fields.next()?.parse::<u32>().ok()?;
+            let bind_host = fields.next()?.trim().to_string();
+            let port = fields.next()?.parse::<u16>().ok()?;
+            Some(ServiceEndpoint {
+                bind_host,
+                port,
+                protocol: "tcp".to_string(),
+                pid: Some(pid),
+                source: "socket".to_string(),
+                state: "listening".to_string(),
+            })
+        })
+        .collect()
+}
+
+#[cfg(any(unix, test))]
 fn parse_host_port(value: &str) -> Option<(String, u16)> {
     let value = value
         .trim()
@@ -375,6 +434,19 @@ mod tests {
         assert_eq!(endpoints[0].pid, Some(42));
         assert_eq!(endpoints[1].bind_host, "::1");
         assert_eq!(endpoints[1].port, 8000);
+    }
+
+    #[test]
+    fn parses_powershell_tcp_listener_rows() {
+        let endpoints = parse_powershell_tcp_listeners("42\t0.0.0.0\t5173\r\n43\t::1\t8000\r\n");
+
+        assert_eq!(
+            endpoints
+                .iter()
+                .map(|endpoint| (endpoint.pid, endpoint.bind_host.as_str(), endpoint.port))
+                .collect::<Vec<_>>(),
+            [(Some(42), "0.0.0.0", 5173), (Some(43), "::1", 8000)]
+        );
     }
 
     #[test]

@@ -44,10 +44,12 @@ test_root_level_legacy_scripts_are_removed() {
     for script in install.sh deploy_compose.sh deploy_ssh.sh; do
         [ ! -e "$REPO_ROOT/$script" ] || fail "$script should live under scripts/ with its new name"
     done
+    [ -f "$REPO_ROOT/scripts/install-local.ps1" ] || fail "scripts/install-local.ps1 is missing"
 }
 
-test_local_install_rejects_windows() {
+test_local_install_supports_windows() {
     mock_bin="$TEST_TMP/windows-bin"
+    log="$TEST_TMP/windows-install.log"
     mkdir -p "$mock_bin"
     cat >"$mock_bin/uname" <<'EOF'
 #!/usr/bin/env sh
@@ -56,12 +58,24 @@ case "${1:-}" in
     -m) printf '%s\n' x86_64 ;;
 esac
 EOF
-    chmod +x "$mock_bin/uname"
+    cat >"$mock_bin/cargo" <<'EOF'
+#!/usr/bin/env sh
+printf 'cargo args=%s\n' "$*" >>"$TASKDECK_TEST_LOG"
+EOF
+    cat >"$mock_bin/taskdeck" <<'EOF'
+#!/usr/bin/env sh
+printf 'taskdeck args=%s\n' "$*" >>"$TASKDECK_TEST_LOG"
+EOF
+    cat >"$mock_bin/powershell.exe" <<'EOF'
+#!/usr/bin/env sh
+printf 'powershell args=%s\n' "$*" >>"$TASKDECK_TEST_LOG"
+EOF
+    chmod +x "$mock_bin/uname" "$mock_bin/cargo" "$mock_bin/taskdeck" "$mock_bin/powershell.exe"
 
-    if output=$(cd "$REPO_ROOT" && PATH="$mock_bin:$PATH" ./scripts/install-local.sh 2>&1); then
-        fail "install-local.sh accepted Windows"
-    fi
-    assert_contains "$output" "Windows is not supported"
+    (cd "$REPO_ROOT" && TASKDECK_TEST_LOG="$log" PATH="$mock_bin:$PATH" ./scripts/install-local.sh)
+
+    assert_file_contains "$log" "cargo args=install --locked --path $REPO_ROOT --force"
+    assert_file_contains "$log" "taskdeck args=shutdown"
 }
 
 test_local_install_uses_repo_root_from_both_directories() {
@@ -194,8 +208,8 @@ printf 'scp cwd=%s args=%s\n' "$PWD" "$*" >>"$TASKDECK_TEST_LOG"
 EOF
     chmod +x "$mock_bin/uname" "$mock_bin/cargo" "$mock_bin/ssh" "$mock_bin/scp"
 
-    (cd "$fixture" && TASKDECK_TEST_LOG="$log" TASKDECK_TEST_REPO="$fixture" PATH="$mock_bin:$PATH" ./scripts/deploy-ssh.sh --remote-path /opt/taskdeck/bin/taskdeck dev@example.test)
-    (cd "$fixture/scripts" && TASKDECK_TEST_LOG="$log" TASKDECK_TEST_REPO="$fixture" PATH="$mock_bin:$PATH" ./deploy-ssh.sh --remote-path /opt/taskdeck/bin/taskdeck dev@example.test)
+    (cd "$fixture" && TASKDECK_TEST_LOG="$log" TASKDECK_TEST_REPO="$fixture" TASKDECK_SSH_BIN=ssh TASKDECK_SCP_BIN=scp PATH="$mock_bin:$PATH" ./scripts/deploy-ssh.sh --remote-path /opt/taskdeck/bin/taskdeck dev@example.test)
+    (cd "$fixture/scripts" && TASKDECK_TEST_LOG="$log" TASKDECK_TEST_REPO="$fixture" TASKDECK_SSH_BIN=ssh TASKDECK_SCP_BIN=scp PATH="$mock_bin:$PATH" ./deploy-ssh.sh --remote-path /opt/taskdeck/bin/taskdeck dev@example.test)
 
     assert_file_contains "$log" "cargo cwd=$fixture args=build --locked --release --manifest-path $fixture/Cargo.toml"
     assert_file_contains "$log" "scp cwd=$fixture args="
@@ -203,13 +217,80 @@ EOF
     assert_file_contains "$log" "/opt/taskdeck/bin/taskdeck"
 }
 
+test_ssh_deploy_uses_powershell_for_windows() {
+    fixture="$TEST_TMP/windows-ssh-repo"
+    mock_bin="$TEST_TMP/windows-ssh-bin"
+    log="$TEST_TMP/windows-ssh.log"
+    mkdir -p "$fixture/scripts/lib" "$fixture/src" "$mock_bin"
+    fixture=$(CDPATH= cd -- "$fixture" && pwd)
+    cp "$REPO_ROOT/scripts/deploy-ssh.sh" "$fixture/scripts/deploy-ssh.sh"
+    cp "$REPO_ROOT/scripts/lib/common.sh" "$fixture/scripts/lib/common.sh"
+    chmod +x "$fixture/scripts/deploy-ssh.sh" "$fixture/scripts/lib/common.sh"
+    : >"$fixture/Cargo.toml"
+    : >"$fixture/Cargo.lock"
+    : >"$fixture/src/main.rs"
+
+    cat >"$mock_bin/uname" <<'EOF'
+#!/usr/bin/env sh
+case "${1:-}" in
+    -s) printf '%s\n' Darwin ;;
+    -m) printf '%s\n' arm64 ;;
+esac
+EOF
+    cat >"$mock_bin/ssh" <<'EOF'
+#!/usr/bin/env sh
+printf 'ssh args=%s\n' "$*" >>"$TASKDECK_TEST_LOG"
+last=''
+for argument in "$@"; do
+    last=$argument
+done
+case "$*" in
+    *-EncodedCommand*)
+        decoded=$(printf '%s' "${last##* }" | base64 -d | iconv -f UTF-16LE -t UTF-8)
+        printf 'powershell decoded=%s\n' "$decoded" >>"$TASKDECK_TEST_LOG"
+        case "$decoded" in
+            *PROCESSOR_ARCHITECTURE*) printf '%s' AMD64 ;;
+            *LOCALAPPDATA*) printf '%s' 'C:\Users\22407\AppData\Local' ;;
+            *"Write('windows')"*) printf '%s' windows ;;
+            *'--version'*) printf '%s\n' 'taskdeck 0.1.0' ;;
+        esac
+        ;;
+esac
+EOF
+    cat >"$mock_bin/scp" <<'EOF'
+#!/usr/bin/env sh
+printf 'scp args=%s\n' "$*" >>"$TASKDECK_TEST_LOG"
+EOF
+    cat >"$mock_bin/rustup" <<'EOF'
+#!/usr/bin/env sh
+printf 'rustup args=%s\n' "$*" >>"$TASKDECK_TEST_LOG"
+mkdir -p "$TASKDECK_TEST_REPO/target/x86_64-pc-windows-msvc/release"
+: >"$TASKDECK_TEST_REPO/target/x86_64-pc-windows-msvc/release/taskdeck.exe"
+EOF
+    cat >"$mock_bin/cargo-xwin" <<'EOF'
+#!/usr/bin/env sh
+exit 0
+EOF
+    chmod +x "$mock_bin/uname" "$mock_bin/ssh" "$mock_bin/scp" "$mock_bin/rustup" "$mock_bin/cargo-xwin"
+
+    (cd "$fixture" && TASKDECK_TEST_LOG="$log" TASKDECK_TEST_REPO="$fixture" TASKDECK_SSH_BIN=ssh TASKDECK_SCP_BIN=scp PATH="$mock_bin:$PATH" ./scripts/deploy-ssh.sh 22407@company-hp66)
+
+    assert_file_contains "$log" "PROCESSOR_ARCHITECTURE"
+    assert_file_contains "$log" "rustup args=run stable cargo xwin build --locked --release --target x86_64-pc-windows-msvc"
+    assert_file_contains "$log" "taskdeck.exe 22407@company-hp66:taskdeck."
+    assert_file_contains "$log" "Copy-Item"
+    assert_file_contains "$log" "SetEnvironmentVariable('Path'"
+    assert_file_contains "$log" "C:\Users\22407\AppData\Local/Taskdeck/taskdeck.exe"
+}
+
 test_help_from_repo_and_scripts_directories
 test_root_level_legacy_scripts_are_removed
-test_local_install_rejects_windows
+test_local_install_supports_windows
 test_local_install_uses_repo_root_from_both_directories
 test_compose_deploy_uses_repo_root_from_both_directories
 test_sync_fast_forwards_before_compose_deploy
 test_compose_deploy_targets_an_explicit_docker_context
 test_ssh_deploy_uses_repo_layout_from_both_directories
+test_ssh_deploy_uses_powershell_for_windows
 
 printf '%s\n' 'scripts tests passed'

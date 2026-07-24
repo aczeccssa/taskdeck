@@ -13,6 +13,14 @@ cd /path/to/project
 taskdeck
 ```
 
+On Windows, use PowerShell:
+
+```powershell
+.\scripts\install-local.ps1
+Set-Location C:\path\to\project
+taskdeck.exe
+```
+
 The default installation is an unlinked `worker`, preserving the normal local
 workflow. Project registrations and node settings are stored in
 `~/.taskdeck/state.db`; reinstalling or restarting Taskdeck does not remove
@@ -117,8 +125,11 @@ The deployment helpers resolve the repository from their own location, so they
 work from either the project root or the `scripts` directory:
 
 ```bash
-# Install this checkout on the current macOS or Linux machine.
+# Install this checkout on the current macOS, Linux, or Git Bash machine.
 ./scripts/install-local.sh
+
+# Install natively from PowerShell on Windows.
+.\scripts\install-local.ps1
 
 # Rebuild and recreate the default Compose service.
 ./scripts/deploy-compose.sh
@@ -126,14 +137,18 @@ work from either the project root or the `scripts` directory:
 # Deploy through another Docker engine/context.
 ./scripts/deploy-compose.sh --context production
 
-# Detect a remote macOS/Linux target, build or reuse its binary, then install it.
+# Detect a remote macOS/Linux/Windows target, build or reuse its binary, then install it.
 ./scripts/deploy-ssh.sh user@example.com
 ```
 
 From inside `scripts`, use `./install-local.sh`, `./deploy-compose.sh`, or
-`./deploy-ssh.sh` directly. Run any command with `--help` for its complete
-options and environment variables. Local installation rejects Windows; SSH
-deployment also reports Windows targets as unsupported.
+`./deploy-ssh.sh` directly. Windows users can run `.\install-local.ps1`.
+Run any command with `--help` for its complete options and environment
+variables. SSH deployment probes PowerShell before Unix commands and installs
+Windows builds under `%LOCALAPPDATA%\Taskdeck` by default. Cross-building a
+Windows target requires `cargo-xwin`. On macOS the helper uses the system
+OpenSSH clients by default; `TASKDECK_SSH_BIN` and `TASKDECK_SCP_BIN` can
+override them.
 
 All three commands accept `--sync`. Sync is deliberately opt-in: it requires a
 clean worktree and a configured upstream, then runs a fetch followed by a
@@ -149,7 +164,8 @@ It combines:
 - nearby manifests such as `package.json`, `Cargo.toml`, `go.mod`, and project
   files;
 - configured host/port arguments and environment variables;
-- TCP listeners owned by the task process tree, discovered with `lsof`;
+- TCP listeners owned by the task process tree, discovered with `lsof` on Unix
+  or `Get-NetTCPConnection` through PowerShell on Windows;
 - recognizable startup log URLs as fallback evidence.
 
 The Web UI shows the likely runtime/framework and endpoint chips in the task
@@ -218,9 +234,11 @@ MCP calls are retained in memory and visible in the Web UI or through
 
 ## Process behavior
 
-- Each task runs in its own Unix process group.
-- Pause/resume sends `SIGSTOP`/`SIGCONT` to the full group.
-- Stop sends `SIGTERM`, waits for `stop_timeout_ms`, then sends `SIGKILL`.
+- Each task runs in its own Unix process group or Windows Job Object.
+- Pause/resume signals the Unix process group or suspends/resumes the Windows
+  process tree's threads.
+- Stop uses `SIGTERM` plus the configured timeout on Unix and terminates the
+  complete Job Object on Windows.
 - Logs retain up to 5,000 lines per task in memory.
 - CPU, RSS, descendants, and process state are sampled once per second, with a
   ten-minute history.
@@ -228,5 +246,7 @@ MCP calls are retained in memory and visible in the Web UI or through
   live log pipes and arbitrary orphaned processes are not reconstructed after a
   crash.
 
-Taskdeck currently targets macOS and Linux because Unix process groups and
-per-user Unix sockets are central to its lifecycle guarantees.
+Taskdeck supports macOS, Linux, and Windows. Unix tasks run in process groups;
+Windows tasks run in Job Objects. Shell tasks use the configured Unix shell on
+macOS/Linux and Windows PowerShell (`powershell.exe`) on Windows. Local daemon
+IPC uses a per-user Unix socket or Windows named pipe.

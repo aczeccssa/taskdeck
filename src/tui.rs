@@ -523,7 +523,7 @@ fn render(frame: &mut Frame, app: &App) {
             if line.text.chars().count() > MAX_RENDER_CHARS {
                 text.push_str(" ... [truncated]");
             }
-            Line::from(Span::styled(text, style))
+            ansi_log_line(&text, style)
         })
         .collect::<Vec<_>>();
     let output = Paragraph::new(Text::from(lines))
@@ -540,6 +540,68 @@ fn render(frame: &mut Frame, app: &App) {
         Span::styled(&app.message, Style::default().fg(Color::Cyan)),
     ]));
     frame.render_widget(footer, sections[3]);
+}
+
+fn ansi_log_line(text: &str, base_style: Style) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut remaining = text;
+    let mut style = base_style;
+    while let Some(start) = remaining.find("\u{1b}[") {
+        if start > 0 {
+            spans.push(Span::styled(remaining[..start].to_string(), style));
+        }
+        let sequence = &remaining[start + 2..];
+        let Some(end) = sequence.find('m') else {
+            spans.push(Span::styled(remaining[start..].to_string(), style));
+            return Line::from(spans);
+        };
+        apply_ansi_sgr(&mut style, base_style, &sequence[..end]);
+        remaining = &sequence[end + 1..];
+    }
+    if !remaining.is_empty() || spans.is_empty() {
+        spans.push(Span::styled(remaining.to_string(), style));
+    }
+    Line::from(spans)
+}
+
+fn apply_ansi_sgr(style: &mut Style, base_style: Style, sequence: &str) {
+    for code in sequence
+        .split(';')
+        .map(|code| code.parse::<u8>().unwrap_or(0))
+    {
+        match code {
+            0 => *style = base_style,
+            1 => *style = style.add_modifier(Modifier::BOLD),
+            2 => *style = style.add_modifier(Modifier::DIM),
+            22 => *style = style.remove_modifier(Modifier::BOLD | Modifier::DIM),
+            30..=37 | 90..=97 => *style = style.fg(ansi_color(code)),
+            39 => *style = style.fg(base_style.fg.unwrap_or(Color::Reset)),
+            40..=47 | 100..=107 => *style = style.bg(ansi_color(code - 10)),
+            49 => *style = style.bg(base_style.bg.unwrap_or(Color::Reset)),
+            _ => {}
+        }
+    }
+}
+
+fn ansi_color(code: u8) -> Color {
+    match code {
+        30 | 40 => Color::Black,
+        31 | 41 => Color::Red,
+        32 | 42 => Color::Green,
+        33 | 43 => Color::Yellow,
+        34 | 44 => Color::Blue,
+        35 | 45 => Color::Magenta,
+        36 | 46 => Color::Cyan,
+        37 | 47 => Color::Gray,
+        90 | 100 => Color::DarkGray,
+        91 | 101 => Color::LightRed,
+        92 | 102 => Color::LightGreen,
+        93 | 103 => Color::LightYellow,
+        94 | 104 => Color::LightBlue,
+        95 | 105 => Color::LightMagenta,
+        96 | 106 => Color::LightCyan,
+        _ => Color::White,
+    }
 }
 
 #[cfg(test)]
@@ -585,5 +647,18 @@ mod tests {
             stream: "stdout".to_string(),
             text: format!("line {seq}"),
         }
+    }
+
+    #[test]
+    fn ansi_log_lines_render_text_without_escape_sequences() {
+        let line = ansi_log_line("\u{1b}[32mVITE\u{1b}[0m ready", Style::default());
+        assert_eq!(
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "VITE ready"
+        );
+        assert_eq!(line.spans[0].style.fg, Some(Color::Green));
     }
 }

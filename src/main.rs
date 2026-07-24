@@ -9,8 +9,12 @@ mod tui;
 mod web;
 
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::time::Duration;
+
+#[cfg(windows)]
+use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -136,13 +140,18 @@ fn main() -> Result<()> {
             ..
         })
     ) {
-        let log = daemon::open_daemon_log()?;
-        let stderr = log.try_clone()?;
-        daemonize::Daemonize::new()
-            .stdout(log)
-            .stderr(stderr)
-            .start()
-            .context("failed to detach taskdeck daemon")?;
+        #[cfg(unix)]
+        {
+            let log = daemon::open_daemon_log()?;
+            let stderr = log.try_clone()?;
+            daemonize::Daemonize::new()
+                .stdout(log)
+                .stderr(stderr)
+                .start()
+                .context("failed to detach taskdeck daemon")?;
+        }
+        #[cfg(windows)]
+        attach_daemon_log()?;
     }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -323,14 +332,7 @@ async fn ensure_daemon() -> Result<()> {
         return Ok(());
     }
     let executable = std::env::current_exe().context("cannot locate taskdeck executable")?;
-    Command::new(executable)
-        .arg("daemon")
-        .arg("--background")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to launch taskdeck daemon")?;
+    spawn_background_daemon(&executable)?;
     for _ in 0..50 {
         if daemon::is_running().await {
             return Ok(());
@@ -341,6 +343,83 @@ async fn ensure_daemon() -> Result<()> {
         "daemon did not become ready; inspect {}/daemon.log",
         daemon::root_path()?.display()
     )
+}
+
+#[cfg(unix)]
+fn spawn_background_daemon(executable: &std::path::Path) -> Result<()> {
+    Command::new(executable)
+        .arg("daemon")
+        .arg("--background")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to launch taskdeck daemon")?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn spawn_background_daemon(executable: &std::path::Path) -> Result<()> {
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::Threading::{
+            CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CreateProcessW, PROCESS_INFORMATION,
+            STARTUPINFOW,
+        },
+    };
+
+    let application = executable
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut command_line = format!("\"{}\" daemon --background", executable.display())
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut process = PROCESS_INFORMATION::default();
+    let created = unsafe {
+        CreateProcessW(
+            application.as_ptr(),
+            command_line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB,
+            std::ptr::null(),
+            std::ptr::null(),
+            &startup,
+            &mut process,
+        )
+    };
+    if created == 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to launch taskdeck daemon");
+    }
+    unsafe {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn attach_daemon_log() -> Result<()> {
+    use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle};
+
+    let stdout = daemon::open_daemon_log()?;
+    let stderr = stdout.try_clone()?;
+    let stdout_set = unsafe { SetStdHandle(STD_OUTPUT_HANDLE, stdout.as_raw_handle().cast()) } != 0;
+    let stderr_set = unsafe { SetStdHandle(STD_ERROR_HANDLE, stderr.as_raw_handle().cast()) } != 0;
+    if !stdout_set || !stderr_set {
+        return Err(std::io::Error::last_os_error()).context("failed to attach daemon log");
+    }
+    std::mem::forget(stdout);
+    std::mem::forget(stderr);
+    Ok(())
 }
 
 #[cfg(test)]
