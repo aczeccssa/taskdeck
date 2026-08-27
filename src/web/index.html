@@ -1,125 +1,125 @@
 <!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light dark">
-  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/styles.css">
-  <title>Taskdeck</title>
-</head>
-<body>
-  <div class="shell" id="app-shell">
-    <aside class="sidebar" id="sidebar">
-      <div class="brand-row">
-        <div class="brand">
-          <span class="brand-mark" aria-hidden="true">T</span>
-          <span class="brand-copy"><strong>Taskdeck</strong><small>Control plane</small></span>
-        </div>
-        <button class="icon-button sidebar-toggle" id="sidebar-toggle" type="button" aria-label="Collapse navigation" title="Collapse navigation">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 7-5 5 5 5M20 5v14"/></svg>
-        </button>
-      </div>
-
-      <div class="nav-label">Workspace</div>
-      <nav class="nav" aria-label="Primary navigation">
-        <button class="nav-button active" type="button" data-view="tasks" aria-label="Tasks" title="Tasks">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h9M5 17h6"/></svg><span>Tasks</span>
-        </button>
-        <button class="nav-button" type="button" data-view="calls" aria-label="MCP Calls" title="MCP Calls">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 4h8v4H8zM5 14h4m6 0h4M7 8v3h10V8M7 11v3m10-3v3"/></svg><span>MCP Calls</span>
-        </button>
-        <button class="nav-button" type="button" data-view="docs" aria-label="MCP Guide" title="MCP Guide">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h8l4 4v14H7zM15 3v5h4M10 12h6M10 16h6"/></svg><span>MCP Guide</span>
-        </button>
-      </nav>
-
-      <div class="nav-spacer"></div>
-      <div class="connection" id="connection-state"><i></i><span>Daemon connected</span></div>
-    </aside>
-
-    <main class="main">
-      <header class="topbar">
-        <div class="topbar-title"><strong id="page-title">Task workspace</strong><span id="meta">No sessions registered</span></div>
-        <select class="node-select" id="nodes" aria-label="Taskdeck node"><option value="">No nodes</option></select>
-        <select class="session-select" id="sessions" aria-label="Registered session"><option value="">No sessions</option></select>
-        <button class="icon-button" id="theme" type="button" aria-label="Change color theme" title="Change color theme">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v3M12 19v3M2 12h3m14 0h3M5 5l2 2m10 10 2 2M19 5l-2 2M7 17l-2 2"/></svg>
-        </button>
-      </header>
-
-      <section class="view workspace-view active" id="tasks-view">
-        <div class="task-tabs" id="tabs" role="tablist" aria-label="Tasks"></div>
-        <div class="task-pane" id="task-pane">
-          <div class="empty-state"><div><h1>No active workspace</h1><p>Register a project from the CLI or TUI.</p></div></div>
-        </div>
-      </section>
-
-      <section class="view" id="calls-view" hidden>
-        <div class="mcp-calls">
-          <header class="section-heading">
-            <div><h1>MCP Calls</h1><p id="calls-summary">0 retained calls</p></div>
-            <button class="button" id="refresh-calls" type="button">Refresh</button>
-          </header>
-          <div class="calls-toolbar" aria-label="MCP call filters">
-            <label class="search-field"><span class="sr-only">Search calls</span><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg><input id="calls-search" type="search" placeholder="Search calls" autocomplete="off"></label>
-            <select id="calls-operation" aria-label="Filter by operation">
-              <option value="">All operations</option><option value="sessions">Sessions</option><option value="status">Status</option><option value="logs">Logs</option><option value="start">Start</option><option value="stop">Stop</option><option value="restart">Restart</option><option value="pause">Pause</option><option value="resume">Resume</option>
-            </select>
-            <select id="calls-status" aria-label="Filter by result"><option value="all">All results</option><option value="success">Success</option><option value="error">Error</option></select>
-            <input id="calls-session" type="text" placeholder="Session" aria-label="Filter by exact session">
-            <input id="calls-task" type="text" placeholder="Task" aria-label="Filter by exact task">
-            <select id="calls-page-size" aria-label="Calls per page"><option value="20">20 / page</option><option value="50">50 / page</option><option value="100">100 / page</option></select>
-            <button class="icon-button" id="clear-call-filters" type="button" aria-label="Clear filters" title="Clear filters">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"/></svg>
-            </button>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/assets/styles.css">
+    <title>Taskdeck</title>
+  </head>
+  <body>
+    <div class="shell" id="app-shell">
+      <aside class="sidebar" id="sidebar">
+        <div class="brand-row">
+          <div class="brand">
+            <span class="brand-mark" aria-hidden="true">T</span>
+            <span class="brand-copy"><strong>Taskdeck</strong><small>Control plane</small></span>
           </div>
-          <div class="calls-table-wrap">
-            <table class="calls-table"><thead><tr><th>Operation</th><th>Target</th><th>Result</th><th>Started</th><th>Duration</th><th></th></tr></thead><tbody id="calls-body"><tr class="empty-row"><td colspan="6">No MCP calls recorded.</td></tr></tbody></table>
+          <button class="icon-button sidebar-toggle" id="sidebar-toggle" type="button" aria-label="Collapse navigation" title="Collapse navigation">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 7-5 5 5 5M20 5v14"/></svg>
+          </button>
+        </div>
+
+        <div class="nav-label">Workspace</div>
+        <nav class="nav" aria-label="Primary navigation">
+          <button class="nav-button active" type="button" data-view="tasks" aria-label="Tasks" title="Tasks">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h9M5 17h6"/></svg><span>Tasks</span>
+          </button>
+          <button class="nav-button" type="button" data-view="calls" aria-label="MCP Calls" title="MCP Calls">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 4h8v4H8zM5 14h4m6 0h4M7 8v3h10V8M7 11v3m10-3v3"/></svg><span>MCP Calls</span>
+          </button>
+          <button class="nav-button" type="button" data-view="docs" aria-label="MCP Guide" title="MCP Guide">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h8l4 4v14H7zM15 3v5h4M10 12h6M10 16h6"/></svg><span>MCP Guide</span>
+          </button>
+        </nav>
+
+        <div class="nav-spacer"></div>
+        <div class="connection" id="connection-state"><i></i><span>Daemon connected</span></div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div class="topbar-title"><strong id="page-title">Task workspace</strong><span id="meta">No sessions registered</span></div>
+          <select class="node-select" id="nodes" aria-label="Taskdeck node"><option value="">No nodes</option></select>
+          <select class="session-select" id="sessions" aria-label="Registered session"><option value="">No sessions</option></select>
+          <button class="icon-button" id="theme" type="button" aria-label="Change color theme" title="Change color theme">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v3M12 19v3M2 12h3m14 0h3M5 5l2 2m10 10 2 2M19 5l-2 2M7 17l-2 2"/></svg>
+          </button>
+        </header>
+
+        <section class="view workspace-view active" id="tasks-view">
+          <div class="task-tabs" id="tabs" role="tablist" aria-label="Tasks"></div>
+          <div class="task-pane" id="task-pane">
+            <div class="empty-state"><div><h1>No active workspace</h1><p>Register a project from the CLI or TUI.</p></div></div>
           </div>
-          <footer class="pager"><span id="calls-page-label">Page 0 of 0</span><div><button class="button" id="calls-prev" type="button">Previous</button><button class="button" id="calls-next" type="button">Next</button></div></footer>
-        </div>
-      </section>
+        </section>
 
-      <section class="view" id="docs-view" hidden>
-        <article class="docs">
-          <header class="docs-header"><div class="eyebrow">Streamable HTTP</div><h1>MCP Guide</h1><p>Use the local endpoint to inspect and control registered sessions.</p><div class="endpoint"><i></i><code id="endpoint-label">127.0.0.1:9837/mcp</code></div></header>
-          <section class="docs-section"><header><h2>Client configuration</h2></header><div class="code-block" data-copy><button class="icon-button copy" type="button" aria-label="Copy configuration" title="Copy configuration"><svg viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg></button><code id="client-config"></code></div></section>
-          <section class="docs-section"><header><h2>Operations</h2></header><div class="operation-list"><div><code>sessions</code><span>List registered sessions</span></div><div><code>status</code><span>Inspect task state</span></div><div><code>logs</code><span>Read recent output</span></div><div><code>start</code><span>Start one or all tasks</span></div><div><code>pause</code><span>Pause a process group</span></div><div><code>resume</code><span>Resume a process group</span></div><div><code>restart</code><span>Restart one or all tasks</span></div><div><code>stop</code><span>Stop one or all tasks</span></div></div></section>
-        </article>
-      </section>
-    </main>
-  </div>
+        <section class="view" id="calls-view" hidden>
+          <div class="mcp-calls">
+            <header class="section-heading">
+              <div><h1>MCP Calls</h1><p id="calls-summary">0 retained calls</p></div>
+              <button class="button" id="refresh-calls" type="button">Refresh</button>
+            </header>
+            <div class="calls-toolbar" aria-label="MCP call filters">
+              <label class="search-field"><span class="sr-only">Search calls</span><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg><input id="calls-search" type="search" placeholder="Search calls" autocomplete="off"></label>
+              <select id="calls-operation" aria-label="Filter by operation">
+                <option value="">All operations</option><option value="sessions">Sessions</option><option value="status">Status</option><option value="logs">Logs</option><option value="start">Start</option><option value="stop">Stop</option><option value="restart">Restart</option><option value="pause">Pause</option><option value="resume">Resume</option>
+              </select>
+              <select id="calls-status" aria-label="Filter by result"><option value="all">All results</option><option value="success">Success</option><option value="error">Error</option></select>
+              <input id="calls-session" type="text" placeholder="Session" aria-label="Filter by exact session">
+              <input id="calls-task" type="text" placeholder="Task" aria-label="Filter by exact task">
+              <select id="calls-page-size" aria-label="Calls per page"><option value="20">20 / page</option><option value="50">50 / page</option><option value="100">100 / page</option></select>
+              <button class="icon-button" id="clear-call-filters" type="button" aria-label="Clear filters" title="Clear filters">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"/></svg>
+              </button>
+            </div>
+            <div class="calls-table-wrap">
+              <table class="calls-table"><thead><tr><th>Operation</th><th>Target</th><th>Result</th><th>Started</th><th>Duration</th><th></th></tr></thead><tbody id="calls-body"><tr class="empty-row"><td colspan="6">No MCP calls recorded.</td></tr></tbody></table>
+            </div>
+            <footer class="pager"><span id="calls-page-label">Page 0 of 0</span><div><button class="button" id="calls-prev" type="button">Previous</button><button class="button" id="calls-next" type="button">Next</button></div></footer>
+          </div>
+        </section>
 
-  <dialog class="drawer config-drawer" id="config-dialog" aria-labelledby="config-dialog-title">
-    <div class="drawer-shell">
-      <header class="drawer-header"><div><span>Registered configuration</span><h2 id="config-dialog-title">Edit tasks</h2></div><button class="icon-button" id="close-config" type="button" aria-label="Close configuration" title="Close"><svg viewBox="0 0 24 24"><path d="m7 7 10 10M17 7 7 17"/></svg></button></header>
-      <div class="config-context" id="config-context"></div>
-      <div class="config-message" id="config-message" role="alert" aria-live="assertive" hidden></div>
-      <div class="config-layout"><aside class="config-task-list"><div id="config-task-list"></div><button class="button" id="add-config-task" type="button">Add task</button></aside><form class="config-form" id="config-form"><div class="config-form-body" id="config-form-body"></div><footer><button class="button" id="reload-config" type="button" hidden>Reload</button><button class="button primary" id="save-config" type="submit">Apply</button></footer></form></div>
+        <section class="view" id="docs-view" hidden>
+          <article class="docs">
+            <header class="docs-header"><div class="eyebrow">Streamable HTTP</div><h1>MCP Guide</h1><p>Use the local endpoint to inspect and control registered sessions.</p><div class="endpoint"><i></i><code id="endpoint-label">127.0.0.1:9837/mcp</code></div></header>
+            <section class="docs-section"><header><h2>Client configuration</h2></header><div class="code-block" data-copy><button class="icon-button copy" type="button" aria-label="Copy configuration" title="Copy configuration"><svg viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg></button><code id="client-config"></code></div></section>
+            <section class="docs-section"><header><h2>Operations</h2></header><div class="operation-list"><div><code>sessions</code><span>List registered sessions</span></div><div><code>status</code><span>Inspect task state</span></div><div><code>logs</code><span>Read recent output</span></div><div><code>start</code><span>Start one or all tasks</span></div><div><code>pause</code><span>Pause a process group</span></div><div><code>resume</code><span>Resume a process group</span></div><div><code>restart</code><span>Restart one or all tasks</span></div><div><code>stop</code><span>Stop one or all tasks</span></div></div></section>
+          </article>
+        </section>
+      </main>
     </div>
-  </dialog>
 
-  <dialog class="drawer call-dialog" id="call-dialog" aria-labelledby="call-dialog-title">
-    <div class="drawer-shell">
-      <header class="drawer-header call-header">
-        <div class="detail-status-icon" id="detail-status-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m7.5 12 3 3 6-7"/></svg></div>
-        <div class="call-title"><span id="call-dialog-subtitle">MCP call</span><h2 id="call-dialog-title">Call details</h2></div>
-        <button class="icon-button" id="close-call-dialog" type="button" aria-label="Close details" title="Close"><svg viewBox="0 0 24 24"><path d="m7 7 10 10M17 7 7 17"/></svg></button>
-      </header>
-      <div class="call-detail" id="call-detail">
-        <div class="detail-modes" role="tablist" aria-label="Call detail view"><button class="active" type="button" role="tab" data-call-mode="result" aria-controls="call-result-panel" aria-selected="true">Result</button><button type="button" role="tab" data-call-mode="raw" aria-controls="call-raw-panel" aria-selected="false">Raw</button></div>
-        <div class="call-result-view" id="call-result-panel" role="tabpanel" data-call-panel="result">
-          <div class="call-overview" id="call-overview"></div>
-          <section class="detail-section"><header><span>Request</span><h3>What the agent asked for</h3></header><div class="field-list" id="request-fields"></div></section>
-          <section class="detail-section"><header><span>Result</span><h3>What Taskdeck returned</h3></header><div id="response-summary"></div><div id="response-data"></div></section>
-        </div>
-        <div class="call-raw-view" id="call-raw-panel" role="tabpanel" data-call-panel="raw" hidden><section><h3>Request</h3><pre id="call-request"></pre></section><section><h3>Response</h3><pre id="call-response"></pre></section></div>
+    <dialog class="drawer config-drawer" id="config-dialog" aria-labelledby="config-dialog-title">
+      <div class="drawer-shell">
+        <header class="drawer-header"><div><span>Registered configuration</span><h2 id="config-dialog-title">Edit tasks</h2></div><button class="icon-button" id="close-config" type="button" aria-label="Close configuration" title="Close"><svg viewBox="0 0 24 24"><path d="m7 7 10 10M17 7 7 17"/></svg></button></header>
+        <div class="config-context" id="config-context"></div>
+        <div class="config-message" id="config-message" role="alert" aria-live="assertive" hidden></div>
+        <div class="config-layout"><aside class="config-task-list"><div id="config-task-list"></div><button class="button" id="add-config-task" type="button">Add task</button></aside><form class="config-form" id="config-form"><div class="config-form-body" id="config-form-body"></div><footer><button class="button" id="reload-config" type="button" hidden>Reload</button><button class="button primary" id="save-config" type="submit">Apply</button></footer></form></div>
       </div>
-    </div>
-  </dialog>
+    </dialog>
 
-  <div class="toast" id="toast" role="status" aria-live="polite"></div>
-  <script src="/assets/app.js" defer></script>
-</body>
+    <dialog class="drawer call-dialog" id="call-dialog" aria-labelledby="call-dialog-title">
+      <div class="drawer-shell">
+        <header class="drawer-header call-header">
+          <div class="detail-status-icon" id="detail-status-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m7.5 12 3 3 6-7"/></svg></div>
+          <div class="call-title"><span id="call-dialog-subtitle">MCP call</span><h2 id="call-dialog-title">Call details</h2></div>
+          <button class="icon-button" id="close-call-dialog" type="button" aria-label="Close details" title="Close"><svg viewBox="0 0 24 24"><path d="m7 7 10 10M17 7 7 17"/></svg></button>
+        </header>
+        <div class="call-detail" id="call-detail">
+          <div class="detail-modes" role="tablist" aria-label="Call detail view"><button class="active" type="button" role="tab" data-call-mode="result" aria-controls="call-result-panel" aria-selected="true">Result</button><button type="button" role="tab" data-call-mode="raw" aria-controls="call-raw-panel" aria-selected="false">Raw</button></div>
+          <div class="call-result-view" id="call-result-panel" role="tabpanel" data-call-panel="result">
+            <div class="call-overview" id="call-overview"></div>
+            <section class="detail-section"><header><span>Request</span><h3>What the agent asked for</h3></header><div class="field-list" id="request-fields"></div></section>
+            <section class="detail-section"><header><span>Result</span><h3>What Taskdeck returned</h3></header><div id="response-summary"></div><div id="response-data"></div></section>
+          </div>
+          <div class="call-raw-view" id="call-raw-panel" role="tabpanel" data-call-panel="raw" hidden><section><h3>Request</h3><pre id="call-request"></pre></section><section><h3>Response</h3><pre id="call-response"></pre></section></div>
+        </div>
+      </div>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="/assets/app.js" defer></script>
+  </body>
 </html>
