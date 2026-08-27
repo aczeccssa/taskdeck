@@ -102,6 +102,26 @@ enum Commands {
     Endpoints,
     /// Stop the global daemon and every managed task.
     Shutdown,
+    /// Configure single-user access-key authentication.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthCommands {
+    /// Print whether access-key authentication is enabled and configured.
+    Status,
+    /// Enable authentication. Uses TASKDECK_ACCESS_KEY or generates a one-time key.
+    Enable {
+        #[arg(long)]
+        generate: bool,
+    },
+    /// Disable authentication and remove its configured key hash.
+    Disable,
+    /// Replace the configured key by reading a new value from stdin.
+    SetKey,
 }
 
 #[derive(Subcommand)]
@@ -163,6 +183,9 @@ async fn run(cli: Cli) -> Result<()> {
     if let Some(Commands::Daemon { web_port, .. }) = &cli.command {
         return daemon::run(*web_port).await;
     }
+    if let Some(Commands::Auth { command }) = cli.command {
+        return run_auth_command(command).await;
+    }
     if let Some(Commands::Node { command }) = cli.command {
         return run_node_command(command).await;
     }
@@ -219,8 +242,48 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Commands::Shutdown => print_response(daemon::request(&Request::Shutdown).await?),
-        Commands::Daemon { .. } | Commands::Node { .. } => unreachable!(),
+        Commands::Daemon { .. } | Commands::Node { .. } | Commands::Auth { .. } => unreachable!(),
     }
+}
+
+async fn run_auth_command(command: AuthCommands) -> Result<()> {
+    let root = daemon::root_path()?;
+    let store = StateStore::open(&root)?;
+    match command {
+        AuthCommands::Status => {
+            let settings = store.auth_settings()?;
+            println!("{}", serde_json::to_string_pretty(&settings.public())?);
+        }
+        AuthCommands::Enable { generate } => {
+            let generated = generate.then(|| uuid::Uuid::new_v4().simple().to_string());
+            if let Some(key) = &generated {
+                store.set_access_key(key)?;
+            } else if !generate && std::env::var_os("TASKDECK_ACCESS_KEY").is_none() {
+                bail!("provide TASKDECK_ACCESS_KEY or pass --generate");
+            }
+            let settings = store.configure_auth(true)?;
+            println!("{}", serde_json::to_string_pretty(&settings.public())?);
+            if let Some(key) = generated {
+                println!("access key: {key}");
+            }
+            if daemon::is_running().await {
+                let _ = daemon::request(&Request::Shutdown).await;
+            }
+        }
+        AuthCommands::Disable => {
+            let settings = store.configure_auth(false)?;
+            println!("{}", serde_json::to_string_pretty(&settings.public())?);
+        }
+        AuthCommands::SetKey => {
+            let mut line = String::new();
+            std::io::Write::write_all(&mut std::io::stderr(), b"Enter new access key: ")?;
+            std::io::stdin().read_line(&mut line)?;
+            let key = line.trim();
+            store.set_access_key(key)?;
+            println!("access key updated");
+        }
+    }
+    Ok(())
 }
 
 async fn run_node_command(command: NodeCommands) -> Result<()> {

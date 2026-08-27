@@ -11,7 +11,10 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use uuid::Uuid;
 
 use crate::daemon::{DaemonState, dispatch_async};
-use crate::protocol::{Action, EditableTaskInput, NodeSummary, Request, Response, SessionSnapshot};
+use crate::protocol::{
+    Action, EditableTaskInput, EventFilter, NodeSummary, Request, Response, SessionSnapshot,
+    TaskRunFilter,
+};
 use crate::state::{NodeSettings, StateStore};
 
 pub const AGENT_PROTOCOL_VERSION: u32 = 1;
@@ -55,6 +58,12 @@ pub enum AgentMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RemoteRequest {
     ListSessions,
+    ListTaskRuns {
+        filter: TaskRunFilter,
+    },
+    ListEvents {
+        filter: EventFilter,
+    },
     Snapshot {
         session: String,
         tail: Option<usize>,
@@ -80,6 +89,8 @@ pub enum RemoteRequest {
     PutSessionConfig {
         session: String,
         revision: String,
+        #[serde(default)]
+        workspace_env: Option<std::collections::BTreeMap<String, String>>,
         tasks: Vec<EditableTaskInput>,
     },
     Action {
@@ -96,6 +107,8 @@ impl RemoteRequest {
     pub fn into_local(self) -> Request {
         match self {
             Self::ListSessions => Request::ListSessions,
+            Self::ListTaskRuns { filter } => Request::ListTaskRuns { filter },
+            Self::ListEvents { filter } => Request::ListEvents { filter },
             Self::Snapshot { session, tail } => Request::Snapshot { session, tail },
             Self::TaskLogs {
                 session,
@@ -122,10 +135,12 @@ impl RemoteRequest {
             Self::PutSessionConfig {
                 session,
                 revision,
+                workspace_env,
                 tasks,
             } => Request::PutSessionConfig {
                 session,
                 revision,
+                workspace_env,
                 tasks,
             },
             Self::Action {

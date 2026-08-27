@@ -465,7 +465,7 @@ fn render(frame: &mut Frame, app: &App) {
     let task = app
         .selected_label()
         .and_then(|label| app.snapshot.tasks.get(label));
-    let (status, status_style, pid, command, cwd) = if let Some(task) = task {
+    let (status, status_style, pid, command, cwd, schedule, last_exit) = if let Some(task) = task {
         let style = match task.status {
             TaskStatus::Running => Style::default().fg(Color::Green),
             TaskStatus::Paused => Style::default().fg(Color::Yellow),
@@ -480,6 +480,8 @@ fn render(frame: &mut Frame, app: &App) {
                 .unwrap_or_else(|| "-".into()),
             task.command.as_str(),
             task.cwd.to_string_lossy(),
+            task.schedule.as_deref().unwrap_or(""),
+            task.last_exit.as_deref().unwrap_or(""),
         )
     } else {
         (
@@ -488,9 +490,11 @@ fn render(frame: &mut Frame, app: &App) {
             "-".into(),
             "",
             "".into(),
+            "",
+            "",
         )
     };
-    let info = Paragraph::new(vec![
+    let mut info_lines = vec![
         Line::from(vec![
             Span::styled(status, status_style.add_modifier(Modifier::BOLD)),
             Span::raw(format!("  PID {pid}  ")),
@@ -500,8 +504,21 @@ fn render(frame: &mut Frame, app: &App) {
             format!("cwd: {cwd}"),
             Style::default().fg(Color::DarkGray),
         )),
-    ])
-    .block(Block::default().borders(Borders::LEFT | Borders::RIGHT));
+    ];
+    if !schedule.is_empty() {
+        info_lines.push(Line::from(Span::styled(
+            format!("cron: {schedule}"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    if !last_exit.is_empty() {
+        info_lines.push(Line::from(Span::styled(
+            format!("last exit: {last_exit}"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let info =
+        Paragraph::new(info_lines).block(Block::default().borders(Borders::LEFT | Borders::RIGHT));
     frame.render_widget(info, sections[1]);
 
     let inner_height = sections[2].height.saturating_sub(2) as usize;

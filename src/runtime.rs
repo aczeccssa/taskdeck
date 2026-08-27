@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Read};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -120,8 +120,10 @@ pub struct TaskRuntime {
     child: Option<GroupChild>,
     pid: Option<u32>,
     start_generation: u64,
+    started_at_ms: u64,
     history_generation: u64,
     last_exit: Option<String>,
+    exit_code: Option<i32>,
     logs: Arc<Mutex<LogBuffer>>,
     service: ServiceObservation,
     #[cfg(windows)]
@@ -137,8 +139,10 @@ impl TaskRuntime {
             child: None,
             pid: None,
             start_generation: 0,
+            started_at_ms: 0,
             history_generation: 1,
             last_exit: None,
+            exit_code: None,
             logs: Arc::new(Mutex::new(LogBuffer::default())),
             service,
             #[cfg(windows)]
@@ -235,10 +239,15 @@ impl TaskRuntime {
             spawn_reader(stderr, "stderr", self.logs.clone());
         }
         self.start_generation += 1;
+        self.started_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         self.child = Some(child);
         self.pid = Some(pid);
         self.status = TaskStatus::Running;
         self.last_exit = None;
+        self.exit_code = None;
         self.push_system(format!("running (pid {pid})"));
         Ok(())
     }
@@ -324,6 +333,7 @@ impl TaskRuntime {
         self.status = TaskStatus::Idle;
         self.reset_runtime_service(ServiceInspectionState::NotRunning);
         self.last_exit = Some(status.to_string());
+        self.exit_code = exit_code_for(&status);
         self.push_system(format!("stopped ({status})"));
         Ok(())
     }
@@ -351,6 +361,7 @@ impl TaskRuntime {
             self.pid = None;
             self.reset_runtime_service(ServiceInspectionState::NotRunning);
             self.last_exit = Some(status.to_string());
+            self.exit_code = exit_code_for(&status);
             self.logs
                 .lock()
                 .expect("log lock")
@@ -425,8 +436,11 @@ impl TaskRuntime {
             cwd: self.spec.cwd.clone(),
             auto_start: self.spec.auto_start,
             last_exit: self.last_exit.clone(),
+            exit_code: self.exit_code,
             logs: logs.lines.iter().skip(skip).cloned().collect(),
             run_generation: self.start_generation,
+            started_at_ms: self.started_at_ms,
+            schedule: self.spec.schedule.clone(),
             service,
         })
     }
@@ -435,6 +449,16 @@ impl TaskRuntime {
         self.poll()?;
         Ok(self.logs.lock().expect("log lock").snapshot(after, limit))
     }
+}
+
+#[cfg(unix)]
+fn exit_code_for(status: &ExitStatus) -> Option<i32> {
+    status.code()
+}
+
+#[cfg(windows)]
+fn exit_code_for(status: &ExitStatus) -> Option<i32> {
+    status.code().map(|code| code as i32)
 }
 
 #[cfg(windows)]
@@ -659,6 +683,21 @@ impl SessionRuntime {
         }
     }
 
+    pub fn scheduled_start(&mut self, label: &str) -> Result<bool> {
+        let task = self.tasks.get_mut(label).with_context(|| {
+            format!(
+                "scheduled task '{label}' not found in session '{}'",
+                self.name
+            )
+        })?;
+        task.poll()?;
+        if matches!(task.status, TaskStatus::Running | TaskStatus::Paused) {
+            return Ok(false);
+        }
+        task.start()?;
+        Ok(true)
+    }
+
     pub fn auto_start(&mut self) {
         for task in self.tasks.values_mut().filter(|task| task.spec.auto_start) {
             let _ = task.start();
@@ -792,6 +831,7 @@ mod tests {
             auto_start: false,
             stop_timeout_ms: 500,
             clear_logs_on_restart: false,
+            schedule: None,
         })
     }
 
@@ -806,6 +846,7 @@ mod tests {
             auto_start,
             stop_timeout_ms: 500,
             clear_logs_on_restart: false,
+            schedule: None,
         }
     }
 
@@ -1066,5 +1107,42 @@ mod tests {
             task_order: vec!["web".to_string(), "api".to_string()],
         });
         assert_eq!(runtime.snapshot(0).unwrap().task_order, ["web", "api"]);
+    }
+
+    #[test]
+    fn scheduled_start_runs_once_then_skips_running_task() {
+        let mut tasks = BTreeMap::new();
+        tasks.insert(
+            "one-shot".to_string(),
+            TaskSpec {
+                label: "one-shot".into(),
+                program: "sleep".into(),
+                args: vec!["0.05".into()],
+                cwd: PathBuf::from("/tmp"),
+                env: BTreeMap::new(),
+                shell: true,
+                auto_start: false,
+                stop_timeout_ms: 1000,
+                clear_logs_on_restart: false,
+                schedule: Some("* * * * *".into()),
+            },
+        );
+        let mut runtime = SessionRuntime::new(ProjectDefinition {
+            session: "demo".into(),
+            project: PathBuf::from("/tmp"),
+            source: "test".into(),
+            tasks,
+            task_order: vec!["one-shot".into()],
+        });
+        assert!(runtime.scheduled_start("one-shot").unwrap());
+        for _ in 0..50 {
+            if let Ok(snapshot) = runtime.snapshot(0) {
+                if snapshot.tasks["one-shot"].status == TaskStatus::Running {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!runtime.scheduled_start("one-shot").unwrap());
     }
 }

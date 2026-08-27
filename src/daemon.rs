@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -21,15 +21,14 @@ use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 use crate::cluster::{LeaderCluster, RemoteRequest, spawn_worker_client};
 use crate::config;
 use crate::protocol::{
-    McpCallRecord, Request, Response, TaskMetricsAggregate, TaskMetricsSample, TaskMetricsSnapshot,
-    TaskProcessSnapshot, casefold_search_text,
+    Request, Response, TaskMetricsAggregate, TaskMetricsSample, TaskMetricsSnapshot,
+    TaskProcessSnapshot, TaskStatus,
 };
 use crate::runtime::{SessionRuntime, Sessions};
 use crate::service;
 use crate::state::{NodeRole, NodeSettings, StateStore};
 use crate::web;
 
-pub const MAX_MCP_CALLS: usize = 500;
 pub const TASK_METRICS_SAMPLE_INTERVAL_MS: u64 = 1_000;
 pub const MAX_TASK_METRIC_SAMPLES: usize = 600;
 
@@ -40,9 +39,8 @@ pub struct DaemonState {
     pub cluster: LeaderCluster,
     pub sessions: Arc<Mutex<Sessions>>,
     pub unavailable_sessions: Arc<Mutex<BTreeMap<String, UnavailableSession>>>,
-    pub mcp_calls: Arc<Mutex<VecDeque<Arc<McpCallHistoryEntry>>>>,
-    pub next_mcp_call_id: Arc<AtomicU64>,
     pub task_metrics: Arc<Mutex<TaskMetricsStore>>,
+    run_triggers: Arc<Mutex<HashMap<ScheduleKey, String>>>,
     pub config_mutations: Arc<Mutex<()>>,
     pub shutdown: Arc<AtomicBool>,
     #[cfg(test)]
@@ -73,9 +71,8 @@ impl DaemonState {
             cluster,
             sessions: Arc::new(Mutex::new(Sessions::new())),
             unavailable_sessions: Arc::new(Mutex::new(BTreeMap::new())),
-            mcp_calls: Arc::new(Mutex::new(VecDeque::new())),
-            next_mcp_call_id: Arc::new(AtomicU64::new(1)),
             task_metrics: Arc::new(Mutex::new(TaskMetricsStore::default())),
+            run_triggers: Arc::new(Mutex::new(HashMap::new())),
             config_mutations: Arc::new(Mutex::new(())),
             shutdown: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -114,15 +111,22 @@ impl DaemonState {
                 }
             }
         }
+        let auth = store.apply_auth_environment()?;
+        if auth.enabled {
+            let _ = store.record_event(
+                "auth",
+                "access-key authentication enabled",
+                serde_json::json!({"enabled":true}),
+            );
+        }
         Ok(Self {
             store,
             settings: Arc::new(Mutex::new(settings)),
             cluster,
             sessions: Arc::new(Mutex::new(sessions)),
             unavailable_sessions: Arc::new(Mutex::new(unavailable_sessions)),
-            mcp_calls: Arc::new(Mutex::new(VecDeque::new())),
-            next_mcp_call_id: Arc::new(AtomicU64::new(1)),
             task_metrics: Arc::new(Mutex::new(TaskMetricsStore::default())),
+            run_triggers: Arc::new(Mutex::new(HashMap::new())),
             config_mutations: Arc::new(Mutex::new(())),
             shutdown: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -264,33 +268,6 @@ impl DaemonState {
             .collect()
     }
 
-    pub fn record_mcp_call(&self, mut record: McpCallRecord) {
-        record.id = self.next_mcp_call_id.fetch_add(1, Ordering::Relaxed);
-        let entry = Arc::new(McpCallHistoryEntry::new(record));
-        let mut calls = self.mcp_calls.lock().expect("MCP calls lock");
-        calls.push_front(entry);
-        calls.truncate(MAX_MCP_CALLS);
-    }
-
-    pub fn recent_mcp_calls(&self, limit: usize) -> Vec<Arc<McpCallHistoryEntry>> {
-        self.mcp_calls
-            .lock()
-            .expect("MCP calls lock")
-            .iter()
-            .take(limit.min(MAX_MCP_CALLS))
-            .cloned()
-            .collect()
-    }
-
-    pub fn mcp_call(&self, id: u64) -> Option<Arc<McpCallHistoryEntry>> {
-        self.mcp_calls
-            .lock()
-            .expect("MCP calls lock")
-            .iter()
-            .find(|call| call.record.id == id)
-            .cloned()
-    }
-
     #[cfg(test)]
     pub fn set_put_config_post_check_delay(&self, delay: Duration) {
         *self
@@ -298,7 +275,6 @@ impl DaemonState {
             .lock()
             .expect("config write delay lock") = Some(delay);
     }
-
     #[cfg(test)]
     fn put_config_post_check_delay(&self) -> Option<Duration> {
         *self
@@ -306,23 +282,20 @@ impl DaemonState {
             .lock()
             .expect("config write delay lock")
     }
-
     #[cfg(test)]
     pub fn set_put_config_before_finalize_content(&self, content: impl Into<String>) {
         *self
             .put_config_before_finalize_content
             .lock()
-            .expect("config finalize hook lock") = Some(content.into());
+            .expect("config write finalize hook lock") = Some(content.into());
     }
-
     #[cfg(test)]
     fn take_put_config_before_finalize_content(&self) -> Option<String> {
         self.put_config_before_finalize_content
             .lock()
-            .expect("config finalize hook lock")
+            .expect("config write finalize hook lock")
             .take()
     }
-
     #[cfg(test)]
     pub fn set_put_config_runtime_failure_after(&self, count: usize) {
         *self
@@ -330,15 +303,6 @@ impl DaemonState {
             .lock()
             .expect("runtime failure hook lock") = Some(count);
     }
-
-    #[cfg(test)]
-    pub fn clear_put_config_runtime_failure(&self) {
-        *self
-            .put_config_runtime_failure_after
-            .lock()
-            .expect("runtime failure hook lock") = None;
-    }
-
     #[cfg(test)]
     fn put_config_runtime_failure_after(&self) -> Option<usize> {
         *self
@@ -346,66 +310,13 @@ impl DaemonState {
             .lock()
             .expect("runtime failure hook lock")
     }
-}
-
-#[derive(Debug)]
-pub struct McpCallHistoryEntry {
-    pub record: McpCallRecord,
-    pub input: serde_json::Value,
-    pub session: Option<String>,
-    pub task: Option<String>,
-    pub searchable_text: String,
-}
-
-impl McpCallHistoryEntry {
-    fn new(record: McpCallRecord) -> Self {
-        let input = record
-            .request
-            .pointer("/params/arguments")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let session = input
-            .get("session")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let task = input
-            .get("task")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let searchable_text = build_mcp_call_searchable_text(
-            &record.tool,
-            record.operation.as_deref(),
-            record.target_node.as_deref(),
-            session.as_deref(),
-            task.as_deref(),
-            &input,
-        );
-        Self {
-            record,
-            input,
-            session,
-            task,
-            searchable_text,
-        }
+    #[cfg(test)]
+    pub fn clear_put_config_runtime_failure(&self) {
+        *self
+            .put_config_runtime_failure_after
+            .lock()
+            .expect("runtime failure hook lock") = None;
     }
-}
-
-fn build_mcp_call_searchable_text(
-    tool: &str,
-    operation: Option<&str>,
-    target_node: Option<&str>,
-    session: Option<&str>,
-    task: Option<&str>,
-    input: &serde_json::Value,
-) -> String {
-    let serialized_input = serde_json::to_string(input).unwrap_or_default();
-    casefold_search_text(&format!(
-        "{tool}\u{1f}{operation}\u{1f}{target_node}\u{1f}{session}\u{1f}{task}\u{1f}{serialized_input}",
-        operation = operation.unwrap_or(""),
-        target_node = target_node.unwrap_or(""),
-        session = session.unwrap_or(""),
-        task = task.unwrap_or(""),
-    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -572,6 +483,303 @@ fn current_timestamp_ms() -> u64 {
         .as_millis() as u64
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ScheduleKey {
+    session: String,
+    task: String,
+}
+
+fn status_label(status: TaskStatus) -> String {
+    serde_json::to_value(&status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{status:?}"))
+}
+
+enum RunTransition {
+    Started(String, Box<crate::protocol::TaskSnapshot>, String),
+    Finished {
+        session: String,
+        task: String,
+        generation: u64,
+        status: String,
+        exit_code: Option<i32>,
+        error_message: Option<String>,
+    },
+}
+
+fn trigger_for(
+    state: &DaemonState,
+    key: &ScheduleKey,
+    snapshot: &crate::protocol::TaskSnapshot,
+) -> String {
+    state
+        .run_triggers
+        .lock()
+        .expect("run trigger lock")
+        .remove(key)
+        .unwrap_or_else(|| {
+            if snapshot.auto_start {
+                "auto_start".to_string()
+            } else {
+                "manual".to_string()
+            }
+        })
+}
+
+fn finished_run_details(
+    session: &str,
+    task_snapshot: &crate::protocol::TaskSnapshot,
+) -> RunTransition {
+    let status = if matches!(task_snapshot.status, TaskStatus::Idle) {
+        "stopped".to_string()
+    } else {
+        status_label(task_snapshot.status.clone())
+    };
+    RunTransition::Finished {
+        session: session.to_string(),
+        task: task_snapshot.label.clone(),
+        generation: task_snapshot.run_generation,
+        status,
+        exit_code: task_snapshot.exit_code,
+        error_message: if matches!(task_snapshot.status, TaskStatus::Failed)
+            || task_snapshot.exit_code.is_none()
+        {
+            task_snapshot.last_exit.clone()
+        } else {
+            None
+        },
+    }
+}
+
+fn collect_run_transitions(
+    state: &DaemonState,
+    tracked: &mut HashMap<ScheduleKey, (u64, TaskStatus)>,
+) -> Vec<RunTransition> {
+    let mut transitions = Vec::new();
+    {
+        let mut sessions = state.sessions.lock().expect("sessions lock");
+        for (session_name, runtime) in sessions.iter_mut() {
+            let Ok(snapshot) = runtime.snapshot(0) else {
+                continue;
+            };
+            for task_snapshot in snapshot.tasks.into_values() {
+                let key = ScheduleKey {
+                    session: session_name.clone(),
+                    task: task_snapshot.label.clone(),
+                };
+                let previous = tracked
+                    .get(&key)
+                    .map(|(generation, status)| (*generation, status.clone()));
+                let (previous_generation, previous_status) = previous
+                    .map(|(generation, status)| (Some(generation), Some(status)))
+                    .unwrap_or((None, None));
+                let generation_changed = previous_generation != Some(task_snapshot.run_generation);
+                let previous_active = previous_status.is_some_and(|status| {
+                    matches!(status, TaskStatus::Running | TaskStatus::Paused)
+                });
+                let current_finished = matches!(
+                    task_snapshot.status,
+                    TaskStatus::Exited | TaskStatus::Failed | TaskStatus::Idle
+                );
+                let generation = task_snapshot.run_generation;
+
+                // A restart can replace a still-active generation before the sampler observes
+                // its stop. Close the previous row before recording the replacement.
+                if generation > 0 && generation_changed && previous_active {
+                    transitions.push(RunTransition::Finished {
+                        session: session_name.clone(),
+                        task: task_snapshot.label.clone(),
+                        generation: previous_generation.expect("previous generation"),
+                        status: "stopped".to_string(),
+                        exit_code: None,
+                        error_message: None,
+                    });
+                }
+
+                // Sampling is asynchronous: a sub-second task can already be Exited/Failed on
+                // its first observation. Record both boundaries from that snapshot.
+                if generation > 0 && generation_changed {
+                    transitions.push(RunTransition::Started(
+                        session_name.clone(),
+                        Box::new(task_snapshot.clone()),
+                        trigger_for(state, &key, &task_snapshot),
+                    ));
+                    if current_finished {
+                        transitions.push(finished_run_details(session_name, &task_snapshot));
+                    }
+                } else if generation > 0 && previous_active && current_finished {
+                    transitions.push(finished_run_details(session_name, &task_snapshot));
+                }
+
+                tracked.insert(key.clone(), (generation, task_snapshot.status.clone()));
+            }
+        }
+    }
+    transitions
+}
+
+fn spawn_task_history_sampler(state: DaemonState) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut tracked = HashMap::<ScheduleKey, (u64, TaskStatus)>::new();
+        while !state.shutdown.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(500));
+            let transitions = collect_run_transitions(&state, &mut tracked);
+            if transitions.is_empty() {
+                continue;
+            }
+            let node_id = match state.store.node_settings() {
+                Ok(v) => v.node_id,
+                Err(_) => continue,
+            };
+            for transition in transitions {
+                match transition {
+                    RunTransition::Started(session, snapshot, trigger) => {
+                        if let Err(error) = state
+                            .store
+                            .record_task_run_start(&node_id, &snapshot, &trigger, &session)
+                        {
+                            eprintln!("failed to persist task run: {error:#}");
+                        }
+                    }
+                    RunTransition::Finished {
+                        session,
+                        task,
+                        generation,
+                        status,
+                        exit_code,
+                        error_message,
+                    } => {
+                        let _ = state.store.finish_task_run(
+                            &node_id,
+                            &session,
+                            &task,
+                            generation,
+                            &status,
+                            exit_code,
+                            error_message.as_deref(),
+                        );
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn spawn_task_scheduler(state: DaemonState) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut last_processed_second = current_timestamp_ms() / 1000;
+        let _ = state.store.record_event(
+            "scheduler",
+            "scheduler started; missed executions while offline were not replayed",
+            serde_json::json!({}),
+        );
+        loop {
+            thread::sleep(Duration::from_millis(250));
+            if state.shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            let now = current_timestamp_ms();
+            let now_second = now / 1000;
+            if now_second <= last_processed_second {
+                continue;
+            }
+            let mut due_actions: Vec<ScheduleKey> = Vec::new();
+            {
+                let mut sessions = state.sessions.lock().expect("sessions lock");
+                for (session_name, runtime) in sessions.iter_mut() {
+                    let Ok(snapshot) = runtime.snapshot(0) else {
+                        continue;
+                    };
+                    for task_snapshot in snapshot.tasks.into_values() {
+                        let Some(expression) = task_snapshot.schedule.as_deref() else {
+                            continue;
+                        };
+                        let fields = expression.split_whitespace().count();
+                        let normalized = if fields == 5 {
+                            format!("0 {expression}")
+                        } else {
+                            expression.to_string()
+                        };
+                        let Ok(schedule) = normalized.parse::<cron::Schedule>() else {
+                            continue;
+                        };
+                        for timestamp_ms in
+                            ((last_processed_second + 1) * 1000)..=(now_second * 1000)
+                        {
+                            if let Some(after_utc) =
+                                chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+                                    timestamp_ms as i64,
+                                )
+                            {
+                                let local_after =
+                                    <chrono::Local as chrono::TimeZone>::from_utc_datetime(
+                                        &chrono::Local,
+                                        &after_utc.naive_utc(),
+                                    );
+                                if schedule.includes(local_after) {
+                                    due_actions.push(ScheduleKey {
+                                        session: session_name.clone(),
+                                        task: task_snapshot.label.clone(),
+                                    });
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            last_processed_second = now_second;
+            for key in due_actions {
+                state
+                    .run_triggers
+                    .lock()
+                    .expect("run trigger lock")
+                    .insert(key.clone(), "cron".to_string());
+                let mut sessions = state.sessions.lock().expect("sessions lock");
+                match sessions
+                    .get_mut(&key.session)
+                    .map(|runtime| runtime.scheduled_start(&key.task))
+                {
+                    Some(Ok(true)) => {
+                        let node_id = state.public_settings().node_id;
+                        if let Some(runtime) = sessions.get_mut(&key.session) {
+                            if let Ok(snapshot) = runtime.snapshot(0) {
+                                if let Some(run_snapshot) = snapshot
+                                    .tasks
+                                    .into_values()
+                                    .find(|value| value.label == key.task)
+                                {
+                                    if let Err(error) = state.store.record_task_run_start(
+                                        &node_id,
+                                        &run_snapshot,
+                                        "cron",
+                                        &key.session,
+                                    ) {
+                                        eprintln!("failed to persist scheduled run: {error:#}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(false)) => {
+                        drop(sessions);
+                        let _ = state.store.record_event(
+                            "scheduler",
+                            "scheduled task already running; execution skipped",
+                            serde_json::json!({"session":key.session,"task":key.task}),
+                        );
+                    }
+                    Some(Err(error)) => {
+                        drop(sessions);
+                        let _=state.store.record_event("scheduler","scheduled task failed to start",serde_json::json!({"session":key.session,"task":key.task,"error":error.to_string()}));
+                    }
+                    None => {}
+                }
+            }
+        }
+    })
+}
 fn collect_metric_targets(state: &DaemonState) -> Vec<TaskMetricsTarget> {
     let sessions = &mut *state.sessions.lock().expect("sessions lock");
     sessions
@@ -946,6 +1154,8 @@ pub async fn run(web_port_override: Option<u16>) -> Result<()> {
                 )
             })?;
     let metrics_sampler = spawn_task_metrics_sampler(state.clone());
+    let history_sampler = spawn_task_history_sampler(state.clone());
+    let task_scheduler = spawn_task_scheduler(state.clone());
     let worker_client =
         if worker_settings.role == NodeRole::Worker && worker_settings.leader_url.is_some() {
             Some(spawn_worker_client(state.clone(), worker_settings))
@@ -1007,7 +1217,13 @@ pub async fn run(web_port_override: Option<u16>) -> Result<()> {
     if let Some(worker_client) = worker_client {
         worker_client.abort();
     }
-    if let Err(payload) = metrics_sampler.join() {
+    let metrics_panic = metrics_sampler.join().err();
+    for (name, handle) in [("history", history_sampler), ("scheduler", task_scheduler)] {
+        if let Err(payload) = handle.join() {
+            eprintln!("{name} worker panicked: {}", panic_message(payload));
+        }
+    }
+    if let Some(payload) = metrics_panic {
         let message = panic_message(payload);
         eprintln!("task metrics sampler thread panicked: {message}");
         stop_all(&state);
@@ -1063,10 +1279,12 @@ fn dispatch(state: &DaemonState, request: Request) -> Response {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_session_config_write(
     state: &DaemonState,
     project: &std::path::Path,
     revision: &str,
+    workspace_env: Option<&std::collections::BTreeMap<String, String>>,
     tasks: Vec<crate::protocol::EditableTaskInput>,
 ) -> std::result::Result<config::PreparedSessionConfigWrite, config::WriteConfigError> {
     #[cfg(not(test))]
@@ -1078,13 +1296,14 @@ fn prepare_session_config_write(
             project,
             revision,
             tasks,
+            workspace_env,
             state.put_config_post_check_delay(),
         )
     }
 
     #[cfg(not(test))]
     {
-        config::prepare_session_config_write(project, revision, tasks)
+        config::prepare_session_config_write(project, revision, tasks, workspace_env)
     }
 }
 
@@ -1222,6 +1441,14 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
                 runtime.snapshot(tail.unwrap_or(500))?,
             ))
         }
+        Request::ListTaskRuns { filter } => {
+            let records = state.store.list_task_runs(&filter)?;
+            Ok(Response::ok("task runs", records))
+        }
+        Request::ListEvents { filter } => {
+            let events = state.store.list_events(&filter)?;
+            Ok(Response::ok("events", events))
+        }
         Request::TaskLogs {
             session,
             task,
@@ -1291,6 +1518,7 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
         Request::PutSessionConfig {
             session,
             revision,
+            workspace_env,
             tasks,
         } => {
             require_local_execution(state)?;
@@ -1313,8 +1541,13 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
                 (project, names)
             };
 
-            let mut prepared = match prepare_session_config_write(state, &project, &revision, tasks)
-            {
+            let mut prepared = match prepare_session_config_write(
+                state,
+                &project,
+                &revision,
+                workspace_env.as_ref(),
+                tasks,
+            ) {
                 Ok(prepared) => prepared,
                 Err(error) => return config_write_error_response(error),
             };
@@ -1397,6 +1630,23 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
             require_local_execution(state)?;
             reject_unavailable_session(state, &session)?;
             let mut sessions = state.sessions.lock().expect("sessions lock");
+            let mut pre_stop_runs: Vec<(String, u64)> = Vec::new();
+            if matches!(
+                action,
+                crate::protocol::Action::Stop | crate::protocol::Action::Restart
+            ) {
+                if let Ok(snapshot) = sessions.get_mut(&session).expect("checked").snapshot(0) {
+                    let task_filter = task.as_deref();
+                    for value in snapshot.tasks.into_values() {
+                        if task_filter.is_none_or(|label| label == value.label)
+                            && matches!(value.status, TaskStatus::Running | TaskStatus::Paused)
+                            && value.run_generation > 0
+                        {
+                            pre_stop_runs.push((value.label, value.run_generation));
+                        }
+                    }
+                }
+            }
             let runtime = sessions
                 .get_mut(&session)
                 .with_context(|| format!("session '{session}' not found"))?;
@@ -1411,6 +1661,32 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
                 }
             }
             drop(metrics);
+            drop(sessions);
+            if matches!(
+                action,
+                crate::protocol::Action::Stop | crate::protocol::Action::Restart
+            ) {
+                let node_id = state
+                    .store
+                    .node_settings()
+                    .map(|v| v.node_id)
+                    .unwrap_or_default();
+                for (stopped_task, generation) in pre_stop_runs {
+                    let _ = state.store.finish_task_run(
+                        &node_id,
+                        &session,
+                        &stopped_task,
+                        generation,
+                        "stopped",
+                        None,
+                        None,
+                    );
+                }
+            }
+            let mut sessions = state.sessions.lock().expect("sessions lock");
+            let runtime = sessions
+                .get_mut(&session)
+                .with_context(|| format!("session '{session}' not found"))?;
             Ok(Response::ok(
                 format!("{action:?} completed"),
                 runtime.snapshot(50)?,
@@ -1547,7 +1823,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::protocol::{EditableTaskInput, SessionConfigSnapshot, TaskMetricsAggregate};
+    use crate::protocol::{
+        EditableTaskInput, McpCallRecord, SessionConfigSnapshot, TaskMetricsAggregate,
+    };
 
     fn call_record() -> McpCallRecord {
         McpCallRecord {
@@ -1564,21 +1842,223 @@ mod tests {
     }
 
     #[test]
-    fn mcp_call_history_is_newest_first_and_bounded() {
+    fn history_sampler_records_a_subsecond_run_and_exit_code() {
         let state = DaemonState::new();
-        for _ in 0..MAX_MCP_CALLS + 2 {
-            state.record_mcp_call(call_record());
+        let project = tempfile::tempdir().unwrap();
+        let mut runtime = SessionRuntime::new(crate::config::ProjectDefinition {
+            session: "demo".to_string(),
+            project: project.path().to_path_buf(),
+            source: "taskdeck.yaml".to_string(),
+            tasks: std::collections::BTreeMap::from([(
+                "quick".to_string(),
+                crate::config::TaskSpec {
+                    label: "quick".to_string(),
+                    program: "exit".to_string(),
+                    args: vec!["7".to_string()],
+                    cwd: project.path().to_path_buf(),
+                    env: Default::default(),
+                    shell: true,
+                    auto_start: false,
+                    stop_timeout_ms: 500,
+                    clear_logs_on_restart: false,
+                    schedule: None,
+                },
+            )]),
+            task_order: vec!["quick".to_string()],
+        });
+        runtime
+            .apply(Some("quick"), crate::protocol::Action::Start)
+            .unwrap();
+        state
+            .sessions
+            .lock()
+            .expect("sessions lock")
+            .insert("demo".to_string(), runtime);
+
+        let mut tracked = std::collections::HashMap::new();
+        let mut transitions = collect_run_transitions(&state, &mut tracked);
+        for _ in 0..100 {
+            if transitions.len() >= 2 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+            transitions.extend(collect_run_transitions(&state, &mut tracked));
+        }
+        assert_eq!(transitions.len(), 2);
+        let node_id = state.store.node_settings().unwrap().node_id;
+        for transition in transitions {
+            match transition {
+                RunTransition::Started(session, snapshot, trigger) => {
+                    state
+                        .store
+                        .record_task_run_start(&node_id, &snapshot, &trigger, &session)
+                        .unwrap();
+                }
+                RunTransition::Finished {
+                    session,
+                    task,
+                    generation,
+                    status,
+                    exit_code,
+                    error_message,
+                } => {
+                    assert!(
+                        state
+                            .store
+                            .finish_task_run(
+                                &node_id,
+                                &session,
+                                &task,
+                                generation,
+                                &status,
+                                exit_code,
+                                error_message.as_deref(),
+                            )
+                            .unwrap()
+                    );
+                }
+            }
         }
 
-        let calls = state.recent_mcp_calls(MAX_MCP_CALLS + 20);
-        assert_eq!(calls.len(), MAX_MCP_CALLS);
-        assert_eq!(calls.first().map(|call| call.record.id), Some(502));
-        assert_eq!(calls.last().map(|call| call.record.id), Some(3));
-        assert!(state.mcp_call(1).is_none());
-        assert_eq!(
-            state.mcp_call(502).map(|call| call.record.tool.clone()),
-            Some("taskdeck_control".to_string())
+        let runs = state
+            .store
+            .list_task_runs(&crate::protocol::TaskRunFilter {
+                session: Some("demo".into()),
+                task: Some("quick".into()),
+                status: None,
+                trigger: None,
+                page: 1,
+                page_size: 20,
+            })
+            .unwrap();
+        assert_eq!(runs.total, 1);
+        assert_eq!(runs.items[0].trigger, "manual");
+        assert_eq!(runs.items[0].status, "failed");
+        assert_eq!(runs.items[0].exit_code, Some(7));
+        assert!(runs.items[0].duration_ms.is_some());
+    }
+
+    #[test]
+    fn history_sampler_finishes_a_stopped_run_with_exit_code() {
+        let state = DaemonState::new();
+        let project = tempfile::tempdir().unwrap();
+        let mut runtime = SessionRuntime::new(crate::config::ProjectDefinition {
+            session: "demo".to_string(),
+            project: project.path().to_path_buf(),
+            source: "taskdeck.yaml".to_string(),
+            tasks: std::collections::BTreeMap::from([(
+                "long".to_string(),
+                crate::config::TaskSpec {
+                    label: "long".to_string(),
+                    program: "trap 'exit 0' TERM; while :; do sleep 1; done".to_string(),
+                    args: Vec::new(),
+                    cwd: project.path().to_path_buf(),
+                    env: Default::default(),
+                    shell: true,
+                    auto_start: false,
+                    stop_timeout_ms: 3000,
+                    clear_logs_on_restart: false,
+                    schedule: None,
+                },
+            )]),
+            task_order: vec!["long".to_string()],
+        });
+        runtime
+            .apply(Some("long"), crate::protocol::Action::Start)
+            .unwrap();
+        state
+            .sessions
+            .lock()
+            .expect("sessions lock")
+            .insert("demo".to_string(), runtime);
+
+        let mut tracked = std::collections::HashMap::new();
+        let started = collect_run_transitions(&state, &mut tracked);
+        assert_eq!(started.len(), 1);
+        assert!(matches!(started[0], RunTransition::Started(_, _, _)));
+
+        state
+            .sessions
+            .lock()
+            .expect("sessions lock")
+            .get_mut("demo")
+            .unwrap()
+            .apply(Some("long"), crate::protocol::Action::Stop)
+            .unwrap();
+        let finished = collect_run_transitions(&state, &mut tracked);
+        assert_eq!(finished.len(), 1);
+        let RunTransition::Finished {
+            exit_code,
+            session,
+            task,
+            generation,
+            status,
+            error_message,
+        } = &finished[0]
+        else {
+            panic!("expected finished transition");
+        };
+        assert_eq!(*exit_code, None);
+        assert_eq!(status, "stopped");
+        assert!(
+            error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("signal"))
         );
+        let node_id = state.store.node_settings().unwrap().node_id;
+        if let RunTransition::Started(_, snapshot, trigger) = &started[0] {
+            state
+                .store
+                .record_task_run_start(&node_id, snapshot, trigger, session)
+                .unwrap();
+        }
+        state
+            .store
+            .finish_task_run(
+                &node_id,
+                session,
+                task,
+                *generation,
+                status,
+                *exit_code,
+                error_message.as_deref(),
+            )
+            .unwrap();
+        let runs = state
+            .store
+            .list_task_runs(&crate::protocol::TaskRunFilter {
+                session: Some("demo".into()),
+                task: Some("long".into()),
+                status: None,
+                trigger: None,
+                page: 1,
+                page_size: 20,
+            })
+            .unwrap();
+        assert_eq!(runs.items[0].status, "stopped");
+        assert_eq!(runs.items[0].exit_code, None);
+        assert!(
+            runs.items[0]
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("signal"))
+        );
+    }
+
+    #[test]
+    fn mcp_call_history_is_persisted_with_database_ids() {
+        let state = DaemonState::new();
+        for _ in 0..3 {
+            let _ = state.store.record_mcp_call(call_record());
+        }
+        let page = state
+            .store
+            .list_mcp_calls(None, None, None, None, None, 1, 20)
+            .unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(page.items[0].id, 3);
+        assert_eq!(page.items[0].tool, "taskdeck_control");
+        assert!(state.store.mcp_call_detail(1).unwrap().is_some());
     }
 
     #[test]
@@ -1649,6 +2129,7 @@ mod tests {
             auto_start: false,
             stop_timeout_ms: 3_000,
             clear_logs_on_restart: false,
+            schedule: None,
         }
     }
 
@@ -1799,6 +2280,8 @@ mod tests {
                         auto_start: false,
                         stop_timeout_ms: 500,
                         clear_logs_on_restart: false,
+
+                        schedule: None,
                     },
                 )]),
                 task_order: vec!["worker".to_string()],
@@ -1861,6 +2344,8 @@ mod tests {
                         auto_start: false,
                         stop_timeout_ms: 500,
                         clear_logs_on_restart: false,
+
+                        schedule: None,
                     },
                 )]),
                 task_order: vec!["idle".to_string()],
@@ -1894,6 +2379,8 @@ mod tests {
                     auto_start: false,
                     stop_timeout_ms: 500,
                     clear_logs_on_restart: false,
+
+                    schedule: None,
                 },
             )]),
             task_order: vec!["clock".to_string()],
@@ -1965,6 +2452,8 @@ mod tests {
                     auto_start: false,
                     stop_timeout_ms: 500,
                     clear_logs_on_restart: false,
+
+                    schedule: None,
                 },
             )]),
             task_order: vec!["flash".to_string()],
@@ -2087,6 +2576,7 @@ mod tests {
             Request::PutSessionConfig {
                 session: "one".to_string(),
                 revision,
+                workspace_env: None,
                 tasks: vec![
                     task_input("api", "echo new"),
                     task_input("worker", "echo worker"),
@@ -2175,6 +2665,7 @@ mod tests {
             Request::PutSessionConfig {
                 session: "demo".to_string(),
                 revision: config.revision,
+                workspace_env: None,
                 tasks: vec![task_input("api", "echo ready"), broken],
             },
         )
@@ -2244,6 +2735,7 @@ mod tests {
             Request::PutSessionConfig {
                 session: "one".to_string(),
                 revision: snapshot.revision,
+                workspace_env: None,
                 tasks: vec![task_input("api", "echo changed")],
             },
         )
@@ -2302,6 +2794,7 @@ mod tests {
                 Request::PutSessionConfig {
                     session: "one".to_string(),
                     revision: first_revision,
+                    workspace_env: None,
                     tasks: vec![task_input("api", "echo one")],
                 },
             )
@@ -2318,6 +2811,7 @@ mod tests {
                 Request::PutSessionConfig {
                     session: "one".to_string(),
                     revision: second_revision,
+                    workspace_env: None,
                     tasks: vec![task_input("api", "echo two")],
                 },
             )
@@ -2385,6 +2879,7 @@ mod tests {
             Request::PutSessionConfig {
                 session: "one".to_string(),
                 revision: snapshot.revision,
+                workspace_env: None,
                 tasks: vec![task_input("api", "echo submitted")],
             },
         )
@@ -2514,6 +3009,7 @@ mod tests {
             Request::PutSessionConfig {
                 session: "a".to_string(),
                 revision: snapshot.revision,
+                workspace_env: None,
                 tasks: vec![task_input("api", "echo new")],
             },
         )
@@ -2559,6 +3055,7 @@ mod tests {
             Request::PutSessionConfig {
                 session: "a".to_string(),
                 revision: current_revision,
+                workspace_env: None,
                 tasks: vec![task_input("api", "echo new")],
             },
         )

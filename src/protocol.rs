@@ -104,9 +104,15 @@ pub struct TaskSnapshot {
     pub cwd: PathBuf,
     pub auto_start: bool,
     pub last_exit: Option<String>,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
     pub logs: Vec<LogLine>,
     #[serde(default)]
     pub run_generation: u64,
+    #[serde(default)]
+    pub started_at_ms: u64,
+    #[serde(default)]
+    pub schedule: Option<String>,
     #[serde(default)]
     pub service: ServiceObservation,
 }
@@ -196,10 +202,13 @@ pub struct EditableTask {
     pub cwd: String,
     pub env: BTreeMap<String, String>,
     pub shell: bool,
+    #[serde(default)]
     pub auto_start: bool,
     pub stop_timeout_ms: u64,
     #[serde(default)]
     pub clear_logs_on_restart: bool,
+    #[serde(default)]
+    pub schedule: Option<String>,
     pub origin: EditableTaskOrigin,
 }
 
@@ -215,6 +224,8 @@ pub struct EditableTaskInput {
     pub stop_timeout_ms: u64,
     #[serde(default)]
     pub clear_logs_on_restart: bool,
+    #[serde(default)]
+    pub schedule: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -223,6 +234,8 @@ pub struct SessionConfigSnapshot {
     pub project: PathBuf,
     pub source: String,
     pub revision: String,
+    #[serde(default)]
+    pub workspace_env: BTreeMap<String, String>,
     pub tasks: Vec<EditableTask>,
 }
 
@@ -241,8 +254,102 @@ impl SessionConfigSnapshot {
                 auto_start: task.auto_start,
                 stop_timeout_ms: task.stop_timeout_ms,
                 clear_logs_on_restart: task.clear_logs_on_restart,
+                schedule: task.schedule.clone(),
             })
             .collect()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaskRunRecord {
+    pub id: u64,
+    #[serde(default)]
+    pub node_id: String,
+    pub session: String,
+    pub task: String,
+    pub trigger: String,
+    pub status: String,
+    pub started_at_ms: u64,
+    #[serde(default)]
+    pub finished_at_ms: Option<u64>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    pub command: String,
+    pub cwd: PathBuf,
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub run_generation: u64,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRunFilter {
+    pub session: Option<String>,
+    pub task: Option<String>,
+    pub status: Option<String>,
+    pub trigger: Option<String>,
+    pub page: usize,
+    pub page_size: usize,
+}
+
+impl TaskRunFilter {
+    pub fn parse(
+        query: &std::collections::HashMap<String, String>,
+    ) -> std::result::Result<Self, Response> {
+        let optional = |key: &str| {
+            query
+                .get(key)
+                .map(|value| value.trim())
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        Ok(Self {
+            session: optional("session"),
+            task: optional("task"),
+            status: optional("status"),
+            trigger: optional("trigger"),
+            page: parse_positive_usize(query, "page", 1)?,
+            page_size: parse_history_page_size(query)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EventRecord {
+    pub id: u64,
+    pub timestamp_ms: u64,
+    pub category: String,
+    pub message: String,
+    #[serde(default)]
+    pub details: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventFilter {
+    pub category: Option<String>,
+    pub page: usize,
+    pub page_size: usize,
+}
+
+impl EventFilter {
+    pub fn parse(
+        query: &std::collections::HashMap<String, String>,
+    ) -> std::result::Result<Self, Response> {
+        let optional = |key: &str| {
+            query
+                .get(key)
+                .map(|value| value.trim())
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        Ok(Self {
+            category: optional("category"),
+            page: parse_positive_usize(query, "page", 1)?,
+            page_size: parse_history_page_size(query)?,
+        })
     }
 }
 
@@ -258,6 +365,28 @@ pub struct McpCallRecord {
     pub target_node: Option<String>,
     pub request: Value,
     pub response: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRunListPage {
+    pub items: Vec<TaskRunRecord>,
+    pub page: usize,
+    pub page_size: usize,
+    pub total: usize,
+    pub total_pages: usize,
+    pub has_next: bool,
+    pub has_previous: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventListPage {
+    pub items: Vec<EventRecord>,
+    pub page: usize,
+    pub page_size: usize,
+    pub total: usize,
+    pub total_pages: usize,
+    pub has_next: bool,
+    pub has_previous: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -284,6 +413,62 @@ pub struct McpCallListPage {
     pub has_previous: bool,
 }
 
+pub fn parse_positive_usize(
+    query: &std::collections::HashMap<String, String>,
+    key: &str,
+    default: usize,
+) -> std::result::Result<usize, Response> {
+    let value = query
+        .get(key)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    match value {
+        None => Ok(default),
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                Response::error_with_data(
+                    format!("invalid {key}"),
+                    serde_json::json!({"kind": "validation_error", "status": 400}),
+                )
+            }),
+    }
+}
+
+pub fn parse_history_page_size(
+    query: &std::collections::HashMap<String, String>,
+) -> std::result::Result<usize, Response> {
+    const SUPPORTED: [usize; 3] = [20, 50, 100];
+    let requested = match query
+        .get("page_size")
+        .map(|value| value.trim())
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            query
+                .get("limit")
+                .map(|value| value.trim())
+                .filter(|v| !v.is_empty())
+        }) {
+        None => return Ok(20),
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|v| *v > 0)
+            .ok_or_else(|| {
+                Response::error_with_data(
+                    "invalid page_size",
+                    serde_json::json!({"kind": "validation_error", "status": 400}),
+                )
+            })?,
+    };
+    Ok(*SUPPORTED
+        .iter()
+        .min_by_key(|size| (requested.abs_diff(**size), **size))
+        .expect("supported page sizes"))
+}
+
 pub fn casefold_search_text(value: &str) -> String {
     value.case_fold().collect()
 }
@@ -292,6 +477,12 @@ pub fn casefold_search_text(value: &str) -> String {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     Ping,
+    ListTaskRuns {
+        filter: TaskRunFilter,
+    },
+    ListEvents {
+        filter: EventFilter,
+    },
     Register {
         project: PathBuf,
         session: Option<String>,
@@ -326,6 +517,8 @@ pub enum Request {
     PutSessionConfig {
         session: String,
         revision: String,
+        #[serde(default)]
+        workspace_env: Option<BTreeMap<String, String>>,
         tasks: Vec<EditableTaskInput>,
     },
     Action {

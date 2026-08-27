@@ -46,7 +46,13 @@ const state = {
   configSession: null,
   configNode: null,
   configTasks: [],
-  configTaskIndex: 0,
+  configWorkspaceEnvRows: [],
+  runs: [],
+  runPage: { page: 1, page_size: 20, total: 0, total_pages: 0 },
+  runFilters: { session:"",task:"",status:"all",trigger:"",page:1,pageSize:20 },
+  events: [],
+  eventPage: { page: 1, page_size: 20, total: 0, total_pages: 0 },
+
   configSaving: false,
   configDirty: false,
   tabOrderSaving: false,
@@ -99,6 +105,7 @@ function escapeAttr(value) {
 
 async function requestJson(url, options) {
   const response = await fetch(url, options);
+  if (response.status === 401) { location.assign("/login"); throw new Error("Authentication required"); }
   const payload = await response.json();
   return payload;
 }
@@ -156,8 +163,9 @@ function setView(view) {
   });
   $("#sessions").hidden = view !== "tasks";
   $("#nodes").hidden = view !== "tasks";
-  $("#page-title").textContent = view === "calls" ? "MCP Calls" : view === "docs" ? "MCP Guide" : "Task workspace";
+  $("#page-title").textContent = view === "calls" ? "MCP Calls" : view === "runs" ? "Task Runs" : view === "docs" ? "MCP Guide" : "Task workspace";
   if (view === "calls") loadMcpCalls();
+  if (view === "runs") loadRuns().catch((error) => showToast(error.message || "Unable to load runs"));
   updateMeta();
 }
 
@@ -209,6 +217,8 @@ function updateMeta() {
   const meta = $("#meta");
   if (state.view === "calls") {
     meta.textContent = `${state.callPage.total || 0} retained call${state.callPage.total === 1 ? "" : "s"}`;
+  } else if (state.view === "runs") {
+    meta.textContent = `${state.runPage.total||0} run${(state.runPage.total||0)===1?"":"s"}`;
   } else if (state.view === "docs") {
     meta.textContent = "Local Streamable HTTP endpoint";
   } else if (state.snapshot) {
@@ -376,6 +386,7 @@ function editableTaskPayload(task) {
     auto_start: Boolean(task.auto_start),
     stop_timeout_ms: Number(task.stop_timeout_ms || 3000),
     clear_logs_on_restart: Boolean(task.clear_logs_on_restart),
+    schedule: task.schedule || null,
   };
 }
 
@@ -1131,6 +1142,7 @@ function taskToDraft(task) {
     auto_start: Boolean(task.auto_start),
     stop_timeout_ms: Number(task.stop_timeout_ms || 3000),
     clear_logs_on_restart: Boolean(task.clear_logs_on_restart),
+    schedule: task.schedule ?? null,
     origin: task.origin || { imported: false, has_yaml_override: false },
   };
 }
@@ -1157,6 +1169,7 @@ async function loadConfig(session, confirmDiscard) {
     state.configSession = session;
     state.configNode = node;
     state.configTasks = (response.data.tasks || []).map(taskToDraft);
+    state.configWorkspaceEnvRows = Object.entries(response.data.workspace_env || {}).map(([key,value])=>({key,value}));
     state.configTaskIndex = Math.max(0, state.configTasks.findIndex((task) => task.label === state.currentTask));
     state.configDirty = false;
     renderConfig();
@@ -1185,6 +1198,7 @@ function renderConfig() {
   const node = state.nodes.find((candidate) => candidate.id === state.configNode);
   $("#config-context").innerHTML = `<div><span>Node</span><strong>${escapeHtml(node?.name || state.configNode || "Unknown")}</strong></div><div><span>Session</span><strong>${escapeHtml(state.config.session)}</strong></div><div><span>Project</span><strong title="${escapeAttr(state.config.project)}">${escapeHtml(state.config.project)}</strong></div><div><span>Revision</span><strong>${escapeHtml(String(state.config.revision).slice(0, 12))}</strong></div>`;
   renderConfigTaskList();
+  renderConfigWorkspace();
   renderConfigForm();
 }
 
@@ -1202,12 +1216,45 @@ function renderConfigForm() {
   body.innerHTML = `
     <label class="field"><span>Label</span><input data-field="label" value="${escapeAttr(task.label)}" required></label>
     <label class="field"><span>Command</span><input data-field="command" value="${escapeAttr(task.command)}" required></label>
+    <label class="field"><span>Cron schedule (5 or 6 fields; empty disables)</span><input data-field="schedule" value="${escapeAttr(task.schedule || "")}" placeholder="*/10 * * * *"></label>
     <div class="field-grid"><label class="field"><span>Working directory</span><input data-field="cwd" value="${escapeAttr(task.cwd)}"></label><label class="field"><span>Stop timeout (ms)</span><input data-field="stop_timeout_ms" type="number" min="1" max="300000" value="${task.stop_timeout_ms}"></label></div>
     <div class="toggle-row"><label><input data-field="shell" type="checkbox" ${task.shell ? "checked" : ""}> Run through shell</label><label><input data-field="auto_start" type="checkbox" ${task.auto_start ? "checked" : ""}> Auto start</label><label><input data-field="clear_logs_on_restart" type="checkbox" ${task.clear_logs_on_restart ? "checked" : ""}> Clear logs and performance history on restart</label></div>
     <div class="origin-note">${task.origin.imported ? "Imported from .vscode/tasks.json; Taskdeck saves only overrides." : "Defined in taskdeck.yaml."}</div>
     <fieldset class="field"><legend>Arguments</legend><div class="repeater" id="args-rows">${task.args.map((arg, index) => `<div class="repeater-row"><input data-arg="${index}" value="${escapeAttr(arg)}" aria-label="Argument ${index + 1}"><button class="icon-button" type="button" data-remove-arg="${index}" aria-label="Remove argument" title="Remove">&#215;</button></div>`).join("")}</div><button class="button compact" type="button" data-add-arg>Add argument</button></fieldset>
     <fieldset class="field"><legend>Environment</legend><div class="repeater" id="env-rows">${task.envRows.map((row, index) => `<div class="repeater-row env"><input data-env-key="${index}" value="${escapeAttr(row.key)}" placeholder="NAME" aria-label="Environment key"><input data-env-value="${index}" value="${escapeAttr(row.value)}" placeholder="Value" aria-label="Environment value"><button class="icon-button" type="button" data-remove-env="${index}" aria-label="Remove environment variable" title="Remove">&#215;</button></div>`).join("")}</div><button class="button compact" type="button" data-add-env>Add variable</button></fieldset>
     <button class="button danger" type="button" data-delete-task>Delete task</button>`;
+}
+
+function renderConfigWorkspace() {
+  const rows=state.configWorkspaceEnvRows;
+  const container=$("#workspace-env-rows");
+  if(container){
+    container.innerHTML=rows.map((row,index)=>`<div class="repeater-row env"><input data-workspace-key="${index}" value="${escapeAttr(row.key)}" placeholder="NAME"><input data-workspace-value="${index}" value="${escapeAttr(row.value)}" placeholder="Value"><button class="icon-button" type="button" data-remove-workspace="${index}" aria-label="Remove workspace environment variable" title="Remove">&#215;</button></div>`).join("");
+  }
+}
+
+async function loadRuns(){
+  if(state.view!=="runs")return;
+  const params=new URLSearchParams({
+    page:String(state.runFilters.page),page_size:String(state.runFilters.pageSize),
+    status:state.runFilters.status==="all"?"":state.runFilters.status,
+    trigger:state.runFilters.trigger,
+    session:state.runFilters.session,task:state.runFilters.task,
+  });
+  const [runs,eventResponse]=await Promise.all([
+    requestJson(`/api/task-runs?${addNodeQuery(params)}`),
+    requestJson("/api/events?page=1&page_size=20"),
+  ]);
+  if(runs.ok){ state.runPage={page:runs.data.page,page_size:runs.data.page_size,total:runs.data.total,total_pages:runs.data.total_pages}; state.runs=runs.data.items||[]; }
+  else throw new Error(runs.message);
+  if(eventResponse.ok){state.eventPage=eventResponse.data;state.events=eventResponse.data.items||[];} else throw new Error(eventResponse.message);
+  renderRuns(); updateMeta();
+}
+
+function renderRuns(){
+  $("#runs-body").innerHTML=state.runs.length?state.runs.map((run)=>`<tr><td>${escapeHtml(run.task)}</td><td>${escapeHtml(run.session)}</td><td><span class="status ${escapeAttr(run.status)}">${escapeHtml(run.status)}</span></td><td>${escapeHtml(run.trigger)}</td><td>${escapeHtml(new Date(run.started_at_ms).toLocaleString())}</td><td>${run.duration_ms==null?"":escapeHtml(run.duration_ms+" ms")}</td><td>${escapeHtml(run.error_message||run.command||"")}</td></tr>`).join(""):'<tr class="empty-row"><td colspan="7">No task runs recorded.</td></tr>';
+  $("#events-body").innerHTML=state.events.length?state.events.map((event)=>`<tr><td>${escapeHtml(new Date(event.timestamp_ms).toLocaleString())}</td><td>${escapeHtml(event.category)}</td><td>${escapeHtml(event.message)}</td></tr>`).join(""):'<tr class="empty-row"><td colspan="3">No events recorded.</td></tr>';
+  $("#runs-page-label").textContent=`Page ${state.runPage.page||1} of ${state.runPage.total_pages||0}`;
 }
 
 function showConfigMessage(message, error = false, reload = false) {
@@ -1224,7 +1271,7 @@ function hideConfigMessage() {
 }
 
 function addConfigTask() {
-  state.configTasks.push({ _key: globalThis.crypto?.randomUUID?.() || `task-${Date.now()}-${Math.random()}`, label: "new-task", command: "", args: [], cwd: ".", envRows: [], shell: true, auto_start: false, stop_timeout_ms: 3000, clear_logs_on_restart: false, origin: { imported: false, has_yaml_override: false } });
+  state.configTasks.push({ _key: globalThis.crypto?.randomUUID?.() || `task-${Date.now()}-${Math.random()}`, label: "new-task", command: "", args: [], cwd: ".", envRows: [], shell: true, auto_start: false, stop_timeout_ms: 3000, clear_logs_on_restart: false, schedule: null, origin: { imported: false, has_yaml_override: false } });
   state.configTaskIndex = state.configTasks.length - 1;
   state.configDirty = true;
   renderConfig();
@@ -1248,8 +1295,14 @@ function validateConfigTasks() {
       if (Object.hasOwn(env, key)) throw new Error(`${label}: duplicate environment key ${key}`);
       env[key] = row.value;
     });
-    return { label, command, args: [...task.args], cwd: task.cwd.trim() || ".", env, shell: task.shell, auto_start: task.auto_start, stop_timeout_ms: timeout, clear_logs_on_restart: Boolean(task.clear_logs_on_restart) };
+    return { label, command, args: [...task.args], cwd: task.cwd.trim() || ".", env, shell: task.shell, auto_start: task.auto_start, stop_timeout_ms: timeout, clear_logs_on_restart: Boolean(task.clear_logs_on_restart), schedule: task.schedule ? String(task.schedule).trim() : null };
   });
+}
+
+async function validateWorkspaceEnv(){
+  const values={};
+  state.configWorkspaceEnvRows.forEach((row)=>{const key=row.key.trim();if(!key)throw new Error("Workspace environment key is required");if(Object.hasOwn(values,key))throw new Error(`Duplicate workspace environment key ${key}`);values[key]=row.value;});
+  return values;
 }
 
 async function saveConfig() {
@@ -1268,7 +1321,7 @@ async function saveConfig() {
     const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}/config?${addNodeQuery()}`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ revision: state.config.revision, tasks }),
+      body: JSON.stringify({ revision: state.config.revision, workspace_env:Object.fromEntries(validateWorkspaceEnv()), tasks }),
     });
     if (!response.ok) {
       const kind = response.data?.kind;
@@ -1287,6 +1340,7 @@ async function saveConfig() {
     }
     state.config = response.data;
     state.configTasks = (response.data.tasks || []).map(taskToDraft);
+    state.configWorkspaceEnvRows = Object.entries(response.data.workspace_env || {}).map(([key,value])=>({key,value}));
     state.configDirty = false;
     showToast("Configuration applied");
     $("#config-dialog").close();
@@ -1429,9 +1483,23 @@ function bindEvents() {
     renderConfigTaskList();
   });
   $("#config-form").addEventListener("submit", (event) => { event.preventDefault(); saveConfig(); });
-  $("#config-form-body").addEventListener("input", handleConfigInput);
-  $("#config-form-body").addEventListener("change", handleConfigInput);
-  $("#config-form-body").addEventListener("click", handleConfigButton);
+  $("#refresh-runs").addEventListener("click", () => loadRuns().catch((e)=>showToast(e.message||"Unable to load runs")));
+  ["run-session","run-task","run-status","run-trigger","run-page-size"].forEach((id)=>{
+    $(`#${id}`).addEventListener("change",(event)=>{
+      const target=event.target;
+      if(id==="run-session")state.runFilters.session=target.value;
+      else if(id==="run-task")state.runFilters.task=target.value;
+      else if(id==="run-status")state.runFilters.status=target.value;
+      else if(id==="run-trigger")state.runFilters.trigger=target.value;
+      else if(id==="run-page-size")state.runFilters.pageSize=Number(target.value);
+      state.runFilters.page=1;loadRuns().catch(()=>{});
+    });
+  });
+  $("#runs-prev").addEventListener("click",()=>{if(state.runPage.page>1){state.runFilters.page-=1;loadRuns().catch(()=>{});}});
+  $("#runs-next").addEventListener("click",()=>{if(state.runPage.has_next??(state.runFilters.page<state.runPage.total_pages)){state.runFilters.page+=1;loadRuns().catch(()=>{});}});
+  $("#config-form").addEventListener("input", handleConfigInput);
+  $("#config-form").addEventListener("change", handleConfigInput);
+  $("#config-form").addEventListener("click", handleConfigButton);
   $("#docs-view").addEventListener("click", async (event) => {
     const button = event.target.closest("[data-copy] .copy");
     if (!button) return;
@@ -1454,9 +1522,10 @@ function bindEvents() {
 }
 
 function handleConfigInput(event) {
-  const task = state.configTasks[state.configTaskIndex];
-  if (!task) return;
   const target = event.target;
+  if(target.dataset.workspaceKey!=null){state.configWorkspaceEnvRows[Number(target.dataset.workspaceKey)].key=target.value;}
+  else if(target.dataset.workspaceValue!=null){state.configWorkspaceEnvRows[Number(target.dataset.workspaceValue)].value=target.value;}
+  else { const task=state.configTasks[state.configTaskIndex]; if(!task)return;
   if (target.dataset.field) {
     const field = target.dataset.field;
     task[field] = target.type === "checkbox" ? target.checked : field === "stop_timeout_ms" ? Number(target.value) : target.value;
@@ -1465,14 +1534,17 @@ function handleConfigInput(event) {
   if (target.dataset.arg != null) task.args[Number(target.dataset.arg)] = target.value;
   if (target.dataset.envKey != null) task.envRows[Number(target.dataset.envKey)].key = target.value;
   if (target.dataset.envValue != null) task.envRows[Number(target.dataset.envValue)].value = target.value;
+  }
   state.configDirty = true;
 }
 
 function handleConfigButton(event) {
   const task = state.configTasks[state.configTaskIndex];
-  if (!task) return;
   const button = event.target.closest("button");
   if (!button) return;
+  if(button.dataset.addWorkspace!=null){state.configWorkspaceEnvRows.push({key:"",value:""});renderConfigWorkspace();}
+  else if(button.dataset.removeWorkspace!=null){state.configWorkspaceEnvRows.splice(Number(button.dataset.removeWorkspace),1);renderConfigWorkspace();}
+  else if (!task) return;
   if (button.dataset.addArg != null) { task.args.push(""); renderConfigForm(); }
   if (button.dataset.removeArg != null) { task.args.splice(Number(button.dataset.removeArg), 1); renderConfigForm(); }
   if (button.dataset.addEnv != null) { task.envRows.push({ key: "", value: "" }); renderConfigForm(); }
@@ -1499,6 +1571,8 @@ function tick() {
     loadMetrics();
   } else if (state.view === "calls") {
     loadMcpCalls();
+  } else if (state.view === "runs") {
+    loadRuns().catch(() => {});
   }
 }
 

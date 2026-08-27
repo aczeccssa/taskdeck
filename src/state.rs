@@ -5,15 +5,30 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use clap::ValueEnum;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+use crate::protocol::{
+    EventFilter, EventListPage, EventRecord, McpCallListItem, McpCallListPage, McpCallRecord,
+    TaskRunFilter, TaskRunListPage, TaskRunRecord, casefold_search_text,
+};
 
 pub const DEFAULT_BIND_HOST: &str = "0.0.0.0";
 pub const DEFAULT_WEB_PORT: u16 = 9837;
 const DATABASE_FILE: &str = "state.db";
-const SCHEMA_VERSION: &str = "2";
+pub const AUTH_SESSION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
+const SCHEMA_VERSION: &str = "3";
+
+#[cfg(test)]
+use crate::protocol::TaskStatus;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -154,6 +169,28 @@ pub struct NodeSettingsUpdate {
     pub web_port: Option<u16>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthSettings {
+    pub enabled: bool,
+    #[serde(skip_serializing)]
+    pub password_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicAuthStatus {
+    pub enabled: bool,
+    pub configured: bool,
+}
+
+impl AuthSettings {
+    pub fn public(&self) -> PublicAuthStatus {
+        PublicAuthStatus {
+            enabled: self.enabled,
+            configured: self.password_hash.is_some(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Registration {
     pub session: String,
@@ -187,7 +224,62 @@ impl StateStore {
                  name TEXT NOT NULL,
                  last_seen_ms INTEGER NOT NULL,
                  inventory_json TEXT NOT NULL
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS task_runs (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 node_id TEXT NOT NULL,
+                 session TEXT NOT NULL,
+                 task TEXT NOT NULL,
+                 trigger TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 started_at_ms INTEGER NOT NULL,
+                 finished_at_ms INTEGER,
+                 duration_ms INTEGER,
+                 command TEXT NOT NULL,
+                 cwd TEXT NOT NULL,
+                 pid INTEGER,
+                 run_generation INTEGER NOT NULL DEFAULT 0,
+                 exit_code INTEGER,
+                 error_message TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_task_runs_recent ON task_runs(started_at_ms DESC);
+             CREATE INDEX IF NOT EXISTS idx_task_runs_target ON task_runs(session, task, run_generation);
+             CREATE TABLE IF NOT EXISTS mcp_calls (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 tool TEXT NOT NULL,
+                 operation TEXT,
+                 started_at_ms INTEGER NOT NULL,
+                 duration_ms INTEGER NOT NULL,
+                 success INTEGER NOT NULL,
+                 target_node TEXT,
+                 request_json TEXT NOT NULL,
+                 response_json TEXT NOT NULL,
+                 input_json TEXT NOT NULL,
+                 searchable_text TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_mcp_calls_recent ON mcp_calls(started_at_ms DESC);
+             CREATE TABLE IF NOT EXISTS events (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 timestamp_ms INTEGER NOT NULL,
+                 category TEXT NOT NULL,
+                 message TEXT NOT NULL,
+                 details_json TEXT NOT NULL DEFAULT '{}'
+             );
+             CREATE INDEX IF NOT EXISTS idx_events_recent ON events(timestamp_ms DESC);
+             CREATE TABLE IF NOT EXISTS auth_settings (
+                 id INTEGER PRIMARY KEY CHECK(id = 1),
+                 enabled INTEGER NOT NULL DEFAULT 0,
+                 password_hash TEXT,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             INSERT OR IGNORE INTO auth_settings(id, enabled, updated_at_ms) VALUES (1, 0, 0);
+             CREATE TABLE IF NOT EXISTS auth_sessions (
+                 token_hash TEXT PRIMARY KEY,
+                 created_at_ms INTEGER NOT NULL,
+                 expires_at_ms INTEGER NOT NULL,
+                 last_seen_at_ms INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry ON auth_sessions(expires_at_ms);",
         )?;
         let store = Self {
             connection: Mutex::new(connection),
@@ -215,7 +307,62 @@ impl StateStore {
                  name TEXT NOT NULL,
                  last_seen_ms INTEGER NOT NULL,
                  inventory_json TEXT NOT NULL
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS task_runs (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 node_id TEXT NOT NULL,
+                 session TEXT NOT NULL,
+                 task TEXT NOT NULL,
+                 trigger TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 started_at_ms INTEGER NOT NULL,
+                 finished_at_ms INTEGER,
+                 duration_ms INTEGER,
+                 command TEXT NOT NULL,
+                 cwd TEXT NOT NULL,
+                 pid INTEGER,
+                 run_generation INTEGER NOT NULL DEFAULT 0,
+                 exit_code INTEGER,
+                 error_message TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_task_runs_recent ON task_runs(started_at_ms DESC);
+             CREATE INDEX IF NOT EXISTS idx_task_runs_target ON task_runs(session, task, run_generation);
+             CREATE TABLE IF NOT EXISTS mcp_calls (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 tool TEXT NOT NULL,
+                 operation TEXT,
+                 started_at_ms INTEGER NOT NULL,
+                 duration_ms INTEGER NOT NULL,
+                 success INTEGER NOT NULL,
+                 target_node TEXT,
+                 request_json TEXT NOT NULL,
+                 response_json TEXT NOT NULL,
+                 input_json TEXT NOT NULL,
+                 searchable_text TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_mcp_calls_recent ON mcp_calls(started_at_ms DESC);
+             CREATE TABLE IF NOT EXISTS events (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 timestamp_ms INTEGER NOT NULL,
+                 category TEXT NOT NULL,
+                 message TEXT NOT NULL,
+                 details_json TEXT NOT NULL DEFAULT '{}'
+             );
+             CREATE INDEX IF NOT EXISTS idx_events_recent ON events(timestamp_ms DESC);
+             CREATE TABLE IF NOT EXISTS auth_settings (
+                 id INTEGER PRIMARY KEY CHECK(id = 1),
+                 enabled INTEGER NOT NULL DEFAULT 0,
+                 password_hash TEXT,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             INSERT OR IGNORE INTO auth_settings(id, enabled, updated_at_ms) VALUES (1, 0, 0);
+             CREATE TABLE IF NOT EXISTS auth_sessions (
+                 token_hash TEXT PRIMARY KEY,
+                 created_at_ms INTEGER NOT NULL,
+                 expires_at_ms INTEGER NOT NULL,
+                 last_seen_at_ms INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry ON auth_sessions(expires_at_ms);",
         )?;
         let store = Self {
             connection: Mutex::new(connection),
@@ -229,7 +376,7 @@ impl StateStore {
         let version = get_metadata(&connection, "schema_version")?;
         match version.as_deref() {
             None => set_metadata(&connection, "schema_version", SCHEMA_VERSION)?,
-            Some("1") => {
+            Some("1" | "2") => {
                 if get_metadata(&connection, "bind_host")?.as_deref() == Some("127.0.0.1") {
                     set_metadata(&connection, "bind_host", DEFAULT_BIND_HOST)?;
                 }
@@ -365,6 +512,244 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn auth_settings(&self) -> Result<AuthSettings> {
+        let connection = self.connection.lock().expect("state store lock");
+        read_auth_settings(&connection)
+    }
+
+    pub fn apply_auth_environment(&self) -> Result<AuthSettings> {
+        let connection = self.connection.lock().expect("state store lock");
+        let mut settings = read_auth_settings(&connection)?;
+        if let Ok(value) = std::env::var("TASKDECK_AUTH_ENABLED") {
+            settings.enabled = matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+        if settings.enabled && settings.password_hash.is_none() {
+            let default = std::env::var("TASKDECK_ACCESS_KEY").map_err(|_| {
+                anyhow::anyhow!("auth is enabled but no TASKDECK_ACCESS_KEY is configured")
+            })?;
+            settings.password_hash = Some(hash_access_key(&default)?);
+        }
+        write_auth_settings(&connection, &settings)?;
+        Ok(settings)
+    }
+
+    pub fn configure_auth(&self, enabled: bool) -> Result<AuthSettings> {
+        let connection = self.connection.lock().expect("state store lock");
+        let mut settings = read_auth_settings(&connection)?;
+        if !enabled {
+            settings.password_hash = None;
+        }
+        settings.enabled = enabled;
+        write_auth_settings(&connection, &settings)?;
+        Ok(settings)
+    }
+
+    pub fn set_access_key(&self, key: &str) -> Result<()> {
+        if key.trim().is_empty() {
+            bail!("access key cannot be empty");
+        }
+        let connection = self.connection.lock().expect("state store lock");
+        let mut settings = read_auth_settings(&connection)?;
+        settings.password_hash = Some(hash_access_key(key)?);
+        write_auth_settings(&connection, &settings)?;
+        Ok(())
+    }
+
+    pub fn create_auth_session(&self) -> Result<String> {
+        let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let now = current_timestamp_ms();
+        let expires = now + AUTH_SESSION_TTL_SECONDS * 1000;
+        self.purge_expired_auth_sessions(now)?;
+        let connection = self.connection.lock().expect("state store lock");
+        connection.execute(
+            "INSERT INTO auth_sessions(token_hash, created_at_ms, expires_at_ms, last_seen_at_ms) VALUES (?1, ?2, ?3, ?3)",
+            params![sha256_hex(token.as_bytes()), now as i64, expires as i64],
+        )?;
+        Ok(token)
+    }
+
+    pub fn valid_auth_session(&self, token: Option<&str>) -> bool {
+        let Some(token) = token else { return false };
+        let now = current_timestamp_ms();
+        let connection = match self.connection.try_lock() {
+            Ok(connection) => connection,
+            Err(_) => return false,
+        };
+        let _ = connection.execute(
+            "DELETE FROM auth_sessions WHERE expires_at_ms <= ?1",
+            params![now as i64],
+        );
+        connection.execute(
+            "UPDATE auth_sessions SET last_seen_at_ms=?2 WHERE token_hash=?1 AND expires_at_ms > ?2",
+            params![sha256_hex(token.as_bytes()), now as i64],
+        ).is_ok_and(|count| count == 1)
+    }
+
+    pub fn delete_auth_session(&self, token: Option<&str>) {
+        if let Some(token) = token {
+            let _ = self.connection.lock().expect("state store lock").execute(
+                "DELETE FROM auth_sessions WHERE token_hash=?1",
+                params![sha256_hex(token.as_bytes())],
+            );
+        }
+    }
+
+    pub fn purge_expired_auth_sessions(&self, now_ms: u64) -> Result<()> {
+        let connection = self.connection.lock().expect("state store lock");
+        connection.execute(
+            "DELETE FROM auth_sessions WHERE expires_at_ms <= ?1",
+            params![now_ms as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn verify_access_key(&self, candidate: &str) -> Result<bool> {
+        let settings = self.auth_settings()?;
+        let Some(hash) = settings.password_hash else {
+            return Ok(false);
+        };
+        Ok(verify_access_key(candidate, &hash))
+    }
+
+    pub fn record_event(
+        &self,
+        category: &str,
+        message: &str,
+        details: serde_json::Value,
+    ) -> Result<EventRecord> {
+        let details_json = serde_json::to_string(&details)?;
+        let timestamp = current_timestamp_ms();
+        let connection = self.connection.lock().expect("state store lock");
+        connection.execute(
+            "INSERT INTO events(timestamp_ms,category,message,details_json) VALUES (?1,?2,?3,?4)",
+            params![timestamp as i64, category, message, details_json],
+        )?;
+        Ok(EventRecord {
+            id: connection.last_insert_rowid() as u64,
+            timestamp_ms: timestamp,
+            category: category.to_string(),
+            message: message.to_string(),
+            details,
+        })
+    }
+
+    pub fn list_events(&self, filter: &EventFilter) -> Result<EventListPage> {
+        let mut sql_conditions = Vec::new();
+        if filter.category.is_some() {
+            sql_conditions.push("category = ?".to_string());
+        }
+        let where_sql = where_clause(&sql_conditions);
+        let connection = self.connection.lock().expect("state store lock");
+        let total: i64 = match &filter.category {
+            Some(category) => connection.query_row(
+                format!("SELECT COUNT(*) FROM events{where_sql}").as_str(),
+                params![category],
+                |row| row.get(0),
+            )?,
+            None => connection.query_row(
+                format!("SELECT COUNT(*) FROM events{where_sql}").as_str(),
+                [],
+                |row| row.get(0),
+            )?,
+        };
+        let offset = (filter
+            .page
+            .saturating_sub(1)
+            .saturating_mul(filter.page_size)) as i64;
+        let limit = filter.page_size as i64;
+        let sql = format!(
+            "SELECT id,timestamp_ms,category,message,details_json FROM events{where_sql} ORDER BY id DESC LIMIT ? OFFSET ?"
+        );
+        let rows = if let Some(category) = &filter.category {
+            let mut st = connection.prepare(sql.as_str())?;
+            let rows = st.query_map(params![category, limit, offset], map_event)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            let mut st = connection.prepare(sql.as_str())?;
+            let rows = st.query_map(params![limit, offset], map_event)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(paginated_events(rows, total, filter.page, filter.page_size))
+    }
+
+    pub fn start_task_run(
+        &self,
+        node_id: &str,
+        snapshot: &crate::protocol::TaskSnapshot,
+        trigger: &str,
+        session: &str,
+        error_message: Option<String>,
+        finished_at_ms: Option<u64>,
+    ) -> Result<Option<TaskRunRecord>> {
+        let command = snapshot.command.clone();
+        let cwd = snapshot.cwd.to_string_lossy().into_owned();
+        let connection = self.connection.lock().expect("state store lock");
+        let _timestamp = finished_at_ms.unwrap_or_else(current_timestamp_ms);
+        connection.execute("INSERT INTO task_runs(node_id,session,task,trigger,status,started_at_ms,finished_at_ms,duration_ms,command,cwd,pid,run_generation,exit_code,error_message) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)", params![node_id,session,snapshot.label,trigger,if finished_at_ms.is_some() {"failed"} else {"running"},snapshot.started_at_ms as i64,finished_at_ms.map(|v| v as i64),None::<i64>,command,cwd,snapshot.pid.map(|v| v as i64),snapshot.run_generation as i64,None::<i64>,error_message])?;
+        Ok(Some(TaskRunRecord {
+            id: connection.last_insert_rowid() as u64,
+            node_id: node_id.to_string(),
+            session: session.to_string(),
+            task: snapshot.label.clone(),
+            trigger: trigger.to_string(),
+            status: "running".into(),
+            started_at_ms: snapshot.started_at_ms,
+            finished_at_ms,
+            duration_ms: None,
+            command,
+            cwd: snapshot.cwd.clone(),
+            pid: snapshot.pid,
+            run_generation: snapshot.run_generation,
+            exit_code: None,
+            error_message,
+        }))
+    }
+
+    pub fn has_task_run(
+        &self,
+        node_id: &str,
+        session: &str,
+        task: &str,
+        run_generation: u64,
+    ) -> Result<bool> {
+        let connection = self.connection.lock().expect("state store lock");
+        let count:i64=connection.query_row("SELECT COUNT(*) FROM task_runs WHERE node_id=?1 AND session=?2 AND task=?3 AND run_generation=?4",params![node_id,session,task,run_generation as i64],|row|row.get(0))?;
+        Ok(count > 0)
+    }
+
+    pub fn record_task_run_start(
+        &self,
+        node_id: &str,
+        snapshot: &crate::protocol::TaskSnapshot,
+        trigger: &str,
+        session: &str,
+    ) -> Result<Option<TaskRunRecord>> {
+        if self.has_task_run(node_id, session, &snapshot.label, snapshot.run_generation)? {
+            return Ok(None);
+        }
+        self.start_task_run(node_id, snapshot, trigger, session, None, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_task_run(
+        &self,
+        node_id: &str,
+        session: &str,
+        task: &str,
+        run_generation: u64,
+        status: &str,
+        exit_code: Option<i32>,
+        error_message: Option<&str>,
+    ) -> Result<bool> {
+        let finished = current_timestamp_ms();
+        let connection = self.connection.lock().expect("state store lock");
+        let updated=connection.execute("WITH target AS (SELECT id FROM task_runs WHERE node_id=?1 AND session=?2 AND task=?3 AND run_generation=?4 AND status='running' ORDER BY id DESC LIMIT 1) UPDATE task_runs SET status=?5,finished_at_ms=?6,duration_ms=(SELECT ?6-started_at_ms FROM task_runs WHERE id IN(SELECT id FROM target)),exit_code=?7,error_message=?8 WHERE id IN(SELECT id FROM target)",params![node_id,session,task,run_generation as i64,status,finished as i64,exit_code,error_message])?;
+        Ok(updated == 1)
+    }
+
     pub fn known_workers(&self) -> Result<Vec<KnownWorker>> {
         let connection = self.connection.lock().expect("state store lock");
         let mut statement = connection.prepare(
@@ -381,6 +766,156 @@ impl StateStore {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("failed to read known workers")
     }
+
+    pub fn record_mcp_call(&self, mut record: McpCallRecord) -> Result<McpCallRecord> {
+        let input = record
+            .request
+            .pointer("/params/arguments")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let session = input
+            .get("session")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let task = input
+            .get("task")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let searchable_text = build_mcp_search_text(
+            &record.tool,
+            record.operation.as_deref(),
+            record.target_node.as_deref(),
+            session.as_deref(),
+            task.as_deref(),
+            &input,
+        );
+        let request_json = serde_json::to_string(&record.request)?;
+        let response_json = serde_json::to_string(&record.response)?;
+        let input_json = serde_json::to_string(&input)?;
+        let connection = self.connection.lock().expect("state store lock");
+        connection.execute("INSERT INTO mcp_calls(tool,operation,started_at_ms,duration_ms,success,target_node,request_json,response_json,input_json,searchable_text) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![record.tool,record.operation,record.started_at_ms as i64,record.duration_ms as i64,i64::from(record.success),record.target_node,request_json,response_json,input_json,searchable_text])?;
+        record.id = connection.last_insert_rowid() as u64;
+        Ok(record)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_mcp_calls(
+        &self,
+        q: Option<&str>,
+        operation: Option<&str>,
+        success_only: Option<bool>,
+        session: Option<&str>,
+        task: Option<&str>,
+        page: usize,
+        page_size: usize,
+    ) -> Result<McpCallListPage> {
+        let mut sql_conditions = Vec::<String>::new();
+        let mut values = Vec::<rusqlite::types::Value>::new();
+        if let Some(q) = q {
+            sql_conditions.push("searchable_text LIKE ? ESCAPE '\\'".to_string());
+            values.push(format!("%{}%", escape_like(&casefold_search_text(q))).into());
+        }
+        if let Some(value) = operation {
+            sql_conditions.push("operation = ?".to_string());
+            values.push(value.to_string().into());
+        }
+        if let Some(success) = success_only {
+            sql_conditions.push("success = ?".to_string());
+            values.push(i64::from(success).into());
+        }
+        if let Some(value) = session {
+            sql_conditions.push("json_extract(input_json,'$.session') = ?".to_string());
+            values.push(value.to_string().into());
+        }
+        if let Some(value) = task {
+            sql_conditions.push("json_extract(input_json,'$.task') = ?".to_string());
+            values.push(value.to_string().into());
+        }
+        let where_sql = where_clause(&sql_conditions);
+        let connection = self.connection.lock().expect("state store lock");
+        let total: i64 = connection.query_row(
+            format!("SELECT COUNT(*) FROM mcp_calls{where_sql}").as_str(),
+            params_from_iter(values.clone()),
+            |row| row.get(0),
+        )?;
+        let offset = (page.saturating_sub(1).saturating_mul(page_size)) as i64;
+        values.push((page_size as i64).into());
+        values.push(offset.into());
+        let sql = format!(
+            "SELECT id,tool,operation,started_at_ms,duration_ms,success,target_node,input_json FROM mcp_calls{where_sql} ORDER BY id DESC LIMIT ? OFFSET ?"
+        );
+        let mut statement = connection.prepare(sql.as_str())?;
+        let rows = statement
+            .query_map(params_from_iter(values), |row| {
+                Ok(McpCallListItem {
+                    id: row.get::<_, i64>(0)? as u64,
+                    tool: row.get(1)?,
+                    operation: row.get(2)?,
+                    started_at_ms: row.get::<_, i64>(3)? as u64,
+                    duration_ms: row.get::<_, i64>(4)? as u64,
+                    success: row.get::<_, i64>(5)? != 0,
+                    target_node: row.get(6)?,
+                    input: {
+                        let json = row.get::<_, String>(7)?;
+                        parse_sql_json(json, 7)?
+                    },
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(paginated_mcp_calls(rows, total, page, page_size))
+    }
+
+    pub fn mcp_call_detail(&self, id: u64) -> Result<Option<McpCallRecord>> {
+        let connection = self.connection.lock().expect("state store lock");
+        Ok(connection.query_row("SELECT id,tool,operation,started_at_ms,duration_ms,success,target_node,request_json,response_json FROM mcp_calls WHERE id=?1",params![id as i64],|row|{Ok(McpCallRecord{id:row.get::<_,i64>(0)? as u64,tool:row.get(1)?,operation:row.get(2)?,started_at_ms:row.get::<_,i64>(3)? as u64,duration_ms:row.get::<_,i64>(4)? as u64,success:row.get::<_,i64>(5)? != 0,target_node:row.get(6)?,request:{let json=row.get::<_,String>(7)?;parse_sql_json(json,7)?},response:{let json=row.get::<_,String>(8)?;parse_sql_json(json,8)?}})}).optional()?)
+    }
+
+    pub fn list_task_runs(&self, filter: &TaskRunFilter) -> Result<TaskRunListPage> {
+        let mut sql_conditions = Vec::<String>::new();
+        let mut values = Vec::<rusqlite::types::Value>::new();
+        if let Some(value) = filter.session.as_deref() {
+            sql_conditions.push("session = ?".to_string());
+            values.push(value.to_string().into());
+        }
+        if let Some(value) = filter.task.as_deref() {
+            sql_conditions.push("task = ?".to_string());
+            values.push(value.to_string().into());
+        }
+        if let Some(value) = filter.status.as_deref() {
+            sql_conditions.push("status = ?".to_string());
+            values.push(value.to_string().into());
+        }
+        if let Some(value) = filter.trigger.as_deref() {
+            sql_conditions.push("trigger = ?".to_string());
+            values.push(value.to_string().into());
+        }
+        let where_sql = where_clause(&sql_conditions);
+        let connection = self.connection.lock().expect("state store lock");
+        let total: i64 = connection.query_row(
+            format!("SELECT COUNT(*) FROM task_runs{where_sql}").as_str(),
+            params_from_iter(values.clone()),
+            |row| row.get(0),
+        )?;
+        let offset = (filter
+            .page
+            .saturating_sub(1)
+            .saturating_mul(filter.page_size)) as i64;
+        values.push((filter.page_size as i64).into());
+        values.push(offset.into());
+        let sql = format!(
+            "SELECT id,node_id,session,task,trigger,status,started_at_ms,finished_at_ms,duration_ms,command,cwd,pid,run_generation,exit_code,error_message FROM task_runs{where_sql} ORDER BY started_at_ms DESC,id DESC LIMIT ? OFFSET ?"
+        );
+        let mut statement = connection.prepare(sql.as_str())?;
+        let rows = statement
+            .query_map(params_from_iter(values), map_task_run)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(paginated_task_runs(
+            rows,
+            total,
+            filter.page,
+            filter.page_size,
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -389,6 +924,236 @@ pub struct KnownWorker {
     pub name: String,
     pub last_seen_ms: u64,
     pub inventory_json: String,
+}
+
+fn paginated_mcp_calls(
+    items: Vec<McpCallListItem>,
+    total: i64,
+    page: usize,
+    page_size: usize,
+) -> McpCallListPage {
+    let total = total.max(0) as usize;
+    let total_pages = if total == 0 {
+        0
+    } else {
+        total.div_ceil(page_size)
+    };
+    McpCallListPage {
+        items,
+        page,
+        page_size,
+        total,
+        total_pages,
+        has_next: page < total_pages,
+        has_previous: page > 1 && total > 0,
+    }
+}
+
+fn where_clause(conditions: &[String]) -> String {
+    if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    }
+}
+
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn build_mcp_search_text(
+    tool: &str,
+    operation: Option<&str>,
+    target_node: Option<&str>,
+    session: Option<&str>,
+    task: Option<&str>,
+    input: &serde_json::Value,
+) -> String {
+    let serialized = serde_json::to_string(input).unwrap_or_default();
+    casefold_search_text(&format!(
+        "{tool}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{serialized}",
+        operation.unwrap_or(""),
+        target_node.unwrap_or(""),
+        session.unwrap_or(""),
+        task.unwrap_or("")
+    ))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut out, b| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{b:02x}");
+            out
+        })
+}
+
+pub fn hash_access_key(key: &str) -> Result<String> {
+    let uuid = Uuid::new_v4();
+    let salt = SaltString::encode_b64(uuid.as_bytes())
+        .map_err(|error| anyhow::anyhow!("failed to create password salt: {error}"))?;
+    Argon2::default()
+        .hash_password(key.as_bytes(), &salt)
+        .map(|value| value.to_string())
+        .map_err(|error| anyhow::anyhow!("failed to hash access key: {error}"))
+}
+
+pub fn verify_access_key(candidate: &str, hash: &str) -> bool {
+    PasswordHash::new(hash).ok().is_some_and(|parsed| {
+        Argon2::default()
+            .verify_password(candidate.as_bytes(), &parsed)
+            .is_ok()
+    })
+}
+
+fn read_auth_settings(connection: &Connection) -> Result<AuthSettings> {
+    let (enabled, password_hash) = connection.query_row(
+        "SELECT enabled,password_hash FROM auth_settings WHERE id=1",
+        [],
+        |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, Option<String>>(1)?)),
+    )?;
+    Ok(AuthSettings {
+        enabled,
+        password_hash,
+    })
+}
+
+fn write_auth_settings(connection: &Connection, settings: &AuthSettings) -> Result<()> {
+    connection.execute(
+        "UPDATE auth_settings SET enabled=?1,password_hash=?2,updated_at_ms=?3 WHERE id=1",
+        params![
+            i64::from(settings.enabled),
+            settings.password_hash,
+            current_timestamp_ms() as i64
+        ],
+    )?;
+    Ok(())
+}
+
+fn next_after_schedule(expression: &str, after_ms: u64) -> Result<u64> {
+    let fields = expression.split_whitespace().count();
+    let normalized = if fields == 5 {
+        format!("0 {expression}")
+    } else {
+        expression.to_string()
+    };
+    let schedule = normalized
+        .parse::<cron::Schedule>()
+        .context(format!("invalid cron expression '{expression}'"))?;
+    let after_utc = DateTime::<Utc>::from_timestamp_millis(after_ms as i64).unwrap_or(Utc::now());
+    let local_after = Local.from_utc_datetime(&after_utc.naive_utc());
+    schedule
+        .after(&local_after)
+        .next()
+        .map(|next| next.with_timezone(&Local).timestamp_millis().max(0) as u64)
+        .ok_or_else(|| anyhow::anyhow!("cron expression '{expression}' has no future occurrence"))
+}
+
+pub fn validate_cron_expression(expression: &str) -> Result<()> {
+    if expression.trim().is_empty() {
+        bail!("schedule cannot be empty; remove it to disable scheduling")
+    }
+    next_after_schedule(expression.trim(), current_timestamp_ms())?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn cron_next_after(expression: &str, after_ms: u64) -> Result<u64> {
+    next_after_schedule(expression.trim(), after_ms)
+}
+
+fn parse_sql_json(value: String, column: usize) -> rusqlite::Result<serde_json::Value> {
+    serde_json::from_str(&value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+fn map_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRecord> {
+    let json = row.get::<_, String>(4)?;
+    let details = serde_json::from_str(&json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(EventRecord {
+        id: row.get::<_, i64>(0)? as u64,
+        timestamp_ms: row.get::<_, i64>(1)? as u64,
+        category: row.get(2)?,
+        message: row.get(3)?,
+        details,
+    })
+}
+
+fn map_task_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRunRecord> {
+    Ok(TaskRunRecord {
+        id: row.get::<_, i64>(0)? as u64,
+        node_id: row.get(1)?,
+        session: row.get(2)?,
+        task: row.get(3)?,
+        trigger: row.get(4)?,
+        status: row.get(5)?,
+        started_at_ms: row.get::<_, i64>(6)? as u64,
+        finished_at_ms: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+        duration_ms: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+        command: row.get(9)?,
+        cwd: PathBuf::from(row.get::<_, String>(10)?),
+        pid: row.get::<_, Option<i64>>(11)?.map(|v| v as u32),
+        run_generation: row.get::<_, i64>(12)? as u64,
+        exit_code: row.get(13)?,
+        error_message: row.get(14)?,
+    })
+}
+
+fn paginated_task_runs(
+    items: Vec<TaskRunRecord>,
+    total: i64,
+    page: usize,
+    page_size: usize,
+) -> TaskRunListPage {
+    let total = total.max(0) as usize;
+    let total_pages = if total == 0 {
+        0
+    } else {
+        total.div_ceil(page_size)
+    };
+    TaskRunListPage {
+        items,
+        page,
+        page_size,
+        total,
+        total_pages,
+        has_next: page < total_pages,
+        has_previous: page > 1 && total > 0,
+    }
+}
+
+fn paginated_events(
+    items: Vec<EventRecord>,
+    total: i64,
+    page: usize,
+    page_size: usize,
+) -> EventListPage {
+    let total = total.max(0) as usize;
+    let total_pages = if total == 0 {
+        0
+    } else {
+        total.div_ceil(page_size)
+    };
+    EventListPage {
+        items,
+        page,
+        page_size,
+        total,
+        total_pages,
+        has_next: page < total_pages,
+        has_previous: page > 1 && total > 0,
+    }
 }
 
 fn get_metadata(connection: &Connection, key: &str) -> Result<Option<String>> {
@@ -606,5 +1371,166 @@ mod tests {
         let serialized = serde_json::to_string(&settings.public()).unwrap();
         assert!(!serialized.contains("secret"));
         assert!(settings.public().has_enrollment_token);
+    }
+
+    #[test]
+    fn schema_two_migrates_and_preserves_registrations() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let connection = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
+            connection.execute_batch("PRAGMA foreign_keys=ON;
+             CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+             CREATE TABLE registrations(session TEXT PRIMARY KEY,project TEXT NOT NULL,registered_at_ms INTEGER NOT NULL);
+             CREATE TABLE workers(node_id TEXT PRIMARY KEY,name TEXT NOT NULL,last_seen_ms INTEGER NOT NULL,inventory_json TEXT NOT NULL);").unwrap();
+            connection
+                .execute("INSERT INTO registrations VALUES ('api','/tmp/api',1)", [])
+                .unwrap();
+            connection
+                .execute("INSERT INTO metadata VALUES ('schema_version','2')", [])
+                .unwrap();
+            let id = uuid::Uuid::new_v4().to_string();
+            connection
+                .execute("INSERT INTO metadata VALUES ('node_id',?1)", [&id])
+                .unwrap();
+        }
+        let store = StateStore::open(dir.path()).unwrap();
+        assert_eq!(store.registrations().unwrap()[0].session, "api");
+        let ids = store
+            .list_task_runs(&TaskRunFilter {
+                session: None,
+                task: None,
+                status: None,
+                trigger: None,
+                page: 1,
+                page_size: 20,
+            })
+            .unwrap()
+            .total;
+        assert_eq!(ids, 0);
+    }
+
+    #[test]
+    fn task_runs_and_mcp_calls_survive_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        let node_id = StateStore::open(dir.path())
+            .unwrap()
+            .node_settings()
+            .unwrap()
+            .node_id;
+        let snapshot = crate::protocol::TaskSnapshot {
+            label: "cleanup".into(),
+            status: TaskStatus::Exited,
+            pid: Some(9),
+            command: "echo done".into(),
+            cwd: PathBuf::from("/tmp"),
+            auto_start: false,
+            last_exit: Some("exit status: 0".into()),
+            exit_code: Some(0),
+            logs: vec![],
+            run_generation: 2,
+            started_at_ms: 42,
+            schedule: Some("* * * * *".into()),
+            service: Default::default(),
+        };
+        {
+            let store = StateStore::open(dir.path()).unwrap();
+            store
+                .record_task_run_start(&node_id, &snapshot, "cron", "demo")
+                .unwrap();
+            assert!(
+                store
+                    .finish_task_run(&node_id, "demo", "cleanup", 2, "exited", Some(0), None)
+                    .unwrap()
+            );
+            store.record_mcp_call(McpCallRecord{id:0,tool:"taskdeck_control".into(),operation:Some("start".into()),started_at_ms:99,duration_ms:5,success:true,target_node:Some("self".into()),request:serde_json::json!({"params":{"arguments":{"session":"demo","needle":"unique-request"}}}),response:serde_json::json!({"ok":true})}).unwrap();
+            store
+                .record_event(
+                    "scheduler",
+                    "scheduler started",
+                    serde_json::json!({"caught_up":false}),
+                )
+                .unwrap();
+        }
+        let store = StateStore::open(dir.path()).unwrap();
+        let runs = store
+            .list_task_runs(&TaskRunFilter {
+                session: Some("demo".into()),
+                task: None,
+                status: None,
+                trigger: None,
+                page: 1,
+                page_size: 20,
+            })
+            .unwrap();
+        assert_eq!(runs.items.len(), 1);
+        assert_eq!(runs.items[0].status, "exited");
+        assert!(runs.items[0].duration_ms.is_some());
+        let calls = store
+            .list_mcp_calls(Some("unique-request"), None, None, None, None, 1, 20)
+            .unwrap();
+        assert_eq!(calls.items.len(), 1);
+        assert_eq!(calls.total, 1);
+        assert_eq!(
+            store
+                .mcp_call_detail(calls.items[0].id)
+                .unwrap()
+                .unwrap()
+                .tool,
+            "taskdeck_control"
+        );
+        assert_eq!(
+            store
+                .list_events(&EventFilter {
+                    category: None,
+                    page: 1,
+                    page_size: 20
+                })
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn cron_validation_rejects_bad_expressions_and_calculates_a_future_occurrence() {
+        validate_cron_expression("*/10 * * * *").unwrap();
+        validate_cron_expression("*/5 * * * * *").unwrap();
+        assert!(validate_cron_expression("not-a-cron").is_err());
+        assert!(validate_cron_expression("").is_err());
+        assert!(cron_next_after("* * * * *", current_timestamp_ms()).is_ok());
+    }
+
+    #[test]
+    fn access_keys_use_argon2id_and_sessions_are_hashed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(dir.path()).unwrap();
+        let key = "correct-horse-battery-staple";
+        store.set_access_key(key).unwrap();
+        store.configure_auth(true).unwrap();
+        assert!(verify_access_key(
+            key,
+            &store.auth_settings().unwrap().password_hash.unwrap()
+        ));
+        assert!(!verify_access_key(
+            "wrong",
+            &store.auth_settings().unwrap().password_hash.unwrap()
+        ));
+        assert!(
+            !store
+                .auth_settings()
+                .unwrap()
+                .password_hash
+                .as_ref()
+                .unwrap()
+                .contains(key)
+        );
+        let token = store.create_auth_session().unwrap();
+        assert!(token.len() > 32);
+        assert!(store.valid_auth_session(Some(&token)));
+        store.delete_auth_session(Some(&token));
+        assert!(!store.valid_auth_session(Some(&token)));
+        store.configure_auth(false).unwrap();
+        assert!(store.auth_settings().unwrap().password_hash.is_none());
     }
 }

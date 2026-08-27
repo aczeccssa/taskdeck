@@ -35,6 +35,14 @@ overrides. It supports process and shell tasks, `command`, `args`, `options.cwd`
 `options.env`, JSON comments/trailing commas, and common workspace/environment
 variables. See [taskdeck.example.yaml](taskdeck.example.yaml).
 
+Workspace-wide values belong under the optional top-level `workspace_env`
+mapping. Runtime precedence is daemon environment < `workspace_env` < task-level
+`env`. Each task also accepts a five-field local-time Cron schedule; use six
+fields when you need seconds. An empty or absent schedule disables scheduling.
+The scheduler starts an idle task and records a skipped-running result for an
+already-running task; it never replays occurrences missed while Taskdeck was
+offline.
+
 Use the optional top-level `task_order` list to share the Web/TUI tab order.
 Each task may set `clear_logs_on_restart: true` to clear its retained logs and
 performance history whenever it restarts; the default preserves history and
@@ -176,6 +184,21 @@ evidence instead of pretending a configured port is live.
 
 ## Web UI and APIs
 
+Single-user access-key authentication is disabled by default. To enable it,
+provide:
+
+```bash
+export TASKDECK_AUTH_ENABLED=true
+export TASKDECK_ACCESS_KEY='a-long-random-access-key'
+```
+
+After first startup, replace that bootstrap key with
+`printf '%s' 'new-key' | taskdeck auth set-key`; inspect state with
+`taskdeck auth status`. The key is stored as an Argon2id hash. Browser sessions
+use an HttpOnly cookie. API/MCP clients may instead send
+`Authorization: Bearer <access-key>`. Worker enrollment continues using the
+separate node token.
+
 By default the daemon binds to `0.0.0.0:9837`, making its Web, MCP, and worker
 agent endpoints available on every network interface. Use `127.0.0.1` when
 accessing it from the same machine:
@@ -202,7 +225,12 @@ GET  /api/sessions/{session}/tasks/{task}/metrics?node=NODE_ID
 GET  /api/sessions/{session}/config?node=NODE_ID
 PUT  /api/sessions/{session}/config?node=NODE_ID
 POST /api/action              { node, session, task, action }
+GET  /api/task-runs?node=&session=&task=
+GET  /api/events
 ```
+
+Task runs, events, and MCP calls are durably stored in each executor/control
+node's SQLite database. Logs remain in memory only.
 
 ## MCP scope
 
