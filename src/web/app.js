@@ -1483,9 +1483,9 @@ function bindEvents() {
     renderConfigTaskList();
   });
   $("#config-form").addEventListener("submit", (event) => { event.preventDefault(); saveConfig(); });
-  $("#refresh-runs").addEventListener("click", () => loadRuns().catch((e)=>showToast(e.message||"Unable to load runs")));
+  $("#refresh-runs")?.addEventListener("click", () => loadRuns().catch((e)=>showToast(e.message||"Unable to load runs")));
   ["run-session","run-task","run-status","run-trigger","run-page-size"].forEach((id)=>{
-    $(`#${id}`).addEventListener("change",(event)=>{
+    $(`#${id}`)?.addEventListener("change",(event)=>{
       const target=event.target;
       if(id==="run-session")state.runFilters.session=target.value;
       else if(id==="run-task")state.runFilters.task=target.value;
@@ -1495,8 +1495,8 @@ function bindEvents() {
       state.runFilters.page=1;loadRuns().catch(()=>{});
     });
   });
-  $("#runs-prev").addEventListener("click",()=>{if(state.runPage.page>1){state.runFilters.page-=1;loadRuns().catch(()=>{});}});
-  $("#runs-next").addEventListener("click",()=>{if(state.runPage.has_next??(state.runFilters.page<state.runPage.total_pages)){state.runFilters.page+=1;loadRuns().catch(()=>{});}});
+  $("#runs-prev")?.addEventListener("click",()=>{if(state.runPage.page>1){state.runFilters.page-=1;loadRuns().catch(()=>{});}});
+  $("#runs-next")?.addEventListener("click",()=>{if(state.runPage.has_next??(state.runFilters.page<state.runPage.total_pages)){state.runFilters.page+=1;loadRuns().catch(()=>{});}});
   $("#config-form").addEventListener("input", handleConfigInput);
   $("#config-form").addEventListener("change", handleConfigInput);
   $("#config-form").addEventListener("click", handleConfigButton);
