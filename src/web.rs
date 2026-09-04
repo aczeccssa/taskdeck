@@ -2,17 +2,23 @@ use std::collections::HashMap;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, header};
-use axum::response::{Html, IntoResponse, Response as AxumResponse};
-use axum::routing::{get, post};
+use axum::body::Body;
+use axum::extract::ws::WebSocketUpgrade;
+use axum::extract::{Form, Path, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::{Html, IntoResponse, Redirect, Response as AxumResponse};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::daemon::{DaemonState, McpCallHistoryEntry, dispatch_async};
+use crate::cluster::{self, RemoteRequest};
+use crate::daemon::DaemonState;
+#[cfg(test)]
+use crate::protocol::McpCallListPage;
 use crate::protocol::{
-    Action, EditableTaskInput, McpCallListItem, McpCallListPage, McpCallRecord, Request, Response,
+    Action, EditableTaskInput, EventFilter, McpCallRecord, Response, TaskRunFilter,
     casefold_search_text,
 };
 
@@ -30,12 +36,18 @@ fn app(state: DaemonState) -> Router {
         .route("/favicon.svg", get(favicon))
         .route("/favicon.ico", get(favicon))
         .route("/healthz", get(health))
+        .route("/api/agent/connect", get(agent_connect))
+        .route("/api/nodes", get(list_nodes))
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/{session}", get(session_snapshot))
         .route("/api/sessions/{session}/tasks/{task}/logs", get(task_logs))
         .route(
             "/api/sessions/{session}/tasks/{task}/metrics",
             get(task_metrics),
+        )
+        .route(
+            "/api/sessions/{session}/tasks/{task}/history",
+            delete(clear_task_history),
         )
         .route(
             "/api/sessions/{session}/config",
@@ -45,6 +57,15 @@ fn app(state: DaemonState) -> Router {
         .route("/api/mcp-calls/{id}", get(mcp_call_detail))
         .route("/api/action", post(action))
         .route("/mcp", post(mcp))
+        .route("/api/task-runs", get(list_task_runs))
+        .route("/api/events", get(list_events_route))
+        .route("/login", get(login_page).post(login_submit))
+        .route("/logout", post(logout))
+        .route("/me", get(auth_status))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .with_state(state)
 }
 
@@ -79,6 +100,167 @@ async fn health() -> StatusCode {
     StatusCode::OK
 }
 
+async fn agent_connect(
+    State(state): State<DaemonState>,
+    upgrade: WebSocketUpgrade,
+) -> AxumResponse {
+    if !state
+        .public_settings()
+        .role
+        .eq(&crate::state::NodeRole::Leader)
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    upgrade
+        .on_upgrade(move |socket| cluster::serve_agent_socket(state.cluster.clone(), socket))
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct LoginBody {
+    access_key: String,
+}
+
+pub const AUTH_COOKIE: &str = "taskdeck_session";
+
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+fn session_cookie(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(header::COOKIE)?.to_str().ok()?;
+    value.split(';').find_map(|part| {
+        let part = part.trim();
+        part.strip_prefix(AUTH_COOKIE)
+            .and_then(|rest| rest.strip_prefix('='))
+            .filter(|token| !token.is_empty())
+            .map(|token| token.to_string())
+    })
+}
+
+async fn auth_middleware(
+    State(state): State<DaemonState>,
+    request: axum::http::Request<Body>,
+    next: Next,
+) -> AxumResponse {
+    let settings = match state.store.auth_settings() {
+        Ok(settings) => settings,
+        Err(error) => return Json(Response::error(format!("{error:#}"))).into_response(),
+    };
+    if !settings.enabled {
+        return next.run(request).await;
+    }
+    let path = request.uri().path();
+    let method = request.method().clone();
+    let headers = request.headers().clone();
+    let exempt = path == "/health"
+        || path == "/healthz"
+        || path.starts_with("/assets/")
+        || path == "/favicon.svg"
+        || path == "/favicon.ico"
+        || path == "/me";
+    let exempt = exempt
+        || (path == "/login" && method == "GET")
+        || (path == "/login" && method == "POST")
+        || path == "/api/agent/connect";
+    let authenticated = session_cookie(&headers)
+        .is_some_and(|token| state.store.valid_auth_session(Some(&token)))
+        || bearer_token(&headers)
+            .is_some_and(|key| state.store.verify_access_key(&key).unwrap_or(false));
+    if exempt || authenticated {
+        return next.run(request).await;
+    }
+    if path == "/" && method.as_str() == "GET" {
+        return Html(LOGIN_HTML).into_response();
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"kind":"unauthorized","status":401})),
+    )
+        .into_response()
+}
+
+async fn login_page() -> Html<String> {
+    Html(LOGIN_HTML.replace("%LOGIN_ERROR%", ""))
+}
+
+async fn login_submit(
+    State(state): State<DaemonState>,
+    Form(body): Form<LoginBody>,
+) -> AxumResponse {
+    let enabled = state
+        .store
+        .auth_settings()
+        .map(|settings| settings.enabled)
+        .unwrap_or(false);
+    if !enabled {
+        return Redirect::to("/").into_response();
+    }
+    match state.store.verify_access_key(&body.access_key) {
+        Ok(true) => {}
+        _ => {
+            return Html(LOGIN_HTML.replace(
+                "%LOGIN_ERROR%",
+                "<p class=\"form-error\">Invalid access key</p>",
+            ))
+            .into_response();
+        }
+    };
+    match state.store.create_auth_session() {
+        Ok(token) => {
+            let mut response = Redirect::to("/").into_response();
+            response.headers_mut().insert(
+                header::SET_COOKIE,
+                format!("{AUTH_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax")
+                    .parse()
+                    .expect("valid cookie"),
+            );
+            response
+        }
+        Err(_) => {
+            Html(LOGIN_HTML.replace("%LOGIN_ERROR%", "<p class=\"form-error\">Login failed</p>"))
+                .into_response()
+        }
+    }
+}
+
+async fn logout(State(state): State<DaemonState>, headers: HeaderMap) -> AxumResponse {
+    state
+        .store
+        .delete_auth_session(session_cookie(&headers).as_deref());
+    let mut response = Redirect::to("/login").into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        format!("{AUTH_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+            .parse()
+            .expect("valid cookie"),
+    );
+    response
+}
+
+async fn auth_status(State(state): State<DaemonState>, headers: HeaderMap) -> Json<Response> {
+    let settings = match state.store.auth_settings() {
+        Ok(v) => v,
+        Err(e) => return Json(Response::error(format!("{e:#}"))),
+    };
+    let authenticated = settings.enabled
+        && (session_cookie(&headers)
+            .is_some_and(|token| state.store.valid_auth_session(Some(&token)))
+            || bearer_token(&headers)
+                .is_some_and(|key| state.store.verify_access_key(&key).unwrap_or(false)));
+    Json(Response::ok(
+        "authentication status",
+        json!({"enabled":settings.enabled,"configured":settings.password_hash.is_some(),"authenticated":!settings.enabled||authenticated}),
+    ))
+}
+
 async fn favicon() -> impl IntoResponse {
     (
         [
@@ -89,8 +271,40 @@ async fn favicon() -> impl IntoResponse {
     )
 }
 
-async fn list_sessions(State(state): State<DaemonState>) -> Json<Response> {
-    Json(dispatch_async(state, Request::ListSessions).await)
+async fn list_nodes(State(state): State<DaemonState>) -> Json<Response> {
+    Json(Response::ok("nodes", state.node_summaries()))
+}
+
+fn selected_node(
+    state: &DaemonState,
+    query: &HashMap<String, String>,
+) -> std::result::Result<String, Response> {
+    if let Some(node) = query.get("node").filter(|node| !node.trim().is_empty()) {
+        return Ok(node.clone());
+    }
+    if state.public_settings().role == crate::state::NodeRole::Worker {
+        Ok("self".to_string())
+    } else {
+        Err(Response::error_with_data(
+            "node is required for leader requests",
+            json!({"kind": "validation_error", "status": 400}),
+        ))
+    }
+}
+
+async fn list_sessions(
+    State(state): State<DaemonState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Response> {
+    let node = match selected_node(&state, &query) {
+        Ok(node) => node,
+        Err(response) => return Json(response),
+    };
+    Json(
+        state
+            .dispatch_node(&node, RemoteRequest::ListSessions)
+            .await,
+    )
 }
 
 async fn session_snapshot(
@@ -98,8 +312,16 @@ async fn session_snapshot(
     Path(session): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Json<Response> {
+    let node = match selected_node(&state, &query) {
+        Ok(node) => node,
+        Err(response) => return Json(response),
+    };
     let tail = query.get("tail").and_then(|value| value.parse().ok());
-    Json(dispatch_async(state, Request::Snapshot { session, tail }).await)
+    Json(
+        state
+            .dispatch_node(&node, RemoteRequest::Snapshot { session, tail })
+            .await,
+    )
 }
 
 async fn task_logs(
@@ -107,6 +329,10 @@ async fn task_logs(
     Path((session, task)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Json<Response> {
+    let node = match selected_node(&state, &query) {
+        Ok(node) => node,
+        Err(response) => return Json(response),
+    };
     let after = match query.get("after") {
         Some(value) => match value.parse::<u64>() {
             Ok(value) => Some(value),
@@ -132,16 +358,17 @@ async fn task_logs(
         None => 1_000,
     };
     Json(
-        dispatch_async(
-            state,
-            Request::TaskLogs {
-                session,
-                task,
-                after,
-                limit,
-            },
-        )
-        .await,
+        state
+            .dispatch_node(
+                &node,
+                RemoteRequest::TaskLogs {
+                    session,
+                    task,
+                    after,
+                    limit,
+                },
+            )
+            .await,
     )
 }
 
@@ -170,72 +397,123 @@ async fn task_metrics(
     Path((session, task)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Json<Response> {
+    let node = match selected_node(&state, &query) {
+        Ok(node) => node,
+        Err(response) => return Json(response),
+    };
     let window_seconds = match parse_metrics_window_seconds(&query) {
         Ok(window_seconds) => window_seconds,
         Err(response) => return Json(response),
     };
     Json(
-        dispatch_async(
-            state,
-            Request::TaskMetrics {
-                session,
-                task,
-                window_seconds,
-            },
-        )
-        .await,
+        state
+            .dispatch_node(
+                &node,
+                RemoteRequest::TaskMetrics {
+                    session,
+                    task,
+                    window_seconds,
+                },
+            )
+            .await,
+    )
+}
+
+async fn clear_task_history(
+    State(state): State<DaemonState>,
+    Path((session, task)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Response> {
+    let node = match selected_node(&state, &query) {
+        Ok(node) => node,
+        Err(response) => return Json(response),
+    };
+    Json(
+        state
+            .dispatch_node(&node, RemoteRequest::ClearTaskHistory { session, task })
+            .await,
     )
 }
 
 async fn session_config(
     State(state): State<DaemonState>,
     Path(session): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Json<Response> {
-    Json(dispatch_async(state, Request::GetSessionConfig { session }).await)
+    let node = match selected_node(&state, &query) {
+        Ok(node) => node,
+        Err(response) => return Json(response),
+    };
+    Json(
+        state
+            .dispatch_node(&node, RemoteRequest::GetSessionConfig { session })
+            .await,
+    )
 }
 
 #[derive(Deserialize)]
 struct UpdateSessionConfigBody {
     revision: String,
+    #[serde(default)]
+    workspace_env: Option<std::collections::BTreeMap<String, String>>,
     tasks: Vec<EditableTaskInput>,
 }
 
 async fn update_session_config(
     State(state): State<DaemonState>,
     Path(session): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
     Json(body): Json<UpdateSessionConfigBody>,
 ) -> Json<Response> {
+    let node = match selected_node(&state, &query) {
+        Ok(node) => node,
+        Err(response) => return Json(response),
+    };
     Json(
-        dispatch_async(
-            state,
-            Request::PutSessionConfig {
-                session,
-                revision: body.revision,
-                tasks: body.tasks,
-            },
-        )
-        .await,
+        state
+            .dispatch_node(
+                &node,
+                RemoteRequest::PutSessionConfig {
+                    session,
+                    revision: body.revision,
+                    workspace_env: body.workspace_env,
+                    tasks: body.tasks,
+                },
+            )
+            .await,
     )
 }
 
 #[derive(Deserialize)]
 struct ActionBody {
+    node: Option<String>,
     session: String,
     task: Option<String>,
     action: Action,
 }
 
 async fn action(State(state): State<DaemonState>, Json(body): Json<ActionBody>) -> Json<Response> {
+    let node = match body.node {
+        Some(node) if !node.trim().is_empty() => node,
+        _ if state.public_settings().role == crate::state::NodeRole::Worker => "self".to_string(),
+        _ => {
+            return Json(Response::error_with_data(
+                "node is required for leader actions",
+                json!({"kind": "validation_error", "status": 400}),
+            ));
+        }
+    };
     Json(
-        dispatch_async(
-            state,
-            Request::Action {
-                session: body.session,
-                task: body.task,
-                action: body.action,
-            },
-        )
-        .await,
+        state
+            .dispatch_node(
+                &node,
+                RemoteRequest::Action {
+                    session: body.session,
+                    task: body.task,
+                    action: body.action,
+                },
+            )
+            .await,
     )
 }
 
@@ -247,40 +525,22 @@ async fn list_mcp_calls(
         Ok(query) => query,
         Err(response) => return Json(response),
     };
-    let calls = state.recent_mcp_calls(crate::daemon::MAX_MCP_CALLS);
-    let filtered = calls
-        .iter()
-        .filter(|call| query.matches(call.as_ref()))
-        .collect::<Vec<_>>();
-    let total = filtered.len();
-    let total_pages = if total == 0 {
-        0
-    } else {
-        total.div_ceil(query.page_size)
-    };
-    let start = query.page.saturating_sub(1).saturating_mul(query.page_size);
-    let items = if start >= total {
-        Vec::new()
-    } else {
-        filtered
-            .into_iter()
-            .skip(start)
-            .take(query.page_size)
-            .map(|call| mcp_call_summary(call.as_ref()))
-            .collect()
-    };
-    Json(Response::ok(
-        "MCP calls",
-        McpCallListPage {
-            items,
-            page: query.page,
-            page_size: query.page_size,
-            total,
-            total_pages,
-            has_next: query.page < total_pages,
-            has_previous: query.page > 1 && total > 0,
+    match state.store.list_mcp_calls(
+        query.q.as_deref(),
+        query.operation.as_deref(),
+        match query.status {
+            McpCallStatusFilter::All => None,
+            McpCallStatusFilter::Success => Some(true),
+            McpCallStatusFilter::Error => Some(false),
         },
-    ))
+        query.session.as_deref(),
+        query.task.as_deref(),
+        query.page,
+        query.page_size,
+    ) {
+        Ok(page) => Json(Response::ok("MCP calls", page)),
+        Err(error) => Json(Response::error(format!("{error:#}"))),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,40 +572,6 @@ impl McpCallListQuery {
             page: parse_positive_usize(query, "page", 1)?,
             page_size: parse_mcp_call_page_size(query)?,
         })
-    }
-
-    fn matches(&self, call: &McpCallHistoryEntry) -> bool {
-        self.matches_operation(call.record.operation.as_deref())
-            && self.matches_status(call.record.success)
-            && self.matches_exact(self.session.as_deref(), call.session.as_deref())
-            && self.matches_exact(self.task.as_deref(), call.task.as_deref())
-            && self.matches_search(call)
-    }
-
-    fn matches_operation(&self, operation: Option<&str>) -> bool {
-        self.matches_exact(self.operation.as_deref(), operation)
-    }
-
-    fn matches_status(&self, success: bool) -> bool {
-        match self.status {
-            McpCallStatusFilter::All => true,
-            McpCallStatusFilter::Success => success,
-            McpCallStatusFilter::Error => !success,
-        }
-    }
-
-    fn matches_exact(&self, expected: Option<&str>, actual: Option<&str>) -> bool {
-        match expected {
-            Some(expected) => actual == Some(expected),
-            None => true,
-        }
-    }
-
-    fn matches_search(&self, call: &McpCallHistoryEntry) -> bool {
-        let Some(needle) = self.q.as_deref() else {
-            return true;
-        };
-        call.searchable_text.contains(needle)
     }
 }
 
@@ -424,22 +650,44 @@ fn parse_mcp_call_page_size(
         .expect("supported page sizes"))
 }
 
-fn mcp_call_summary(call: &McpCallHistoryEntry) -> McpCallListItem {
-    McpCallListItem {
-        id: call.record.id,
-        tool: call.record.tool.clone(),
-        operation: call.record.operation.clone(),
-        started_at_ms: call.record.started_at_ms,
-        duration_ms: call.record.duration_ms,
-        success: call.record.success,
-        input: call.input.clone(),
+async fn mcp_call_detail(State(state): State<DaemonState>, Path(id): Path<u64>) -> Json<Response> {
+    match state.store.mcp_call_detail(id) {
+        Ok(Some(record)) => Json(Response::ok("MCP call", record)),
+        Ok(None) => Json(Response::error(format!("MCP call '{id}' not found"))),
+        Err(error) => Json(Response::error(format!("{error:#}"))),
     }
 }
 
-async fn mcp_call_detail(State(state): State<DaemonState>, Path(id): Path<u64>) -> Json<Response> {
-    match state.mcp_call(id) {
-        Some(call) => Json(Response::ok("MCP call", &call.record)),
-        None => Json(Response::error(format!("MCP call '{id}' not found"))),
+async fn list_task_runs(
+    State(state): State<DaemonState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Response> {
+    let filter = match TaskRunFilter::parse(&query) {
+        Ok(v) => v,
+        Err(response) => return Json(response),
+    };
+    let node = match selected_node(&state, &query) {
+        Ok(node) => node,
+        Err(response) => return Json(response),
+    };
+    Json(
+        state
+            .dispatch_node(&node, RemoteRequest::ListTaskRuns { filter })
+            .await,
+    )
+}
+
+async fn list_events_route(
+    State(state): State<DaemonState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Response> {
+    let filter = match EventFilter::parse(&query) {
+        Ok(v) => v,
+        Err(response) => return Json(response),
+    };
+    match state.store.list_events(&filter) {
+        Ok(page) => Json(Response::ok("events", page)),
+        Err(error) => Json(Response::error(format!("{error:#}"))),
     }
 }
 
@@ -459,10 +707,14 @@ async fn mcp(State(state): State<DaemonState>, Json(rpc): Json<Value>) -> AxumRe
             "protocolVersion": "2025-03-26",
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "taskdeck", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "Use taskdeck_control to inspect and control tasks by global session name."
+            "instructions": if state.public_settings().role == crate::state::NodeRole::Leader {
+                "Use taskdeck_control with an explicit node to inspect and control this Taskdeck cluster."
+            } else {
+                "Use taskdeck_control to inspect and control tasks on this local Taskdeck worker."
+            }
         }),
         "ping" => json!({}),
-        "tools/list" => json!({"tools": [mcp_tool_definition()]}),
+        "tools/list" => json!({"tools": [mcp_tool_definition(&state)]}),
         "tools/call" => {
             let params = rpc.get("params").cloned().unwrap_or_else(|| json!({}));
             match call_mcp_tool(state.clone(), params).await {
@@ -488,7 +740,16 @@ async fn mcp(State(state): State<DaemonState>, Json(rpc): Json<Value>) -> AxumRe
     let response = json!({"jsonrpc": "2.0", "id": id, "result": result});
     if method == "tools/call" {
         let params = rpc.get("params").unwrap_or(&Value::Null);
-        state.record_mcp_call(McpCallRecord {
+        let target_node = params
+            .get("arguments")
+            .and_then(|arguments| arguments.get("node"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                (state.public_settings().role == crate::state::NodeRole::Worker)
+                    .then(|| "self".to_string())
+            });
+        let record = McpCallRecord {
             id: 0,
             tool: params
                 .get("name")
@@ -503,33 +764,60 @@ async fn mcp(State(state): State<DaemonState>, Json(rpc): Json<Value>) -> AxumRe
             started_at_ms,
             duration_ms: started.elapsed().as_millis() as u64,
             success,
+            target_node,
             request: rpc,
             response: response.clone(),
-        });
+        };
+        if let Err(error) = state.store.record_mcp_call(record) {
+            eprintln!("failed to persist MCP call: {error:#}");
+        }
     }
     Json(response).into_response()
 }
 
-fn mcp_tool_definition() -> Value {
-    json!({
-        "name": "taskdeck_control",
-        "description": "List Taskdeck sessions, inspect task status/logs, or control one task/all tasks in a session.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["sessions", "status", "logs", "start", "stop", "restart", "pause", "resume"],
-                    "description": "Operation to perform."
+fn mcp_tool_definition(state: &DaemonState) -> Value {
+    if state.public_settings().role == crate::state::NodeRole::Leader {
+        json!({
+            "name": "taskdeck_control",
+            "description": "Inspect nodes, sessions, and discovered services or control a task on this Taskdeck cluster.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["nodes", "sessions", "services", "status", "logs", "runs", "start", "stop", "restart", "pause", "resume"],
+                        "description": "Cluster operation to perform."
+                    },
+                    "node": {"type": "string", "description": "Node ID. Required for targeted operations; use self for this standard leader."},
+                    "session": {"type": "string", "description": "Session name on the selected node."},
+                    "task": {"type": "string", "description": "Task label. Omit to target every task in a session."},
+                    "tail": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 200}
                 },
-                "session": {"type": "string", "description": "Global session name; required except for sessions."},
-                "task": {"type": "string", "description": "Task label. Omit for all tasks or a full session snapshot."},
-                "tail": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 200}
-            },
-            "required": ["action"],
-            "additionalProperties": false
-        }
-    })
+                "required": ["action"],
+                "additionalProperties": false
+            }
+        })
+    } else {
+        json!({
+            "name": "taskdeck_control",
+            "description": "List local Taskdeck sessions, inspect task status/logs, or control one local task/all tasks in a session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["sessions", "status", "logs", "runs", "start", "stop", "restart", "pause", "resume"],
+                        "description": "Local operation to perform."
+                    },
+                    "session": {"type": "string", "description": "Local session name; required except for sessions."},
+                    "task": {"type": "string", "description": "Task label. Omit for all tasks or a full session snapshot."},
+                    "tail": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 200}
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }
+        })
+    }
 }
 
 async fn call_mcp_tool(state: DaemonState, params: Value) -> std::result::Result<Value, String> {
@@ -544,7 +832,15 @@ async fn call_mcp_tool(state: DaemonState, params: Value) -> std::result::Result
         .get("action")
         .and_then(Value::as_str)
         .ok_or_else(|| "action is required".to_string())?;
-    let session = arguments.get("session").and_then(Value::as_str);
+    let is_leader = state.public_settings().role == crate::state::NodeRole::Leader;
+    if !is_leader && arguments.get("node").is_some() {
+        return Err("worker MCP is local-only and does not accept node".to_string());
+    }
+    let node = arguments.get("node").and_then(Value::as_str);
+    let session = arguments
+        .get("session")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let task = arguments
         .get("task")
         .and_then(Value::as_str)
@@ -553,35 +849,94 @@ async fn call_mcp_tool(state: DaemonState, params: Value) -> std::result::Result
         .get("tail")
         .and_then(Value::as_u64)
         .map(|v| v as usize);
-    let request = match operation {
-        "sessions" => Request::ListSessions,
-        "status" | "logs" => Request::Snapshot {
-            session: session
-                .ok_or_else(|| "session is required".to_string())?
-                .to_string(),
-            tail: Some(if operation == "status" {
-                20
+    let response = match operation {
+        "nodes" if is_leader => Response::ok("nodes", state.node_summaries()),
+        "sessions" if is_leader && node.is_none() => {
+            let rows = state
+                .node_summaries()
+                .into_iter()
+                .flat_map(|node| {
+                    node.sessions.into_iter().map(move |session| {
+                        json!({"node": node.id, "node_name": node.name, "session": session, "online": node.online})
+                    })
+                })
+                .collect::<Vec<_>>();
+            Response::ok("cluster sessions", rows)
+        }
+        "services" if is_leader => Response::ok("services", state.service_rows(node)),
+        "sessions" => {
+            state
+                .dispatch_node(node.unwrap_or("self"), RemoteRequest::ListSessions)
+                .await
+        }
+        "runs" => {
+            let node = if is_leader {
+                node.ok_or_else(|| "node is required for targeted leader operations".to_string())?
             } else {
-                tail.unwrap_or(200)
-            }),
-        },
-        "start" | "stop" | "restart" | "pause" | "resume" => Request::Action {
-            session: session
-                .ok_or_else(|| "session is required".to_string())?
-                .to_string(),
-            task,
-            action: match operation {
-                "start" => Action::Start,
-                "stop" => Action::Stop,
-                "restart" => Action::Restart,
-                "pause" => Action::Pause,
-                "resume" => Action::Resume,
-                _ => unreachable!(),
-            },
-        },
+                "self"
+            };
+            state
+                .dispatch_node(
+                    node,
+                    RemoteRequest::ListTaskRuns {
+                        filter: crate::protocol::TaskRunFilter {
+                            session: session.clone(),
+                            task,
+                            status: None,
+                            trigger: None,
+                            page: tail.unwrap_or(1),
+                            page_size: 50,
+                        },
+                    },
+                )
+                .await
+        }
+        "status" | "logs" => {
+            let node = if is_leader {
+                node.ok_or_else(|| "node is required for targeted leader operations".to_string())?
+            } else {
+                "self"
+            };
+            state
+                .dispatch_node(
+                    node,
+                    RemoteRequest::Snapshot {
+                        session: session.ok_or_else(|| "session is required".to_string())?,
+                        tail: Some(if operation == "status" {
+                            20
+                        } else {
+                            tail.unwrap_or(200)
+                        }),
+                    },
+                )
+                .await
+        }
+        "start" | "stop" | "restart" | "pause" | "resume" => {
+            let node = if is_leader {
+                node.ok_or_else(|| "node is required for targeted leader operations".to_string())?
+            } else {
+                "self"
+            };
+            state
+                .dispatch_node(
+                    node,
+                    RemoteRequest::Action {
+                        session: session.ok_or_else(|| "session is required".to_string())?,
+                        task,
+                        action: match operation {
+                            "start" => Action::Start,
+                            "stop" => Action::Stop,
+                            "restart" => Action::Restart,
+                            "pause" => Action::Pause,
+                            "resume" => Action::Resume,
+                            _ => unreachable!(),
+                        },
+                    },
+                )
+                .await
+        }
         _ => return Err(format!("unsupported action: {operation}")),
     };
-    let response = dispatch_async(state, request).await;
     let text = serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?;
     Ok(json!({
         "content": [{"type": "text", "text": text}],
@@ -593,6 +948,12 @@ async fn call_mcp_tool(state: DaemonState, params: Value) -> std::result::Result
 const INDEX_HTML: &str = include_str!("web/index.html");
 const STYLES_CSS: &str = include_str!("web/styles.css");
 const APP_JS: &str = include_str!("web/app.js");
+
+const LOGIN_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Taskdeck</title>
+<style>:root{color-scheme:dark}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#111315;color:#e8eaed;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.card{width:min(380px,92vw);background:#191d20;border:1px solid #2b3237;padding:28px;border-radius:16px}h1{font-size:22px;margin:0 0 6px}p{margin:0;color:#9ba4a9;font-size:14px}form{display:flex;flex-direction:column;gap:14px;margin-top:24px}input{border-radius:10px;background:#22272b;border:1px solid #333b41;color:#fff;padding:11px 12px}button{background:#51c878;color:#04140a;border:0;border-radius:10px;padding:12px;font-weight:700}.form-error{color:#ff8080;margin-top:18px}</style></head>
+<body><main class="card"><h1>Taskdeck</h1><p>Enter your access key to continue.</p>%LOGIN_ERROR%<form method="post" action="/login"><label for="access_key">Access key</label><input id="access_key" name="access_key" type="password" autocomplete="current-password" required autofocus><button>Unlock</button></form></main></body></html>"#;
 
 const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Taskdeck">
 <rect width="32" height="32" rx="7" fill="#111315"/>
@@ -616,9 +977,32 @@ mod tests {
 
     #[test]
     fn mcp_exposes_one_control_tool() {
-        let tool = mcp_tool_definition();
+        let state = DaemonState::new();
+        let tool = mcp_tool_definition(&state);
         assert_eq!(tool["name"], "taskdeck_control");
         assert_eq!(tool["inputSchema"]["required"][0], "action");
+        assert!(tool["inputSchema"]["properties"].get("node").is_none());
+    }
+
+    #[test]
+    fn leader_mcp_schema_exposes_cluster_targeting() {
+        let state = DaemonState::new();
+        let settings = state
+            .store
+            .configure(crate::state::NodeSettingsUpdate {
+                role: Some(crate::state::NodeRole::Leader),
+                ..crate::state::NodeSettingsUpdate::default()
+            })
+            .unwrap();
+        *state.settings.lock().expect("node settings lock") = settings;
+        let tool = mcp_tool_definition(&state);
+        assert!(tool["inputSchema"]["properties"].get("node").is_some());
+        assert!(
+            tool["inputSchema"]["properties"]["action"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("nodes"))
+        );
     }
 
     #[test]
@@ -637,10 +1021,40 @@ mod tests {
         assert!(APP_JS.contains("/api/mcp-calls"));
         assert!(APP_JS.contains("/config"));
         assert!(APP_JS.contains("/logs?"));
-        assert!(APP_JS.contains("/metrics?window=600"));
+        assert!(INDEX_HTML.contains("id=\"nodes\""));
+        assert!(APP_JS.contains("new URLSearchParams({ window: \"600\" })"));
         assert!(APP_JS.contains("requestFullscreen"));
         assert!(APP_JS.contains("taskdeck-log-tail"));
+        assert!(APP_JS.contains("taskdeck-seen-exits"));
+        assert!(APP_JS.contains("restart_markers_ms"));
+        assert!(INDEX_HTML.contains("data-call-mode=\"result\""));
         assert!(FAVICON_SVG.contains("<svg"));
+    }
+
+    #[test]
+    fn mcp_drawer_preserves_human_readable_details_alongside_raw_payloads() {
+        for id in [
+            "detail-status-icon",
+            "call-overview",
+            "request-fields",
+            "response-summary",
+            "response-data",
+            "call-request",
+            "call-response",
+        ] {
+            assert!(
+                INDEX_HTML.contains(&format!("id=\"{id}\"")),
+                "missing MCP detail element #{id}"
+            );
+        }
+        assert!(INDEX_HTML.contains("data-call-mode=\"result\""));
+        assert!(INDEX_HTML.contains("data-call-mode=\"raw\""));
+        assert!(STYLES_CSS.contains(".detail-status-icon"));
+        assert!(STYLES_CSS.contains(".call-overview"));
+        assert!(STYLES_CSS.contains(".field-row"));
+        assert!(STYLES_CSS.contains(".outcome"));
+        assert!(APP_JS.contains("requestFields(call, target)"));
+        assert!(APP_JS.contains("renderResultData("));
     }
 
     fn metrics_test_state() -> DaemonState {
@@ -662,8 +1076,12 @@ mod tests {
                         shell: false,
                         auto_start: false,
                         stop_timeout_ms: 500,
+                        clear_logs_on_restart: false,
+
+                        schedule: None,
                     },
                 )]),
+                task_order: vec!["api".to_string()],
             }),
         );
         state
@@ -709,6 +1127,148 @@ mod tests {
             assert!(!response.ok);
             assert_eq!(response.data.as_ref().unwrap()["status"], 400);
         }
+    }
+
+    #[tokio::test]
+    async fn task_history_route_replaces_log_generation() {
+        let app = app(metrics_test_state());
+        let read_generation = |body: axum::body::Bytes| async move {
+            let response: Response = serde_json::from_slice(&body).unwrap();
+            response.data.unwrap()["generation"].as_u64().unwrap()
+        };
+        let before = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions/demo/tasks/api/logs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let before = read_generation(to_bytes(before.into_body(), usize::MAX).await.unwrap()).await;
+
+        let cleared = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("DELETE")
+                    .uri("/api/sessions/demo/tasks/api/history")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cleared: Response =
+            serde_json::from_slice(&to_bytes(cleared.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(cleared.ok);
+
+        let after = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions/demo/tasks/api/logs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let after = read_generation(to_bytes(after.into_body(), usize::MAX).await.unwrap()).await;
+        assert_ne!(before, after);
+    }
+
+    #[tokio::test]
+    async fn worker_mcp_audit_records_self_target() {
+        let state = DaemonState::new();
+        let response = app(state.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": "taskdeck_control", "arguments": {"action": "sessions"}}
+                    }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(
+            state
+                .store
+                .mcp_call_detail(1)
+                .unwrap()
+                .unwrap()
+                .target_node
+                .as_deref(),
+            Some("self")
+        );
+    }
+
+    #[tokio::test]
+    async fn leader_mcp_audit_preserves_self_and_worker_targets() {
+        let state = DaemonState::new();
+        let settings = state
+            .store
+            .configure(crate::state::NodeSettingsUpdate {
+                role: Some(crate::state::NodeRole::Leader),
+                ..crate::state::NodeSettingsUpdate::default()
+            })
+            .unwrap();
+        *state.settings.lock().expect("node settings lock") = settings;
+        let app = app(state.clone());
+
+        for (id, node) in [(1, "self"), (2, "worker-7")] {
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "method": "tools/call",
+                                "params": {
+                                    "name": "taskdeck_control",
+                                    "arguments": {"action": "sessions", "node": node}
+                                }
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+        }
+
+        assert_eq!(
+            state
+                .store
+                .mcp_call_detail(1)
+                .unwrap()
+                .unwrap()
+                .target_node
+                .as_deref(),
+            Some("self")
+        );
+        assert_eq!(
+            state
+                .store
+                .mcp_call_detail(2)
+                .unwrap()
+                .unwrap()
+                .target_node
+                .as_deref(),
+            Some("worker-7")
+        );
     }
 
     #[tokio::test]
@@ -782,7 +1342,7 @@ mod tests {
                 }),
             ),
         ] {
-            state.record_mcp_call(call);
+            let _ = state.store.record_mcp_call(call);
         }
         state
     }
@@ -801,6 +1361,7 @@ mod tests {
             started_at_ms,
             duration_ms: started_at_ms + 5,
             success,
+            target_node: None,
             request: json!({
                 "params": {
                     "arguments": arguments
@@ -856,7 +1417,7 @@ mod tests {
     #[tokio::test]
     async fn mcp_calls_route_uses_unicode_casefold_search() {
         let state = DaemonState::new();
-        state.record_mcp_call(test_mcp_call(
+        let _ = state.store.record_mcp_call(test_mcp_call(
             "taskdeck_control",
             Some("inspect"),
             true,
@@ -867,7 +1428,7 @@ mod tests {
                 "note": "ignored"
             }),
         ));
-        state.record_mcp_call(test_mcp_call(
+        let _ = state.store.record_mcp_call(test_mcp_call(
             "taskdeck_control",
             Some("inspect"),
             true,
@@ -894,13 +1455,14 @@ mod tests {
     #[tokio::test]
     async fn mcp_calls_route_does_not_search_response_payload_and_detail_keeps_full_record() {
         let state = DaemonState::new();
-        state.record_mcp_call(McpCallRecord {
+        let _ = state.store.record_mcp_call(McpCallRecord {
             id: 0,
             tool: "taskdeck_control".to_string(),
             operation: Some("inspect".to_string()),
             started_at_ms: 77,
             duration_ms: 9,
             success: true,
+            target_node: None,
             request: json!({
                 "id": 123,
                 "params": {
@@ -1033,7 +1595,7 @@ mod tests {
     async fn mcp_calls_route_paginates_and_snaps_page_sizes() {
         let state = DaemonState::new();
         for index in 0..61 {
-            state.record_mcp_call(test_mcp_call(
+            let _ = state.store.record_mcp_call(test_mcp_call(
                 "taskdeck_control",
                 Some("inspect"),
                 index % 2 == 0,
@@ -1094,5 +1656,97 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![30, 20, 10]
         );
+    }
+
+    async fn http_route(
+        state: DaemonState,
+        method: &str,
+        uri: &str,
+        headers: &[(header::HeaderName, &str)],
+        body: Option<&str>,
+    ) -> axum::response::Response {
+        let app = app(state);
+        let mut builder = HttpRequest::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(name, *value);
+        }
+        let body = Body::from(body.unwrap_or_default().to_owned());
+        app.oneshot(builder.body(body).unwrap()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_allows_disabled_and_protects_enabled_control_plane() {
+        let state = DaemonState::new();
+        let response = http_route(state.clone(), "GET", "/api/nodes", &[], None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        state.store.set_access_key("test-access-key").unwrap();
+        state.store.configure_auth(true).unwrap();
+        let unauthorized = http_route(state.clone(), "GET", "/api/nodes", &[], None).await;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let login = http_route(state, "GET", "/", &[], None).await;
+        assert_eq!(login.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn login_page_hides_the_error_placeholder_until_login_fails() {
+        let state = DaemonState::new();
+        state.store.set_access_key("test-access-key").unwrap();
+        state.store.configure_auth(true).unwrap();
+        let response = http_route(state, "GET", "/login", &[], None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("Enter your access key"));
+        assert!(!body.contains("%LOGIN_ERROR%"));
+    }
+
+    #[tokio::test]
+    async fn auth_login_creates_a_session_cookie_accepted_by_api() {
+        let state = DaemonState::new();
+        state.store.set_access_key("test-access-key").unwrap();
+        state.store.configure_auth(true).unwrap();
+        let wrong = async_body_login(state.clone(), "bad").await;
+        assert_eq!(wrong.status(), StatusCode::OK); // login page with error body
+        let correct = async_body_login(state.clone(), "test-access-key").await;
+        assert_eq!(correct.status(), StatusCode::SEE_OTHER);
+        let cookie = correct
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .unwrap();
+        let token = cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .split('=')
+            .nth(1)
+            .unwrap()
+            .to_string();
+        let name = header::HeaderName::from_static("cookie");
+        let cookie_value = format!("{AUTH_COOKIE}={token}");
+        let response = http_route(
+            state,
+            "GET",
+            "/api/nodes",
+            &[(name, cookie_value.as_str())],
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    async fn async_body_login(state: DaemonState, key: &str) -> axum::response::Response {
+        let body = Body::from(format!("access_key={key}"));
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/login")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(body)
+            .unwrap();
+        app(state).oneshot(request).await.unwrap()
     }
 }

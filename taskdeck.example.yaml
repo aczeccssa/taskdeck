@@ -1,11 +1,23 @@
 version: 1
 session: my-project
 
+# Every task inherits these values; task-level env overrides them.
+# Runtime precedence is daemon environment < workspace_env < task env.
+workspace_env:
+  APP_ENV: development
+  DOTNET_ENVIRONMENT: Development
+
+task_order:
+  - Run Backend API
+  - worker
+  - cleanup
+
 tasks:
   # Override an existing .vscode/tasks.json task by its label.
   Run Backend API:
     auto_start: true
     stop_timeout_ms: 5000
+    clear_logs_on_restart: false
     env:
       ASPNETCORE_ENVIRONMENT: Development
 
@@ -17,4 +29,8 @@ tasks:
     shell: false
     auto_start: false
 
-  # Set enabled: false to hide an imported VS Code task.
+  cleanup:
+    command: ./scripts/cleanup.sh
+    cwd: .
+    shell: true
+    schedule: "*/10 * * * *"   # five fields, local time; six-field forms put seconds first

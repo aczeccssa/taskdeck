@@ -1,0 +1,26 @@
+services:
+  taskdeck-leader:
+    build:
+      context: .
+    image: taskdeck:local
+    restart: unless-stopped
+    environment:
+      TASKDECK_ROLE: leader
+      TASKDECK_LEADER_MODE: pure_master
+      TASKDECK_NODE_NAME: ${TASKDECK_NODE_NAME:-taskdeck-master}
+      TASKDECK_BIND_HOST: 0.0.0.0
+      TASKDECK_WEB_PORT: 9837
+      TASKDECK_ENROLLMENT_TOKEN: ${TASKDECK_ENROLLMENT_TOKEN:?set TASKDECK_ENROLLMENT_TOKEN}
+    ports:
+      - "${TASKDECK_PORT:-9837}:9837"
+    volumes:
+      - taskdeck-state:/var/lib/taskdeck
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:9837/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  taskdeck-state:

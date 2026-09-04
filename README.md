@@ -1,63 +1,52 @@
 # Taskdeck
 
-Taskdeck runs project tasks in one per-user daemon and exposes the same live
-processes through a TUI, CLI, Web UI, and MCP. A task started in one terminal
-keeps running when that terminal or TUI exits and can be controlled elsewhere
-by its global session name.
+Taskdeck runs project tasks in a persistent per-user daemon. The same binary can
+run as a standalone worker, a standard leader that also runs local tasks, or a
+pure master that only controls remote workers. CLI, TUI, Web UI, and MCP all
+operate on the daemon's live state.
 
-## What it reads
-
-Taskdeck automatically imports `.vscode/tasks.json` from the project directory.
-It supports `process` and `shell` tasks, `command`, `args`, `options.cwd`,
-`options.env`, and these common variables:
-
-- `${workspaceFolder}`
-- `${workspaceFolderBasename}`
-- `${env:NAME}`
-
-VS Code JSON with comments and trailing commas is accepted. Add an optional
-`taskdeck.yaml` beside the project README to name the session, add tasks, or
-override imported tasks. See [taskdeck.example.yaml](taskdeck.example.yaml).
-
-```yaml
-version: 1
-session: training-api
-tasks:
-  Run Backend API:
-    auto_start: true
-    stop_timeout_ms: 5000
-  background-worker:
-    command: cargo
-    args: [run, --bin, worker]
-    cwd: ./worker
-    shell: false
-```
-
-## Install and run
+## Install and standalone use
 
 ```bash
-cargo install --path .
+./scripts/install-local.sh
 cd /path/to/project
 taskdeck
 ```
 
-Running `taskdeck` opens the TUI and starts the singleton daemon when needed.
-The project is registered using `taskdeck.yaml`'s `session`, or the directory
-name by default. Use `--session NAME` to override it.
+On Windows, use PowerShell:
 
-TUI keys:
+```powershell
+.\scripts\install-local.ps1
+Set-Location C:\path\to\project
+taskdeck.exe
+```
 
-| Key | Action |
-| --- | --- |
-| `Tab`, `Left`, `Right` | Switch the top task tab |
-| `s` | Start selected task |
-| `Space`, `p` | Pause or resume selected task |
-| `r` | Restart selected task |
-| `x` | Stop selected task |
-| `Up`, `Down`, `PageUp`, `PageDown`, `End` | Browse/follow logs |
-| `q`, `Esc`, `Ctrl+C` | Detach TUI; tasks keep running |
+The default installation is an unlinked `worker`, preserving the normal local
+workflow. Project registrations and node settings are stored in
+`~/.taskdeck/state.db`; reinstalling or restarting Taskdeck does not remove
+them. On daemon startup, Taskdeck reloads every registered project and restores
+configured `auto_start` tasks. Missing or invalid project directories remain
+visible as unavailable registrations instead of being silently forgotten.
 
-CLI examples:
+Set `TASKDECK_HOME` to use an isolated state directory.
+
+Taskdeck imports `.vscode/tasks.json` and applies optional `taskdeck.yaml`
+overrides. It supports process and shell tasks, `command`, `args`, `options.cwd`,
+`options.env`, JSON comments/trailing commas, and common workspace/environment
+variables. See [taskdeck.example.yaml](taskdeck.example.yaml).
+
+Workspace-wide values belong under the optional top-level `workspace_env`
+mapping. Runtime precedence is daemon environment < `workspace_env` < task-level
+`env`. Each task also accepts a five-field local-time Cron schedule; use six
+fields when you need seconds. An empty or absent schedule disables scheduling.
+The scheduler starts an idle task and records a skipped-running result for an
+already-running task; it never replays occurrences missed while Taskdeck was
+offline.
+
+Use the optional top-level `task_order` list to share the Web/TUI tab order.
+Each task may set `clear_logs_on_restart: true` to clear its retained logs and
+performance history whenever it restarts; the default preserves history and
+marks restarts in the performance charts.
 
 ```bash
 taskdeck register --project /path/to/project --session api
@@ -68,74 +57,184 @@ taskdeck start --session api --task "Run Backend API"
 taskdeck pause --session api --task "Run Backend API"
 taskdeck resume --session api --task "Run Backend API"
 taskdeck restart --session api --task "Run Backend API"
-taskdeck stop --session api --task "Run Backend API"
-taskdeck stop --session api        # all tasks in the session
-taskdeck remove --session api      # stop tasks and remove the session
+taskdeck stop --session api
+taskdeck remove --session api
 ```
 
-After editing `.vscode/tasks.json` or `taskdeck.yaml`, run `taskdeck update` for
-the registered project. Existing task processes and logs are retained; changed
-settings take effect the next time a task starts or restarts. Removed tasks are
-stopped, and newly added tasks honor `auto_start`. When one project has multiple
-registered sessions, pass `--session` to select the one to update.
+Running `taskdeck` without a subcommand opens the TUI. Detaching the TUI does
+not stop managed tasks.
 
-The per-user runtime directory is `~/.taskdeck`. Set `TASKDECK_HOME` to isolate
-it, which is useful for tests or running a separate instance.
+## Nodes and roles
 
-## Web UI and MCP
+Every installation has one stable node ID and exactly one role. There are no
+separate worker and leader builds.
 
-The daemon listens only on localhost:
+| Configuration | Runs local tasks | MCP scope | Upstream connection |
+| --- | --- | --- | --- |
+| `worker` | Yes | Local node only | Optional single leader |
+| `leader/standard` | Yes, as `self` | Local and all workers | None |
+| `leader/pure_master` | No | All workers | None |
+
+Inspect and configure the local installation:
+
+```bash
+taskdeck node show
+
+# Link this installation to a leader. The worker initiates the connection.
+taskdeck node configure --role worker --name laptop \
+  --leader-url http://leader.example:9837 --token "$TASKDECK_TOKEN"
+
+# A leader that also runs this machine's tasks.
+taskdeck node configure --role leader --leader-mode standard \
+  --name workstation --token "$TASKDECK_TOKEN"
+
+# A control-plane-only leader.
+taskdeck node configure --role leader --leader-mode pure-master \
+  --name master --bind-host 0.0.0.0 --token "$TASKDECK_TOKEN"
+```
+
+Changing node configuration stops the active daemon; the next command starts
+it with the new settings. A standard leader cannot switch to pure master while
+local projects remain registered. Leaders cannot connect to another leader.
+
+Workers connect outbound over WebSocket, so no worker ingress port is required.
+If the leader is unavailable, local worker tasks, CLI, TUI, Web UI, and MCP keep
+working. The leader retains the last worker inventory while offline and refuses
+new remote actions rather than queueing them.
+
+The enrollment token protects worker admission. Use TLS directly or at a
+trusted reverse proxy before exposing a leader outside a private development
+network. Node APIs never return the token.
+
+## Pure master with Compose
+
+The provided Compose deployment intentionally supports only
+`leader/pure_master`. It uses the same general Taskdeck binary, configured at
+runtime, and persists leader identity plus known worker inventory in a named
+volume.
+
+```bash
+export TASKDECK_ENROLLMENT_TOKEN='replace-with-a-long-random-token'
+./scripts/deploy-compose.sh
+```
+
+Open `http://127.0.0.1:9837`. Override the host port with `TASKDECK_PORT` and the
+display name with `TASKDECK_NODE_NAME`.
+
+There is deliberately no official worker or standard-leader Compose service.
+Those roles execute project commands and must live in the project's actual
+development image/toolchain. Install the Taskdeck binary into that environment,
+persist its `TASKDECK_HOME`, and configure it as a worker pointing at the pure
+master. The deployment does not mount the Docker socket.
+
+## Deployment scripts
+
+The deployment helpers resolve the repository from their own location, so they
+work from either the project root or the `scripts` directory:
+
+```bash
+# Install this checkout on the current macOS, Linux, or Git Bash machine.
+./scripts/install-local.sh
+
+# Install natively from PowerShell on Windows.
+.\scripts\install-local.ps1
+
+# Rebuild and recreate the default Compose service.
+./scripts/deploy-compose.sh
+
+# Deploy through another Docker engine/context.
+./scripts/deploy-compose.sh --context production
+
+# Detect a remote macOS/Linux/Windows target, build or reuse its binary, then install it.
+./scripts/deploy-ssh.sh user@example.com
+```
+
+From inside `scripts`, use `./install-local.sh`, `./deploy-compose.sh`, or
+`./deploy-ssh.sh` directly. Windows users can run `.\install-local.ps1`.
+Run any command with `--help` for its complete options and environment
+variables. SSH deployment probes PowerShell before Unix commands and installs
+Windows builds under `%LOCALAPPDATA%\Taskdeck` by default. Cross-building a
+Windows target requires `cargo-xwin`. On macOS the helper uses the system
+OpenSSH clients by default; `TASKDECK_SSH_BIN` and `TASKDECK_SCP_BIN` can
+override them.
+
+All three commands accept `--sync`. Sync is deliberately opt-in: it requires a
+clean worktree and a configured upstream, then runs a fetch followed by a
+fast-forward-only merge before building or deploying. It never creates merge
+commits, rebases, stashes, or discards local changes.
+
+## Service discovery
+
+Taskdeck classifies each task as a likely service, ordinary process, or unknown.
+It combines:
+
+- command and argument signals;
+- nearby manifests such as `package.json`, `Cargo.toml`, `go.mod`, and project
+  files;
+- configured host/port arguments and environment variables;
+- TCP listeners owned by the task process tree, discovered with `lsof` on Unix
+  or `Get-NetTCPConnection` through PowerShell on Windows;
+- recognizable startup log URLs as fallback evidence.
+
+The Web UI shows the likely runtime/framework and endpoint chips in the task
+header. Listening, configured, and reported endpoints remain distinct. A bind
+such as `0.0.0.0:3000` is reported as observed state, not claimed to be an
+externally reachable URL. Without `lsof`, Taskdeck degrades to static/log
+evidence instead of pretending a configured port is live.
+
+## Web UI and APIs
+
+Single-user access-key authentication is disabled by default. To enable it,
+provide:
+
+```bash
+export TASKDECK_AUTH_ENABLED=true
+export TASKDECK_ACCESS_KEY='a-long-random-access-key'
+```
+
+After first startup, replace that bootstrap key with
+`printf '%s' 'new-key' | taskdeck auth set-key`; inspect state with
+`taskdeck auth status`. The key is stored as an Argon2id hash. Browser sessions
+use an HttpOnly cookie. API/MCP clients may instead send
+`Authorization: Bearer <access-key>`. Worker enrollment continues using the
+separate node token.
+
+By default the daemon binds to `0.0.0.0:9837`, making its Web, MCP, and worker
+agent endpoints available on every network interface. Use `127.0.0.1` when
+accessing it from the same machine:
 
 - Web UI: `http://127.0.0.1:9837`
 - Streamable HTTP MCP: `http://127.0.0.1:9837/mcp`
+- Worker agent connection: `ws://leader:9837/api/agent/connect`
+- Health: `GET /healthz`
 
-The task workspace provides stable log line numbers, 100/500/1,000/5,000-line
-tails, case-insensitive search with previous/next navigation, focused live
-follow, top/bottom controls, and a fullscreen log view. On desktop, worker
-performance can be shown beside the log or as the full workspace; narrow
-screens use separate Logs and Monitor views. The navigation sidebar can be
-collapsed, and that preference is restored on the next visit.
+The leader UI selects node, then session, then task. Standard leaders expose
+their executor as node `self`; pure masters list only connected or previously
+known workers. Remote configuration editing remains revision checked and writes
+the owning worker's `taskdeck.yaml`.
 
-### Editing registered configuration
-
-Use the configuration button for a task to edit the registered project's task
-definitions. The Web UI reads and writes the project-level `taskdeck.yaml`; a
-registered session name remains read-only. Each response includes a content
-`revision`, and Apply rejects the write if the file changed after it was read.
-Writes use a temporary file followed by an atomic rename. YAML is normalized
-when saved: unknown fields are preserved, but comments and formatting are not.
-
-All registered sessions that point at the same project share this YAML and are
-updated together after Apply. Existing running processes keep their current
-command and environment until the next start or restart. Removed tasks stop
-immediately, and newly added tasks with `auto_start: true` start immediately.
-Deleting an imported VS Code task persists `enabled: false`; deleting a YAML
-task removes its entry.
-
-The corresponding endpoints are:
-
-- `GET /api/sessions/{session}/config`
-- `PUT /api/sessions/{session}/config` with `{ "revision": "...", "tasks": [...] }`
-
-### Worker performance
-
-The daemon samples every running task once per second and retains up to 600
-samples (10 minutes). A task includes its root process and descendants. The UI
-shows aggregate CPU, RSS memory, process count, and a process table containing
-PID, PPID, name, CPU, RSS, runtime, and status. CPU uses `100%` for one fully
-utilized logical CPU and can exceed `100%` for a multi-process tree. After a
-task stops, its current metrics become unavailable while its history remains.
-
-Read monitoring data without expanding the ordinary session snapshot:
+Existing session routes accept a `node` query parameter on leaders. Important
+cluster endpoints are:
 
 ```text
-GET /api/sessions/{session}/tasks/{task}/metrics?window=600
+GET  /api/nodes
+GET  /api/sessions?node=NODE_ID
+GET  /api/sessions/{session}?node=NODE_ID
+GET  /api/sessions/{session}/tasks/{task}/logs?node=NODE_ID
+GET  /api/sessions/{session}/tasks/{task}/metrics?node=NODE_ID
+GET  /api/sessions/{session}/config?node=NODE_ID
+PUT  /api/sessions/{session}/config?node=NODE_ID
+POST /api/action              { node, session, task, action }
+GET  /api/task-runs?node=&session=&task=
+GET  /api/events
 ```
 
-`window` is clamped to 1-600 seconds. The response contains `current`,
-`processes`, `samples`, `sample_interval_ms`, and the running state.
+Task runs, events, and MCP calls are durably stored in each executor/control
+node's SQLite database. Logs remain in memory only.
 
-Example MCP client configuration:
+## MCP scope
+
+Configure an MCP client with:
 
 ```json
 {
@@ -148,49 +247,34 @@ Example MCP client configuration:
 }
 ```
 
-The server exposes one tool, `taskdeck_control`. Its `action` is one of
-`sessions`, `status`, `logs`, `start`, `stop`, `restart`, `pause`, or `resume`.
-Pass `session` for every action except `sessions`; pass `task` to target one
-task, or omit it to control all tasks in that session.
+Worker MCP is deliberately local-only: its schema has no `node` field and it
+rejects attempts to provide one. It supports `sessions`, `status`, `logs`,
+`start`, `stop`, `restart`, `pause`, and `resume`.
 
-The Web UI reads MCP call history from `GET /api/mcp-calls`. Supported query
-parameters:
+Leader MCP adds `nodes` and `services`, returns node-qualified aggregate session
+rows, and requires an explicit `node` for targeted reads or actions. Use
+`node: "self"` for a standard leader's local tasks. It never guesses a target
+from a globally unique-looking session name, because another worker may later
+register the same name.
 
-- `q`: case-insensitive search across tool name, operation, session, task, and
-  serialized request arguments
-- `operation`: exact operation filter
-- `status`: `all`, `success`, or `error`
-- `session`: exact session filter
-- `task`: exact task filter
-- `page`: 1-based page number, default `1`
-- `page_size`: default `20`; supported sizes are `20`, `50`, and `100`
-
-`page_size` snaps to the nearest supported size for UI-friendly requests. Ties
-snap down, so `35 -> 20` and `75 -> 50`.
-
-`GET /api/mcp-calls` returns a standard envelope whose `data` object contains:
-
-- `items`: newest-first call summaries with `id`, `tool`, `operation`,
-  `started_at_ms`, `duration_ms`, `success`, and `input`
-- `page`
-- `page_size`
-- `total`
-- `total_pages`
-- `has_next`
-- `has_previous`
-
-Requests with invalid `status`, `page`, or `page_size` return a validation
-error in the normal response envelope. `GET /api/mcp-calls/{id}` remains the
-unchanged detail endpoint.
+MCP calls are retained in memory and visible in the Web UI or through
+`GET /api/mcp-calls`; call details preserve the complete request and response.
 
 ## Process behavior
 
-- Each task gets its own Unix process group.
-- Pause/resume sends `SIGSTOP`/`SIGCONT` to the full group.
-- Stop sends `SIGTERM`, waits for `stop_timeout_ms`, then sends `SIGKILL`.
-- Logs are retained in memory, up to 5,000 lines per task.
-- The daemon and HTTP services bind per-user/localhost only. No authentication
-  is provided, so do not proxy the Web UI or MCP port to an untrusted network.
+- Each task runs in its own Unix process group or Windows Job Object.
+- Pause/resume signals the Unix process group or suspends/resumes the Windows
+  process tree's threads.
+- Stop uses `SIGTERM` plus the configured timeout on Unix and terminates the
+  complete Job Object on Windows.
+- Logs retain up to 5,000 lines per task in memory.
+- CPU, RSS, descendants, and process state are sampled once per second, with a
+  ten-minute history.
+- Graceful daemon shutdown stops managed tasks. Registrations are durable, but
+  live log pipes and arbitrary orphaned processes are not reconstructed after a
+  crash.
 
-Taskdeck currently targets macOS and Linux because process groups and Unix
-domain sockets are central to its lifecycle guarantees.
+Taskdeck supports macOS, Linux, and Windows. Unix tasks run in process groups;
+Windows tasks run in Job Objects. Shell tasks use the configured Unix shell on
+macOS/Linux and Windows PowerShell (`powershell.exe`) on Windows. Local daemon
+IPC uses a per-user Unix socket or Windows named pipe.

@@ -5,13 +5,17 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
 const state = {
   view: "tasks",
+  nodes: [],
+  nodesSignature: "",
   sessions: [],
   sessionsSignature: "",
   snapshot: null,
+  snapshotNode: null,
   currentTask: null,
   renderedTask: null,
   tabsSignature: "",
   headerSignature: "",
+  nodesRequest: 0,
   sessionsRequest: 0,
   snapshotRequest: 0,
   metricsRequest: 0,
@@ -19,6 +23,7 @@ const state = {
   callsRequest: 0,
   callDetailRequest: 0,
   callDetailId: null,
+  callDetailMode: "result",
   configRequest: 0,
   tail: Number(localStorage.getItem("taskdeck-log-tail")) || 1000,
   logLines: [],
@@ -39,10 +44,20 @@ const state = {
   callsDebounce: null,
   config: null,
   configSession: null,
+  configNode: null,
   configTasks: [],
-  configTaskIndex: 0,
+  configWorkspaceEnvRows: [],
+  runs: [],
+  runPage: { page: 1, page_size: 20, total: 0, total_pages: 0 },
+  runFilters: { session:"",task:"",status:"all",trigger:"",page:1,pageSize:20 },
+  events: [],
+  eventPage: { page: 1, page_size: 20, total: 0, total_pages: 0 },
+
   configSaving: false,
   configDirty: false,
+  tabOrderSaving: false,
+  suppressTabClick: false,
+  seenExits: loadSeenExits(),
   toastTimer: null,
 };
 
@@ -52,7 +67,31 @@ const icons = {
   restart: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 8V4m0 0h-4m4 0-3 3a7 7 0 1 0 2 8"/></svg>',
   stop: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>',
   settings: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.4-2.4 1A7 7 0 0 0 15 6l-.3-2.6h-4L10.4 6A7 7 0 0 0 9 7.1l-2.4-1-2 3.4 2 1.5a7 7 0 0 0 0 2l-2 1.5 2 3.4 2.4-1A7 7 0 0 0 10.4 18l.3 2.6h4L15 18a7 7 0 0 0 1.5-1.1l2.4 1 2-3.4-2-1.5a7 7 0 0 0 .1-1z"/></svg>',
+  trash: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"/></svg>',
+  grip: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="7" r="1"/><circle cx="15" cy="7" r="1"/><circle cx="9" cy="12" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="9" cy="17" r="1"/><circle cx="15" cy="17" r="1"/></svg>',
 };
+
+function loadSeenExits() {
+  try {
+    const value = JSON.parse(localStorage.getItem("taskdeck-seen-exits") || "{}");
+    return value && typeof value === "object" ? value : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function exitKey(task) {
+  return `${selectedNode()}\u0000${state.snapshot?.name || ""}\u0000${task}`;
+}
+
+function markExitSeen(task) {
+  const snapshot = state.snapshot?.tasks?.[task];
+  if (!snapshot || snapshot.status !== "exited") return;
+  state.seenExits[exitKey(task)] = Number(snapshot.run_generation || 0);
+  const keys = Object.keys(state.seenExits);
+  keys.slice(0, Math.max(0, keys.length - 500)).forEach((key) => delete state.seenExits[key]);
+  localStorage.setItem("taskdeck-seen-exits", JSON.stringify(state.seenExits));
+}
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -66,6 +105,7 @@ function escapeAttr(value) {
 
 async function requestJson(url, options) {
   const response = await fetch(url, options);
+  if (response.status === 401) { location.assign("/login"); throw new Error("Authentication required"); }
   const payload = await response.json();
   return payload;
 }
@@ -75,7 +115,10 @@ function showToast(message) {
   toast.textContent = message;
   toast.classList.add("visible");
   clearTimeout(state.toastTimer);
-  state.toastTimer = setTimeout(() => toast.classList.remove("visible"), 2200);
+  state.toastTimer = setTimeout(() => {
+    toast.classList.remove("visible");
+    toast.textContent = "";
+  }, 2200);
 }
 
 function setConnection(connected) {
@@ -119,15 +162,63 @@ function setView(view) {
     panel.classList.toggle("active", active);
   });
   $("#sessions").hidden = view !== "tasks";
-  $("#page-title").textContent = view === "calls" ? "MCP Calls" : view === "docs" ? "MCP Guide" : "Task workspace";
+  $("#nodes").hidden = view !== "tasks";
+  $("#page-title").textContent = view === "calls" ? "MCP Calls" : view === "runs" ? "Task Runs" : view === "docs" ? "MCP Guide" : "Task workspace";
   if (view === "calls") loadMcpCalls();
+  if (view === "runs") loadRuns().catch((error) => showToast(error.message || "Unable to load runs"));
   updateMeta();
+}
+
+function selectedNode() {
+  return $("#nodes").value;
+}
+
+function selectedNodeState() {
+  return state.nodes.find((node) => node.id === selectedNode()) || null;
+}
+
+function addNodeQuery(query = new URLSearchParams()) {
+  const node = selectedNode();
+  if (node) query.set("node", node);
+  return query;
+}
+
+async function loadNodes() {
+  const requestId = ++state.nodesRequest;
+  try {
+    const response = await requestJson("/api/nodes");
+    if (requestId !== state.nodesRequest) return;
+    if (!response.ok) throw new Error(response.message);
+    const nodes = response.data || [];
+    const select = $("#nodes");
+    const selected = select.value;
+    state.nodes = nodes;
+    const signature = JSON.stringify(nodes);
+    if (signature !== state.nodesSignature) {
+      state.nodesSignature = signature;
+      select.innerHTML = nodes.length
+        ? nodes.map((node) => `<option value="${escapeAttr(node.id)}">${escapeHtml(node.is_self ? `This device · ${node.name}` : `${node.name}${node.online ? "" : " · offline"}`)}</option>`).join("")
+        : '<option value="">No nodes</option>';
+      state.headerSignature = "";
+    }
+    if (nodes.some((node) => node.id === selected)) select.value = selected;
+    else if (nodes.length) select.value = nodes[0].id;
+    if (state.snapshot && state.snapshotNode === select.value) renderTask();
+    await loadSessions();
+    setConnection(true);
+  } catch (error) {
+    if (requestId !== state.nodesRequest) return;
+    setConnection(false);
+    if (state.view === "tasks") $("#meta").textContent = error.message || "Daemon unavailable";
+  }
 }
 
 function updateMeta() {
   const meta = $("#meta");
   if (state.view === "calls") {
     meta.textContent = `${state.callPage.total || 0} retained call${state.callPage.total === 1 ? "" : "s"}`;
+  } else if (state.view === "runs") {
+    meta.textContent = `${state.runPage.total||0} run${(state.runPage.total||0)===1?"":"s"}`;
   } else if (state.view === "docs") {
     meta.textContent = "Local Streamable HTTP endpoint";
   } else if (state.snapshot) {
@@ -139,9 +230,39 @@ function updateMeta() {
 
 async function loadSessions() {
   const requestId = ++state.sessionsRequest;
+  const node = selectedNode();
+  let daemonReached = false;
+  if (!node) {
+    clearWorkspace();
+    return;
+  }
+  const nodeState = selectedNodeState();
+  if (nodeState?.online === false) {
+    const sessions = nodeState.sessions || [];
+    const select = $("#sessions");
+    const selected = select.value;
+    state.sessions = sessions;
+    state.sessionsSignature = JSON.stringify(sessions);
+    select.innerHTML = sessions.length
+      ? sessions.map((name) => `<option value="${escapeAttr(name)}">${escapeHtml(name)}</option>`).join("")
+      : '<option value="">No cached sessions</option>';
+    if (sessions.includes(selected)) select.value = selected;
+    else if (sessions.length) select.value = sessions[0];
+    setConnection(true);
+    if (state.snapshot && state.snapshotNode === node) {
+      renderTask();
+    } else {
+      clearWorkspace();
+      const lastSeen = nodeState.last_seen_ms ? new Date(nodeState.last_seen_ms).toLocaleString() : "Unknown";
+      $("#task-pane").innerHTML = `<div class="empty-state"><div><h1>Worker offline</h1><p>Last seen ${escapeHtml(lastSeen)}</p></div></div>`;
+    }
+    $("#meta").textContent = `${nodeState.name} is offline`;
+    return;
+  }
   try {
-    const response = await requestJson("/api/sessions");
-    if (requestId !== state.sessionsRequest) return;
+    const response = await requestJson(`/api/sessions?${addNodeQuery()}`);
+    daemonReached = true;
+    if (requestId !== state.sessionsRequest || selectedNode() !== node) return;
     if (!response.ok) throw new Error(response.message);
     const sessions = response.data || [];
     const select = $("#sessions");
@@ -157,7 +278,7 @@ async function loadSessions() {
     if (sessions.includes(selected)) select.value = selected;
     else if (sessions.length) select.value = sessions[0];
     setConnection(true);
-    if (sessions.length && (!state.snapshot || state.snapshot.name !== select.value)) {
+    if (sessions.length && (!state.snapshot || state.snapshot.name !== select.value || state.snapshotNode !== node)) {
       state.currentTask = null;
       state.renderedTask = null;
       await loadSnapshot();
@@ -165,9 +286,9 @@ async function loadSessions() {
       clearWorkspace();
     }
   } catch (error) {
-    if (requestId !== state.sessionsRequest) return;
-    setConnection(false);
-    if (state.view === "tasks") $("#meta").textContent = "Daemon unavailable";
+    if (requestId !== state.sessionsRequest || selectedNode() !== node) return;
+    setConnection(daemonReached);
+    if (state.view === "tasks") $("#meta").textContent = daemonReached ? error.message : "Daemon unavailable";
   }
 }
 
@@ -176,6 +297,7 @@ function clearWorkspace() {
   state.metricsRequest += 1;
   state.logsRequest += 1;
   state.snapshot = null;
+  state.snapshotNode = null;
   state.currentTask = null;
   state.renderedTask = null;
   state.metrics = null;
@@ -189,14 +311,17 @@ function clearWorkspace() {
 
 async function loadSnapshot() {
   const session = $("#sessions").value;
-  if (!session) return;
+  const node = selectedNode();
+  if (!session || !node) return;
   const requestId = ++state.snapshotRequest;
   try {
-    const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}?tail=0`);
-    if (requestId !== state.snapshotRequest || $("#sessions").value !== session) return;
+    const query = addNodeQuery(new URLSearchParams({ tail: "0" }));
+    const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}?${query}`);
+    if (requestId !== state.snapshotRequest || $("#sessions").value !== session || selectedNode() !== node) return;
     if (!response.ok) throw new Error(response.message);
     state.snapshot = response.data;
-    const labels = Object.keys(state.snapshot.tasks || {});
+    state.snapshotNode = node;
+    const labels = orderedTaskLabels(state.snapshot);
     if (!labels.includes(state.currentTask)) {
       state.currentTask = labels[0] || null;
       state.renderedTask = null;
@@ -214,10 +339,140 @@ async function loadSnapshot() {
 }
 
 function renderTabs(labels) {
-  const signature = JSON.stringify([labels, state.currentTask]);
+  const taskStates = labels.map((label) => {
+    const task = state.snapshot?.tasks?.[label] || {};
+    return [label, task.status, task.run_generation, state.seenExits[exitKey(label)] || 0];
+  });
+  const signature = JSON.stringify([taskStates, state.currentTask, state.tabOrderSaving]);
   if (signature === state.tabsSignature) return;
   state.tabsSignature = signature;
-  $("#tabs").innerHTML = labels.map((label) => `<button class="tab ${label === state.currentTask ? "active" : ""}" type="button" role="tab" tabindex="${label === state.currentTask ? "0" : "-1"}" aria-selected="${label === state.currentTask}" data-task="${escapeAttr(label)}">${escapeHtml(label)}</button>`).join("");
+  $("#tabs").classList.toggle("saving-order", state.tabOrderSaving);
+  $("#tabs").innerHTML = labels.map((label) => {
+    const task = state.snapshot.tasks[label] || {};
+    const dot = taskStateDot(label, task);
+    const statusLabel = dot ? `, ${dot.label}` : "";
+    return `<button class="tab ${label === state.currentTask ? "active" : ""}" type="button" role="tab" tabindex="${label === state.currentTask ? "0" : "-1"}" aria-selected="${label === state.currentTask}" aria-label="${escapeAttr(label + statusLabel)}" data-task="${escapeAttr(label)}" data-order-key="${escapeAttr(label)}">${dot ? `<span class="task-state-dot ${dot.className}" title="${escapeAttr(dot.label)}"></span>` : ""}<span>${escapeHtml(label)}</span></button>`;
+  }).join("");
+}
+
+function orderedTaskLabels(snapshot) {
+  const tasks = snapshot?.tasks || {};
+  const labels = [];
+  (snapshot?.task_order || []).forEach((label) => {
+    if (Object.hasOwn(tasks, label) && !labels.includes(label)) labels.push(label);
+  });
+  Object.keys(tasks).forEach((label) => { if (!labels.includes(label)) labels.push(label); });
+  return labels;
+}
+
+function taskStateDot(label, task) {
+  if (task.status === "running") return { className: "running", label: "Running" };
+  if (task.status === "failed") return { className: "failed", label: "Exited with error" };
+  const generation = Number(task.run_generation || 0);
+  if (task.status === "exited" && Number(state.seenExits[exitKey(label)] || 0) !== generation) {
+    return { className: "exited", label: "Finished" };
+  }
+  return null;
+}
+
+function editableTaskPayload(task) {
+  return {
+    label: task.label,
+    command: task.command,
+    args: [...(task.args || [])],
+    cwd: task.cwd || ".",
+    env: { ...(task.env || {}) },
+    shell: Boolean(task.shell),
+    auto_start: Boolean(task.auto_start),
+    stop_timeout_ms: Number(task.stop_timeout_ms || 3000),
+    clear_logs_on_restart: Boolean(task.clear_logs_on_restart),
+    schedule: task.schedule || null,
+  };
+}
+
+async function persistWorkspaceOrder(order, previousOrder) {
+  if (state.tabOrderSaving || !state.snapshot) return;
+  const session = state.snapshot.name;
+  const node = selectedNode();
+  state.tabOrderSaving = true;
+  state.snapshot.task_order = [...order];
+  state.tabsSignature = "";
+  renderTabs(order);
+  try {
+    const query = new URLSearchParams({ node });
+    const current = await requestJson(`/api/sessions/${encodeURIComponent(session)}/config?${query}`);
+    if (!current.ok) throw new Error(current.message);
+    if (selectedNode() !== node || state.snapshot?.name !== session) throw new Error("The selected workspace changed");
+    const byLabel = new Map((current.data.tasks || []).map((task) => [task.label, task]));
+    if (order.some((label) => !byLabel.has(label)) || byLabel.size !== order.length) {
+      throw new Error("Task configuration changed; reload before reordering");
+    }
+    const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}/config?${query}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        revision: current.data.revision,
+        tasks: order.map((label) => editableTaskPayload(byLabel.get(label))),
+      }),
+    });
+    if (!response.ok) throw new Error(response.message);
+    showToast("Task order saved");
+  } catch (error) {
+    if (state.snapshot?.name === session && selectedNode() === node) {
+      state.snapshot.task_order = [...previousOrder];
+    }
+    showToast(error.message || "Unable to save task order");
+  } finally {
+    state.tabOrderSaving = false;
+    state.tabsSignature = "";
+    if (state.snapshot) renderTabs(orderedTaskLabels(state.snapshot));
+  }
+}
+
+function bindPointerSorter(container, itemSelector, handleSelector, onReorder) {
+  let drag = null;
+  container.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || state.tabOrderSaving) return;
+    if (handleSelector && !event.target.closest(handleSelector)) return;
+    const item = event.target.closest(itemSelector);
+    if (!item || !container.contains(item)) return;
+    drag = {
+      item,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      active: false,
+      original: $$(itemSelector, container).map((element) => element.dataset.orderKey),
+    };
+    item.setPointerCapture?.(event.pointerId);
+  });
+  container.addEventListener("pointermove", (event) => {
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    if (!drag.active && Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < 6) return;
+    drag.active = true;
+    drag.item.classList.add("dragging");
+    event.preventDefault();
+    const target = document.elementFromPoint(event.clientX, event.clientY)?.closest(itemSelector);
+    if (!target || target === drag.item || !container.contains(target)) return;
+    const rect = target.getBoundingClientRect();
+    const horizontal = container.id === "tabs";
+    const before = horizontal ? event.clientX < rect.left + rect.width / 2 : event.clientY < rect.top + rect.height / 2;
+    container.insertBefore(drag.item, before ? target : target.nextSibling);
+  });
+  const finish = (event) => {
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    drag.item.releasePointerCapture?.(event.pointerId);
+    drag.item.classList.remove("dragging");
+    if (drag.active) {
+      state.suppressTabClick = container.id === "tabs";
+      const order = $$(itemSelector, container).map((element) => element.dataset.orderKey);
+      onReorder(order, drag.original);
+      setTimeout(() => { state.suppressTabClick = false; }, 80);
+    }
+    drag = null;
+  };
+  container.addEventListener("pointerup", finish);
+  container.addEventListener("pointercancel", finish);
 }
 
 function ensureTaskScaffold() {
@@ -240,16 +495,17 @@ function ensureTaskScaffold() {
           </div>
           <button class="icon-button" type="button" data-log="previous" aria-label="Previous match" title="Previous match">&#8593;</button>
           <button class="icon-button" type="button" data-log="next" aria-label="Next match" title="Next match">&#8595;</button>
-          <button class="icon-button" type="button" data-log="clear" aria-label="Clear search" title="Clear search">&#215;</button>
+          <button class="icon-button" type="button" data-log="clear-search" aria-label="Clear search" title="Clear search">&#215;</button>
           <button class="icon-button" type="button" data-log="top" aria-label="Go to top" title="Go to top">&#8679;</button>
           <button class="icon-button" type="button" data-log="bottom" aria-label="Go to bottom" title="Go to bottom">&#8681;</button>
           <button class="button compact" id="follow-button" type="button" data-log="follow">Focus</button>
           <button class="icon-button" type="button" data-log="fullscreen" aria-label="Full screen logs" title="Full screen logs">&#x26F6;</button>
+          <button class="icon-button danger-icon" type="button" data-log="clear-history" aria-label="Clear logs and performance history" title="Clear logs and performance history">${icons.trash}</button>
           <span class="log-line-count" id="log-line-count">0 lines</span>
         </div>
         <div class="logs" id="logs" tabindex="0"></div>
       </section>
-      <aside class="monitor-panel" id="monitor-panel" aria-label="Worker performance">
+      <aside class="monitor-panel" id="monitor-panel" aria-label="Task performance">
         <header class="monitor-header"><strong>Performance</strong><span id="monitor-state">Waiting</span></header>
         <div class="monitor-body" id="monitor-body"><div class="monitor-empty">No samples</div></div>
       </aside>
@@ -272,7 +528,10 @@ function renderTask() {
 
 function renderTaskHeader(task) {
   const status = task.status || "unknown";
-  const signature = JSON.stringify([state.currentTask, status, task.pid, task.cwd, task.label]);
+  const service = task.service || {};
+  const node = selectedNodeState();
+  const online = node?.online !== false;
+  const signature = JSON.stringify([state.currentTask, status, task.pid, task.cwd, task.label, service, online]);
   if (signature === state.headerSignature) {
     applyWorkspaceMode();
     return;
@@ -284,20 +543,29 @@ function renderTaskHeader(task) {
   const canPause = status === "running";
   const canResume = status === "paused";
   const canStop = ["running", "paused"].includes(status);
+  const technology = service.technology || {};
+  const technologyLabel = technology.framework || technology.runtime || "";
+  const endpointMarkup = (service.endpoints || []).map((endpoint) => {
+    const label = `${endpoint.bind_host}:${endpoint.port}`;
+    const isLink = endpoint.state === "listening" && ["http", "https"].includes(endpoint.protocol);
+    return isLink
+      ? `<a class="endpoint-chip listening" href="${escapeAttr(`${endpoint.protocol}://${endpoint.bind_host}:${endpoint.port}`)}" target="_blank" rel="noreferrer">${escapeHtml(label)}</a>`
+      : `<span class="endpoint-chip ${escapeAttr(endpoint.state || "")}" title="${escapeAttr(`${endpoint.source || "unknown"} · ${endpoint.state || "unknown"}`)}">${escapeHtml(label)}</span>`;
+  }).join("");
   $("#task-header").innerHTML = `
-    <div class="task-heading"><div class="eyebrow">Selected task</div><h1>${escapeHtml(task.label)}</h1><div class="task-detail"><span class="status ${escapeAttr(status)}">${escapeHtml(status)}</span>${task.pid ? `<span>PID ${task.pid}</span>` : ""}<span class="cwd">${escapeHtml(task.cwd)}</span></div></div>
+    <div class="task-heading"><div class="eyebrow">${online ? "Selected task" : "Offline snapshot"}</div><h1>${escapeHtml(task.label)}</h1><div class="task-detail"><span class="status ${escapeAttr(status)}">${escapeHtml(status)}</span>${task.pid ? `<span>PID ${task.pid}</span>` : ""}${technologyLabel ? `<span class="technology-chip" title="${escapeAttr((technology.evidence || []).join(" · "))}">${escapeHtml(technologyLabel)}</span>` : ""}${endpointMarkup}<span class="cwd">${escapeHtml(task.cwd)}</span></div></div>
     <div class="view-modes" aria-label="Workspace layout">
       <button class="mobile-log-mode" type="button" data-mode="log">Logs</button>
       <button class="desktop-split-mode" type="button" data-mode="split">Split</button>
       <button type="button" data-mode="monitor">Monitor</button>
     </div>
     <div class="actions">
-      <button class="button primary" type="button" data-action="start" ${canStart ? "" : "disabled"}>${icons.play}Start</button>
-      <button class="button" type="button" data-action="pause" ${canPause ? "" : "disabled"}>${icons.pause}Pause</button>
-      <button class="button" type="button" data-action="resume" ${canResume ? "" : "disabled"}>${icons.play}Resume</button>
-      <button class="button" type="button" data-action="restart">${icons.restart}Restart</button>
-      <button class="button danger" type="button" data-action="stop" ${canStop ? "" : "disabled"}>${icons.stop}Stop</button>
-      <button class="icon-button" type="button" data-config aria-label="Edit configuration" title="Edit configuration">${icons.settings}</button>
+      <button class="button primary" type="button" data-action="start" ${online && canStart ? "" : "disabled"}>${icons.play}Start</button>
+      <button class="button" type="button" data-action="pause" ${online && canPause ? "" : "disabled"}>${icons.pause}Pause</button>
+      <button class="button" type="button" data-action="resume" ${online && canResume ? "" : "disabled"}>${icons.play}Resume</button>
+      <button class="button" type="button" data-action="restart" ${online ? "" : "disabled"}>${icons.restart}Restart</button>
+      <button class="button danger" type="button" data-action="stop" ${online && canStop ? "" : "disabled"}>${icons.stop}Stop</button>
+      <button class="icon-button" type="button" data-config aria-label="Edit configuration" title="Edit configuration" ${online ? "" : "disabled"}>${icons.settings}</button>
     </div>`;
   applyWorkspaceMode();
   if (focusSelector) $(focusSelector, $("#task-header"))?.focus();
@@ -345,8 +613,9 @@ function resetLogCursor() {
 async function loadLogs() {
   const session = $("#sessions").value;
   const task = state.currentTask;
-  if (!session || !task) return;
-  const context = `${session}\u0000${task}\u0000${state.tail}`;
+  const node = selectedNode();
+  if (!session || !task || !node) return;
+  const context = `${node}\u0000${session}\u0000${task}\u0000${state.tail}`;
   if (state.logContext !== context) {
     state.logContext = context;
     state.logLines = [];
@@ -354,11 +623,11 @@ async function loadLogs() {
     state.lastLogSeq = null;
   }
   const requestId = ++state.logsRequest;
-  const query = new URLSearchParams({ limit: String(state.tail) });
+  const query = addNodeQuery(new URLSearchParams({ limit: String(state.tail) }));
   if (state.lastLogSeq != null) query.set("after", String(state.lastLogSeq));
   try {
     const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}/tasks/${encodeURIComponent(task)}/logs?${query}`);
-    if (requestId !== state.logsRequest || $("#sessions").value !== session || state.currentTask !== task || state.logContext !== context) return;
+    if (requestId !== state.logsRequest || selectedNode() !== node || $("#sessions").value !== session || state.currentTask !== task || state.logContext !== context) return;
     if (!response.ok) throw new Error(response.message);
     const payload = response.data || { generation: null, reset: false, lines: [] };
     const generationChanged = state.logGeneration != null && payload.generation !== state.logGeneration;
@@ -501,7 +770,7 @@ function handleLogAction(action) {
   if (!logs) return;
   if (action === "previous") moveMatch(-1);
   if (action === "next") moveMatch(1);
-  if (action === "clear") {
+  if (action === "clear-search") {
     state.search = "";
     state.matchIndex = 0;
     $("#log-search").value = "";
@@ -524,6 +793,28 @@ function handleLogAction(action) {
     updateFollowButton();
   }
   if (action === "fullscreen") toggleLogFullscreen();
+  if (action === "clear-history") clearTaskHistory();
+}
+
+async function clearTaskHistory() {
+  const session = state.snapshot?.name;
+  const task = state.currentTask;
+  const node = selectedNode();
+  if (!session || !task || !node || selectedNodeState()?.online === false) return;
+  try {
+    const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}/tasks/${encodeURIComponent(task)}/history?${addNodeQuery()}`, {
+      method: "DELETE",
+    });
+    if (!response.ok) throw new Error(response.message);
+    resetLogCursor();
+    state.metrics = null;
+    renderLogs([]);
+    renderMetrics();
+    await Promise.all([loadLogs(), loadMetrics()]);
+    showToast("Logs and performance history cleared");
+  } catch (error) {
+    showToast(error.message || "Unable to clear history");
+  }
 }
 
 async function toggleLogFullscreen() {
@@ -573,13 +864,14 @@ function setWorkspaceMode(mode) {
 async function act(action, button) {
   const session = state.snapshot?.name;
   const task = state.currentTask;
-  if (!session || !task || $("#sessions").value !== session || button.disabled) return;
+  const node = selectedNode();
+  if (!node || !session || !task || $("#sessions").value !== session || button.disabled) return;
   button.disabled = true;
   try {
     const response = await requestJson("/api/action", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ session, task, action }),
+      body: JSON.stringify({ node, session, task, action }),
     });
     if (!response.ok) throw new Error(response.message);
     if ($("#sessions").value === session && state.currentTask === task) await loadSnapshot();
@@ -593,11 +885,13 @@ async function act(action, button) {
 async function loadMetrics() {
   const session = $("#sessions").value;
   const task = state.currentTask;
-  if (!session || !task) return;
+  const node = selectedNode();
+  if (!node || !session || !task) return;
   const requestId = ++state.metricsRequest;
   try {
-    const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}/tasks/${encodeURIComponent(task)}/metrics?window=600`);
-    if (requestId !== state.metricsRequest || $("#sessions").value !== session || state.currentTask !== task) return;
+    const query = addNodeQuery(new URLSearchParams({ window: "600" }));
+    const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}/tasks/${encodeURIComponent(task)}/metrics?${query}`);
+    if (requestId !== state.metricsRequest || selectedNode() !== node || $("#sessions").value !== session || state.currentTask !== task) return;
     if (!response.ok) throw new Error(response.message);
     state.metrics = response.data;
     renderMetrics();
@@ -624,7 +918,7 @@ function formatRuntime(seconds) {
   return `${Math.floor(value / 3600)}h ${Math.floor((value % 3600) / 60)}m`;
 }
 
-function chartMarkup(samples, key, lineClass, formatter) {
+function chartMarkup(samples, key, lineClass, formatter, restartMarkers = []) {
   const values = samples.map((sample) => Number(sample[key] || 0));
   const max = Math.max(...values, 1);
   const points = values.map((value, index) => {
@@ -632,7 +926,16 @@ function chartMarkup(samples, key, lineClass, formatter) {
     const y = 70 - (value / max) * 64;
     return `${x.toFixed(2)},${y.toFixed(2)}`;
   }).join(" ");
-  return `<svg viewBox="0 0 300 72" preserveAspectRatio="none" aria-hidden="true"><path class="chart-grid" d="M0 70H300M0 38H300M0 6H300"/>${points ? `<polyline class="chart-line ${lineClass}" points="${points}"/>` : ""}</svg><div class="chart-title"><span>10 minute history</span><strong>${formatter(max)}</strong></div>`;
+  const firstTimestamp = Number(samples[0]?.timestamp_ms || 0);
+  const lastTimestamp = Number(samples.at(-1)?.timestamp_ms || firstTimestamp);
+  const span = Math.max(lastTimestamp - firstTimestamp, 1);
+  const markers = restartMarkers
+    .map(Number)
+    .filter((timestamp) => timestamp >= firstTimestamp && timestamp <= lastTimestamp)
+    .map((timestamp) => ((timestamp - firstTimestamp) / span) * 300)
+    .map((x) => `<path class="chart-restart" d="M${x.toFixed(2)} 4V70"/>`)
+    .join("");
+  return `<svg viewBox="0 0 300 72" preserveAspectRatio="none" aria-hidden="true"><path class="chart-grid" d="M0 70H300M0 38H300M0 6H300"/>${markers}${points ? `<polyline class="chart-line ${lineClass}" points="${points}"/>` : ""}</svg><div class="chart-title"><span>10 minute history</span><strong>${formatter(max)}</strong></div>`;
 }
 
 function renderMetrics() {
@@ -647,21 +950,23 @@ function renderMetrics() {
   }
   const current = metrics.current || { cpu_percent: 0, memory_bytes: 0, process_count: 0 };
   const samples = metrics.samples || [];
+  const restartMarkers = metrics.restart_markers_ms || [];
   $("#monitor-state").textContent = metrics.running ? "Live - 1s" : "Stopped";
   const processRows = (metrics.processes || []).map((process) => `<tr><td>${process.pid}</td><td>${process.ppid ?? "-"}</td><td class="name" title="${escapeAttr(process.name)}">${escapeHtml(process.name)}</td><td>${Number(process.cpu_percent || 0).toFixed(1)}%</td><td>${formatBytes(process.memory_bytes)}</td><td>${escapeHtml(process.status)}</td><td>${formatRuntime(process.run_time_seconds)}</td></tr>`).join("");
   body.innerHTML = `
     <div class="metric-summary"><div><span>CPU</span><strong>${Number(current.cpu_percent || 0).toFixed(1)}%</strong></div><div><span>RSS</span><strong>${formatBytes(current.memory_bytes)}</strong></div><div><span>Processes</span><strong>${current.process_count || 0}</strong></div></div>
-    <div class="metric-charts"><div class="metric-chart"><div class="chart-title"><span>CPU</span><strong>${Number(current.cpu_percent || 0).toFixed(1)}%</strong></div>${chartMarkup(samples, "cpu_percent", "", (value) => `${value.toFixed(1)}%`)}</div><div class="metric-chart"><div class="chart-title"><span>Memory</span><strong>${formatBytes(current.memory_bytes)}</strong></div>${chartMarkup(samples, "memory_bytes", "memory", formatBytes)}</div></div>
+    <div class="metric-charts"><div class="metric-chart"><div class="chart-title"><span>CPU</span><strong>${Number(current.cpu_percent || 0).toFixed(1)}%</strong></div>${chartMarkup(samples, "cpu_percent", "", (value) => `${value.toFixed(1)}%`, restartMarkers)}</div><div class="metric-chart"><div class="chart-title"><span>Memory</span><strong>${formatBytes(current.memory_bytes)}</strong></div>${chartMarkup(samples, "memory_bytes", "memory", formatBytes, restartMarkers)}</div></div>
     <div class="process-table-wrap">${processRows ? `<table class="processes"><thead><tr><th>PID</th><th>PPID</th><th>Name</th><th>CPU</th><th>RSS</th><th>Status</th><th>Runtime</th></tr></thead><tbody>${processRows}</tbody></table>` : '<div class="monitor-empty">No running processes</div>'}</div>`;
   body.scrollTop = previousTop;
   body.scrollLeft = previousLeft;
 }
 
-function mcpTarget(input) {
-  if (input?.action === "sessions") return { primary: "All sessions", secondary: "Global daemon" };
-  if (input?.task) return { primary: input.task, secondary: input.session || "Task" };
-  if (input?.session) return { primary: input.session, secondary: input.tail ? `Last ${input.tail} lines` : "Session" };
-  return { primary: "Taskdeck daemon", secondary: "No target" };
+function mcpTarget(input, targetNode) {
+  const node = targetNode ? `Node ${targetNode}` : "Cluster";
+  if (input?.action === "sessions" && !targetNode) return { primary: "All sessions", secondary: node };
+  if (input?.task) return { primary: input.task, secondary: `${node} · ${input.session || "Task"}` };
+  if (input?.session) return { primary: input.session, secondary: `${node} · ${input.tail ? `Last ${input.tail} lines` : "Session"}` };
+  return { primary: targetNode || "Taskdeck cluster", secondary: targetNode ? "Node target" : "Cluster operation" };
 }
 
 function callsQuery() {
@@ -697,7 +1002,7 @@ function renderMcpCalls() {
     state.callsSignature = signature;
     const focusedCall = document.activeElement?.closest?.("[data-call-id]")?.dataset.callId;
     body.innerHTML = state.calls.length ? state.calls.map((call) => {
-      const target = mcpTarget(call.input || {});
+      const target = mcpTarget(call.input || {}, call.target_node);
       return `<tr><td><div class="cell-stack"><strong>${escapeHtml(titleCase(call.operation || "MCP call"))}</strong><span>${escapeHtml(call.tool)}</span></div></td><td><div class="cell-stack"><strong>${escapeHtml(target.primary)}</strong><span>${escapeHtml(target.secondary)}</span></div></td><td><span class="status-pill ${call.success ? "" : "error"}">${call.success ? "Success" : "Error"}</span></td><td>${escapeHtml(new Date(call.started_at_ms).toLocaleString())}</td><td>${call.duration_ms} ms</td><td><button class="button compact" type="button" data-call-id="${call.id}">View</button></td></tr>`;
     }).join("") : '<tr class="empty-row"><td colspan="6">No matching MCP calls.</td></tr>';
     if (focusedCall) $(`[data-call-id="${CSS.escape(focusedCall)}"]`, body)?.focus();
@@ -730,14 +1035,93 @@ async function openCallDetails(id) {
     if (!response.ok) throw new Error(response.message);
     const call = response.data;
     if (String(call.id) !== targetId) throw new Error("Call detail response did not match the requested call");
+    const input = call.request?.params?.arguments || {};
+    const target = mcpTarget(input, call.target_node);
     $("#call-dialog-title").textContent = `${titleCase(call.operation || "MCP")} request`;
     $("#call-dialog-subtitle").textContent = `${call.tool} - Call #${call.id}`;
-    $("#call-request").textContent = JSON.stringify(call.request, null, 2);
-    $("#call-response").textContent = JSON.stringify(call.response, null, 2);
-    $("#call-dialog").showModal();
+    const icon = $("#detail-status-icon");
+    icon.classList.toggle("error", !call.success);
+    icon.innerHTML = call.success ? '<svg viewBox="0 0 24 24"><path d="m7.5 12 3 3 6-7"/></svg>' : '<svg viewBox="0 0 24 24"><path d="m8 8 8 8m0-8-8 8"/></svg>';
+    $("#call-overview").innerHTML = `<div class="overview-item"><span>Started</span><strong>${escapeHtml(new Date(call.started_at_ms).toLocaleString())}</strong></div><div class="overview-item"><span>Duration</span><strong>${Number(call.duration_ms || 0)} ms</strong></div><div class="overview-item"><span>Request ID</span><strong>${escapeHtml(call.request?.id ?? "-")}</strong></div>`;
+    $("#request-fields").innerHTML = requestFields(call, target);
+    const result = structuredCallResult(call);
+    const message = result && typeof result === "object" && typeof result.message === "string" ? result.message : typeof result === "string" ? result : call.success ? "The request completed successfully." : "The request could not be completed.";
+    const data = result && typeof result === "object" && Object.hasOwn(result, "data") ? result.data : result;
+    $("#response-summary").innerHTML = `<div class="outcome ${call.success ? "" : "error"}"><span class="outcome-icon">${call.success ? "✓" : "×"}</span><strong>${call.success ? "Completed successfully" : "Request failed"}</strong><p>${escapeHtml(message)}</p></div>`;
+    $("#response-data").innerHTML = renderResultData(data);
+    $("#call-request").textContent = formatCallValue(call.request);
+    $("#call-response").textContent = formatCallValue(call.response);
+    setCallDetailMode("result");
+    if (!$("#call-dialog").open) $("#call-dialog").showModal();
   } catch (error) {
     if (requestId === state.callDetailRequest && state.callDetailId === targetId) showToast(error.message || "Unable to load call");
   }
+}
+
+function requestFields(call, target) {
+  const input = call.request?.params?.arguments || {};
+  const fields = [["Operation", titleCase(input.action || call.operation || "Unknown"), false], ["Target", target.primary, true]];
+  if (call.target_node) fields.push(["Target node", call.target_node, true]);
+  if (input.session) fields.push(["Session", input.session, true]);
+  if (input.task) fields.push(["Task", input.task, false]);
+  else if (["start", "stop", "restart", "pause", "resume"].includes(input.action)) fields.push(["Task", "All tasks in the session", false]);
+  if (input.tail != null) fields.push(["Log lines", input.tail, false]);
+  Object.entries(input).filter(([key]) => !["action", "session", "task", "tail"].includes(key)).forEach(([key, value]) => fields.push([titleCase(key), displayValue(value), typeof value === "string"]));
+  return fields.map(([label, value, mono]) => `<div class="field-row"><span class="field-label">${escapeHtml(label)}</span><strong class="field-value ${mono ? "mono" : ""}">${escapeHtml(value)}</strong></div>`).join("");
+}
+
+function displayValue(value) {
+  if (value == null) return "Not set";
+  if (Array.isArray(value)) return value.map(displayValue).join(", ");
+  if (typeof value === "object") return Object.entries(value).map(([key, item]) => `${titleCase(key)}: ${displayValue(item)}`).join(" - ");
+  return String(value);
+}
+
+function renderResultData(data) {
+  if (data == null || data === "") return '<div class="result-empty">No structured result data.</div>';
+  if (Array.isArray(data)) return `<div class="result-data">${data.length ? `<div class="value-list">${data.map((item) => `<div class="value-list-item">${escapeHtml(displayValue(item))}</div>`).join("")}</div>` : '<div class="result-empty">No items returned.</div>'}</div>`;
+  if (typeof data === "object" && data.tasks) {
+    const facts = [["Session", data.name], ["Project", data.project], ["Source", data.source]].filter(([, value]) => value != null).map(([label, value]) => `<div class="field-row"><span class="field-label">${escapeHtml(label)}</span><strong class="field-value ${label !== "Source" ? "mono" : ""}">${escapeHtml(value)}</strong></div>`).join("");
+    const tasks = Object.entries(data.tasks).map(([name, task]) => renderTaskResult(name, task)).join("");
+    return `<div class="result-data"><div class="session-facts"><div class="field-list">${facts}</div></div>${tasks || '<div class="result-empty">This session has no tasks.</div>'}</div>`;
+  }
+  if (typeof data === "object") return `<div class="result-data"><div class="field-list">${Object.entries(data).filter(([key]) => !["ok", "message"].includes(key)).map(([key, value]) => `<div class="field-row"><span class="field-label">${escapeHtml(titleCase(key))}</span><strong class="field-value">${escapeHtml(displayValue(value))}</strong></div>`).join("")}</div></div>`;
+  return `<div class="result-data"><div class="value-list-item">${escapeHtml(displayValue(data))}</div></div>`;
+}
+
+function renderTaskResult(name, task) {
+  const logs = Array.isArray(task.logs) ? task.logs : [];
+  const status = task.status || "unknown";
+  const statusClass = status === "failed" ? "error" : status === "paused" ? "paused" : "success";
+  return `<article class="task-result"><div class="task-result-header"><strong>${escapeHtml(name)}</strong><span class="status-pill ${statusClass}">${escapeHtml(titleCase(status))}</span></div><div class="task-result-meta">${task.pid ? `<span>PID ${task.pid}</span>` : ""}${task.command ? `<span>${escapeHtml(task.command)}</span>` : ""}${task.cwd ? `<span>${escapeHtml(task.cwd)}</span>` : ""}${task.last_exit ? `<span>Last exit: ${escapeHtml(task.last_exit)}</span>` : ""}</div>${logs.length ? `<details class="log-disclosure"><summary>${logs.length} recent log line${logs.length === 1 ? "" : "s"}</summary><div class="human-logs">${logs.map((line) => `<div class="human-log"><span>${escapeHtml(line.stream)}</span><span>${escapeHtml(line.text)}</span></div>`).join("")}</div></details>` : ""}</article>`;
+}
+
+function structuredCallResult(call) {
+  const result = call.response?.result;
+  if (result?.structuredContent !== undefined) return result.structuredContent;
+  const content = Array.isArray(result?.content) ? result.content : [];
+  for (const item of content) {
+    if (item?.type !== "text" || typeof item.text !== "string") continue;
+    try { return JSON.parse(item.text); } catch (_) { /* plain text fallback */ }
+  }
+  const text = content.filter((item) => item?.type === "text").map((item) => item.text).join("\n");
+  return text || result || call.response;
+}
+
+function formatCallValue(value) {
+  return typeof value === "string" ? value : JSON.stringify(value ?? null, null, 2);
+}
+
+function setCallDetailMode(mode) {
+  state.callDetailMode = mode;
+  $$("[data-call-mode]", $("#call-dialog")).forEach((button) => {
+    const active = button.dataset.callMode === mode;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+  });
+  $$("[data-call-panel]", $("#call-dialog")).forEach((panel) => {
+    panel.hidden = panel.dataset.callPanel !== mode;
+  });
 }
 
 function closeCallDetails() {
@@ -748,6 +1132,7 @@ function closeCallDetails() {
 
 function taskToDraft(task) {
   return {
+    _key: globalThis.crypto?.randomUUID?.() || `task-${Date.now()}-${Math.random()}`,
     label: task.label,
     command: task.command,
     args: [...(task.args || [])],
@@ -756,6 +1141,8 @@ function taskToDraft(task) {
     shell: Boolean(task.shell),
     auto_start: Boolean(task.auto_start),
     stop_timeout_ms: Number(task.stop_timeout_ms || 3000),
+    clear_logs_on_restart: Boolean(task.clear_logs_on_restart),
+    schedule: task.schedule ?? null,
     origin: task.origin || { imported: false, has_yaml_override: false },
   };
 }
@@ -774,12 +1161,15 @@ async function loadConfig(session, confirmDiscard) {
   const requestId = ++state.configRequest;
   showConfigMessage("Loading configuration...");
   try {
-    const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}/config`);
-    if (requestId !== state.configRequest || !$("#config-dialog").open || $("#sessions").value !== session) return;
+    const node = selectedNode();
+    const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}/config?${addNodeQuery()}`);
+    if (requestId !== state.configRequest || !$("#config-dialog").open || $("#sessions").value !== session || selectedNode() !== node) return;
     if (!response.ok) throw new Error(response.message);
     state.config = response.data;
     state.configSession = session;
+    state.configNode = node;
     state.configTasks = (response.data.tasks || []).map(taskToDraft);
+    state.configWorkspaceEnvRows = Object.entries(response.data.workspace_env || {}).map(([key,value])=>({key,value}));
     state.configTaskIndex = Math.max(0, state.configTasks.findIndex((task) => task.label === state.currentTask));
     state.configDirty = false;
     renderConfig();
@@ -805,13 +1195,15 @@ function requestCloseConfig() {
 
 function renderConfig() {
   if (!state.config) return;
-  $("#config-context").innerHTML = `<div><span>Session</span><strong>${escapeHtml(state.config.session)}</strong></div><div><span>Project</span><strong title="${escapeAttr(state.config.project)}">${escapeHtml(state.config.project)}</strong></div><div><span>Revision</span><strong>${escapeHtml(String(state.config.revision).slice(0, 12))}</strong></div>`;
+  const node = state.nodes.find((candidate) => candidate.id === state.configNode);
+  $("#config-context").innerHTML = `<div><span>Node</span><strong>${escapeHtml(node?.name || state.configNode || "Unknown")}</strong></div><div><span>Session</span><strong>${escapeHtml(state.config.session)}</strong></div><div><span>Project</span><strong title="${escapeAttr(state.config.project)}">${escapeHtml(state.config.project)}</strong></div><div><span>Revision</span><strong>${escapeHtml(String(state.config.revision).slice(0, 12))}</strong></div>`;
   renderConfigTaskList();
+  renderConfigWorkspace();
   renderConfigForm();
 }
 
 function renderConfigTaskList() {
-  $("#config-task-list").innerHTML = state.configTasks.length ? state.configTasks.map((task, index) => `<button class="config-task-button ${index === state.configTaskIndex ? "active" : ""}" type="button" data-config-task="${index}"><span>${escapeHtml(task.label || "Untitled task")}</span><small>${task.origin.imported ? "VS Code import" : "YAML task"}</small></button>`).join("") : '<div class="monitor-empty">No tasks</div>';
+  $("#config-task-list").innerHTML = state.configTasks.length ? state.configTasks.map((task, index) => `<div class="config-task-item" data-order-key="${escapeAttr(task._key)}"><button class="drag-handle" type="button" data-drag-handle aria-label="Drag ${escapeAttr(task.label || "Untitled task")}" title="Drag to reorder">${icons.grip}</button><button class="config-task-button ${index === state.configTaskIndex ? "active" : ""}" type="button" data-config-task="${index}"><span>${escapeHtml(task.label || "Untitled task")}</span><small>${task.origin.imported ? "VS Code import" : "YAML task"}</small></button></div>`).join("") : '<div class="monitor-empty">No tasks</div>';
 }
 
 function renderConfigForm() {
@@ -824,12 +1216,45 @@ function renderConfigForm() {
   body.innerHTML = `
     <label class="field"><span>Label</span><input data-field="label" value="${escapeAttr(task.label)}" required></label>
     <label class="field"><span>Command</span><input data-field="command" value="${escapeAttr(task.command)}" required></label>
+    <label class="field"><span>Cron schedule (5 or 6 fields; empty disables)</span><input data-field="schedule" value="${escapeAttr(task.schedule || "")}" placeholder="*/10 * * * *"></label>
     <div class="field-grid"><label class="field"><span>Working directory</span><input data-field="cwd" value="${escapeAttr(task.cwd)}"></label><label class="field"><span>Stop timeout (ms)</span><input data-field="stop_timeout_ms" type="number" min="1" max="300000" value="${task.stop_timeout_ms}"></label></div>
-    <div class="toggle-row"><label><input data-field="shell" type="checkbox" ${task.shell ? "checked" : ""}> Run through shell</label><label><input data-field="auto_start" type="checkbox" ${task.auto_start ? "checked" : ""}> Auto start</label></div>
+    <div class="toggle-row"><label><input data-field="shell" type="checkbox" ${task.shell ? "checked" : ""}> Run through shell</label><label><input data-field="auto_start" type="checkbox" ${task.auto_start ? "checked" : ""}> Auto start</label><label><input data-field="clear_logs_on_restart" type="checkbox" ${task.clear_logs_on_restart ? "checked" : ""}> Clear logs and performance history on restart</label></div>
     <div class="origin-note">${task.origin.imported ? "Imported from .vscode/tasks.json; Taskdeck saves only overrides." : "Defined in taskdeck.yaml."}</div>
     <fieldset class="field"><legend>Arguments</legend><div class="repeater" id="args-rows">${task.args.map((arg, index) => `<div class="repeater-row"><input data-arg="${index}" value="${escapeAttr(arg)}" aria-label="Argument ${index + 1}"><button class="icon-button" type="button" data-remove-arg="${index}" aria-label="Remove argument" title="Remove">&#215;</button></div>`).join("")}</div><button class="button compact" type="button" data-add-arg>Add argument</button></fieldset>
     <fieldset class="field"><legend>Environment</legend><div class="repeater" id="env-rows">${task.envRows.map((row, index) => `<div class="repeater-row env"><input data-env-key="${index}" value="${escapeAttr(row.key)}" placeholder="NAME" aria-label="Environment key"><input data-env-value="${index}" value="${escapeAttr(row.value)}" placeholder="Value" aria-label="Environment value"><button class="icon-button" type="button" data-remove-env="${index}" aria-label="Remove environment variable" title="Remove">&#215;</button></div>`).join("")}</div><button class="button compact" type="button" data-add-env>Add variable</button></fieldset>
     <button class="button danger" type="button" data-delete-task>Delete task</button>`;
+}
+
+function renderConfigWorkspace() {
+  const rows=state.configWorkspaceEnvRows;
+  const container=$("#workspace-env-rows");
+  if(container){
+    container.innerHTML=rows.map((row,index)=>`<div class="repeater-row env"><input data-workspace-key="${index}" value="${escapeAttr(row.key)}" placeholder="NAME"><input data-workspace-value="${index}" value="${escapeAttr(row.value)}" placeholder="Value"><button class="icon-button" type="button" data-remove-workspace="${index}" aria-label="Remove workspace environment variable" title="Remove">&#215;</button></div>`).join("");
+  }
+}
+
+async function loadRuns(){
+  if(state.view!=="runs")return;
+  const params=new URLSearchParams({
+    page:String(state.runFilters.page),page_size:String(state.runFilters.pageSize),
+    status:state.runFilters.status==="all"?"":state.runFilters.status,
+    trigger:state.runFilters.trigger,
+    session:state.runFilters.session,task:state.runFilters.task,
+  });
+  const [runs,eventResponse]=await Promise.all([
+    requestJson(`/api/task-runs?${addNodeQuery(params)}`),
+    requestJson("/api/events?page=1&page_size=20"),
+  ]);
+  if(runs.ok){ state.runPage={page:runs.data.page,page_size:runs.data.page_size,total:runs.data.total,total_pages:runs.data.total_pages}; state.runs=runs.data.items||[]; }
+  else throw new Error(runs.message);
+  if(eventResponse.ok){state.eventPage=eventResponse.data;state.events=eventResponse.data.items||[];} else throw new Error(eventResponse.message);
+  renderRuns(); updateMeta();
+}
+
+function renderRuns(){
+  $("#runs-body").innerHTML=state.runs.length?state.runs.map((run)=>`<tr><td>${escapeHtml(run.task)}</td><td>${escapeHtml(run.session)}</td><td><span class="status ${escapeAttr(run.status)}">${escapeHtml(run.status)}</span></td><td>${escapeHtml(run.trigger)}</td><td>${escapeHtml(new Date(run.started_at_ms).toLocaleString())}</td><td>${run.duration_ms==null?"":escapeHtml(run.duration_ms+" ms")}</td><td>${escapeHtml(run.error_message||run.command||"")}</td></tr>`).join(""):'<tr class="empty-row"><td colspan="7">No task runs recorded.</td></tr>';
+  $("#events-body").innerHTML=state.events.length?state.events.map((event)=>`<tr><td>${escapeHtml(new Date(event.timestamp_ms).toLocaleString())}</td><td>${escapeHtml(event.category)}</td><td>${escapeHtml(event.message)}</td></tr>`).join(""):'<tr class="empty-row"><td colspan="3">No events recorded.</td></tr>';
+  $("#runs-page-label").textContent=`Page ${state.runPage.page||1} of ${state.runPage.total_pages||0}`;
 }
 
 function showConfigMessage(message, error = false, reload = false) {
@@ -846,7 +1271,7 @@ function hideConfigMessage() {
 }
 
 function addConfigTask() {
-  state.configTasks.push({ label: "new-task", command: "", args: [], cwd: ".", envRows: [], shell: true, auto_start: false, stop_timeout_ms: 3000, origin: { imported: false, has_yaml_override: false } });
+  state.configTasks.push({ _key: globalThis.crypto?.randomUUID?.() || `task-${Date.now()}-${Math.random()}`, label: "new-task", command: "", args: [], cwd: ".", envRows: [], shell: true, auto_start: false, stop_timeout_ms: 3000, clear_logs_on_restart: false, schedule: null, origin: { imported: false, has_yaml_override: false } });
   state.configTaskIndex = state.configTasks.length - 1;
   state.configDirty = true;
   renderConfig();
@@ -870,8 +1295,14 @@ function validateConfigTasks() {
       if (Object.hasOwn(env, key)) throw new Error(`${label}: duplicate environment key ${key}`);
       env[key] = row.value;
     });
-    return { label, command, args: [...task.args], cwd: task.cwd.trim() || ".", env, shell: task.shell, auto_start: task.auto_start, stop_timeout_ms: timeout };
+    return { label, command, args: [...task.args], cwd: task.cwd.trim() || ".", env, shell: task.shell, auto_start: task.auto_start, stop_timeout_ms: timeout, clear_logs_on_restart: Boolean(task.clear_logs_on_restart), schedule: task.schedule ? String(task.schedule).trim() : null };
   });
+}
+
+async function validateWorkspaceEnv(){
+  const values={};
+  state.configWorkspaceEnvRows.forEach((row)=>{const key=row.key.trim();if(!key)throw new Error("Workspace environment key is required");if(Object.hasOwn(values,key))throw new Error(`Duplicate workspace environment key ${key}`);values[key]=row.value;});
+  return values;
 }
 
 async function saveConfig() {
@@ -886,11 +1317,11 @@ async function saveConfig() {
   hideConfigMessage();
   try {
     const session = state.configSession;
-    if (!session || $("#sessions").value !== session) throw new Error("The selected session changed. Reopen configuration before saving.");
-    const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}/config`, {
+    if (!session || $("#sessions").value !== session || selectedNode() !== state.configNode) throw new Error("The selected node or session changed. Reopen configuration before saving.");
+    const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}/config?${addNodeQuery()}`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ revision: state.config.revision, tasks }),
+      body: JSON.stringify({ revision: state.config.revision, workspace_env:Object.fromEntries(validateWorkspaceEnv()), tasks }),
     });
     if (!response.ok) {
       const kind = response.data?.kind;
@@ -909,6 +1340,7 @@ async function saveConfig() {
     }
     state.config = response.data;
     state.configTasks = (response.data.tasks || []).map(taskToDraft);
+    state.configWorkspaceEnvRows = Object.entries(response.data.workspace_env || {}).map(([key,value])=>({key,value}));
     state.configDirty = false;
     showToast("Configuration applied");
     $("#config-dialog").close();
@@ -928,6 +1360,17 @@ function bindEvents() {
   $("#sidebar").addEventListener("click", (event) => {
     const button = event.target.closest("[data-view]");
     if (button) setView(button.dataset.view);
+  });
+  $("#nodes").addEventListener("change", () => {
+    if ($("#config-dialog").open && !requestCloseConfig()) {
+      $("#nodes").value = state.configNode || state.snapshotNode || "";
+      return;
+    }
+    clearWorkspace();
+    state.sessions = [];
+    state.sessionsSignature = "";
+    $("#sessions").innerHTML = '<option value="">Loading sessions</option>';
+    loadSessions();
   });
   $("#sessions").addEventListener("change", () => {
     if ($("#config-dialog").open && !requestCloseConfig()) {
@@ -950,13 +1393,14 @@ function bindEvents() {
   });
   $("#tabs").addEventListener("click", (event) => {
     const button = event.target.closest("[data-task]");
-    if (!button) return;
+    if (!button || state.suppressTabClick) return;
+    markExitSeen(button.dataset.task);
     state.currentTask = button.dataset.task;
     state.renderedTask = null;
     state.metrics = null;
     state.headerSignature = "";
     resetLogCursor();
-    renderTabs(Object.keys(state.snapshot.tasks));
+    renderTabs(orderedTaskLabels(state.snapshot));
     renderTask();
     loadLogs();
     loadMetrics();
@@ -967,6 +1411,17 @@ function bindEvents() {
     const index = tabs.indexOf(document.activeElement);
     if (index < 0 || !tabs.length) return;
     event.preventDefault();
+    if (event.altKey) {
+      const direction = event.key === "ArrowRight" ? 1 : -1;
+      const target = index + direction;
+      if (target < 0 || target >= tabs.length) return;
+      const previous = tabs.map((tab) => tab.dataset.task);
+      const order = [...previous];
+      [order[index], order[target]] = [order[target], order[index]];
+      persistWorkspaceOrder(order, previous);
+      requestAnimationFrame(() => $(`[data-task="${CSS.escape(state.currentTask)}"]`, $("#tabs"))?.focus());
+      return;
+    }
     tabs[(index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length].click();
     $("[data-task].active", $("#tabs"))?.focus();
   });
@@ -998,6 +1453,10 @@ function bindEvents() {
   $("#calls-prev").addEventListener("click", () => { if (state.callPage.has_previous) { state.callFilters.page -= 1; loadMcpCalls(); } });
   $("#calls-next").addEventListener("click", () => { if (state.callPage.has_next) { state.callFilters.page += 1; loadMcpCalls(); } });
   $("#close-call-dialog").addEventListener("click", closeCallDetails);
+  $("#call-dialog").addEventListener("click", (event) => {
+    const mode = event.target.closest("[data-call-mode]");
+    if (mode) setCallDetailMode(mode.dataset.callMode);
+  });
   $("#close-config").addEventListener("click", requestCloseConfig);
   $("#call-dialog").addEventListener("click", (event) => { if (event.target === $("#call-dialog")) closeCallDetails(); });
   $("#call-dialog").addEventListener("close", () => { state.callDetailRequest += 1; state.callDetailId = null; });
@@ -1012,10 +1471,35 @@ function bindEvents() {
     renderConfigTaskList();
     renderConfigForm();
   });
+  bindPointerSorter($("#tabs"), ".tab", null, (order, previous) => {
+    if (order.join("\u0000") !== previous.join("\u0000")) persistWorkspaceOrder(order, previous);
+  });
+  bindPointerSorter($("#config-task-list"), ".config-task-item", "[data-drag-handle]", (order) => {
+    const selectedKey = state.configTasks[state.configTaskIndex]?._key;
+    const byKey = new Map(state.configTasks.map((task) => [task._key, task]));
+    state.configTasks = order.map((key) => byKey.get(key)).filter(Boolean);
+    state.configTaskIndex = Math.max(0, state.configTasks.findIndex((task) => task._key === selectedKey));
+    state.configDirty = true;
+    renderConfigTaskList();
+  });
   $("#config-form").addEventListener("submit", (event) => { event.preventDefault(); saveConfig(); });
-  $("#config-form-body").addEventListener("input", handleConfigInput);
-  $("#config-form-body").addEventListener("change", handleConfigInput);
-  $("#config-form-body").addEventListener("click", handleConfigButton);
+  $("#refresh-runs")?.addEventListener("click", () => loadRuns().catch((e)=>showToast(e.message||"Unable to load runs")));
+  ["run-session","run-task","run-status","run-trigger","run-page-size"].forEach((id)=>{
+    $(`#${id}`)?.addEventListener("change",(event)=>{
+      const target=event.target;
+      if(id==="run-session")state.runFilters.session=target.value;
+      else if(id==="run-task")state.runFilters.task=target.value;
+      else if(id==="run-status")state.runFilters.status=target.value;
+      else if(id==="run-trigger")state.runFilters.trigger=target.value;
+      else if(id==="run-page-size")state.runFilters.pageSize=Number(target.value);
+      state.runFilters.page=1;loadRuns().catch(()=>{});
+    });
+  });
+  $("#runs-prev")?.addEventListener("click",()=>{if(state.runPage.page>1){state.runFilters.page-=1;loadRuns().catch(()=>{});}});
+  $("#runs-next")?.addEventListener("click",()=>{if(state.runPage.has_next??(state.runFilters.page<state.runPage.total_pages)){state.runFilters.page+=1;loadRuns().catch(()=>{});}});
+  $("#config-form").addEventListener("input", handleConfigInput);
+  $("#config-form").addEventListener("change", handleConfigInput);
+  $("#config-form").addEventListener("click", handleConfigButton);
   $("#docs-view").addEventListener("click", async (event) => {
     const button = event.target.closest("[data-copy] .copy");
     if (!button) return;
@@ -1038,9 +1522,10 @@ function bindEvents() {
 }
 
 function handleConfigInput(event) {
-  const task = state.configTasks[state.configTaskIndex];
-  if (!task) return;
   const target = event.target;
+  if(target.dataset.workspaceKey!=null){state.configWorkspaceEnvRows[Number(target.dataset.workspaceKey)].key=target.value;}
+  else if(target.dataset.workspaceValue!=null){state.configWorkspaceEnvRows[Number(target.dataset.workspaceValue)].value=target.value;}
+  else { const task=state.configTasks[state.configTaskIndex]; if(!task)return;
   if (target.dataset.field) {
     const field = target.dataset.field;
     task[field] = target.type === "checkbox" ? target.checked : field === "stop_timeout_ms" ? Number(target.value) : target.value;
@@ -1049,14 +1534,17 @@ function handleConfigInput(event) {
   if (target.dataset.arg != null) task.args[Number(target.dataset.arg)] = target.value;
   if (target.dataset.envKey != null) task.envRows[Number(target.dataset.envKey)].key = target.value;
   if (target.dataset.envValue != null) task.envRows[Number(target.dataset.envValue)].value = target.value;
+  }
   state.configDirty = true;
 }
 
 function handleConfigButton(event) {
   const task = state.configTasks[state.configTaskIndex];
-  if (!task) return;
   const button = event.target.closest("button");
   if (!button) return;
+  if(button.dataset.addWorkspace!=null){state.configWorkspaceEnvRows.push({key:"",value:""});renderConfigWorkspace();}
+  else if(button.dataset.removeWorkspace!=null){state.configWorkspaceEnvRows.splice(Number(button.dataset.removeWorkspace),1);renderConfigWorkspace();}
+  else if (!task) return;
   if (button.dataset.addArg != null) { task.args.push(""); renderConfigForm(); }
   if (button.dataset.removeArg != null) { task.args.splice(Number(button.dataset.removeArg), 1); renderConfigForm(); }
   if (button.dataset.addEnv != null) { task.envRows.push({ key: "", value: "" }); renderConfigForm(); }
@@ -1077,11 +1565,14 @@ function updateEndpoint() {
 
 function tick() {
   if (state.view === "tasks") {
+    if (selectedNodeState()?.online === false) return;
     loadSnapshot();
     loadLogs();
     loadMetrics();
   } else if (state.view === "calls") {
     loadMcpCalls();
+  } else if (state.view === "runs") {
+    loadRuns().catch(() => {});
   }
 }
 
@@ -1089,6 +1580,6 @@ applySavedPreferences();
 bindEvents();
 updateEndpoint();
 setView("tasks");
-loadSessions();
+loadNodes();
 setInterval(tick, 1000);
-setInterval(loadSessions, 5000);
+setInterval(loadNodes, 5000);

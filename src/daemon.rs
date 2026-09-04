@@ -1,7 +1,7 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -10,29 +10,37 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 
+use crate::cluster::{LeaderCluster, RemoteRequest, spawn_worker_client};
 use crate::config;
 use crate::protocol::{
-    McpCallRecord, Request, Response, TaskMetricsAggregate, TaskMetricsSample, TaskMetricsSnapshot,
-    TaskProcessSnapshot, casefold_search_text,
+    Request, Response, TaskMetricsAggregate, TaskMetricsSample, TaskMetricsSnapshot,
+    TaskProcessSnapshot, TaskStatus,
 };
 use crate::runtime::{SessionRuntime, Sessions};
+use crate::service;
+use crate::state::{NodeRole, NodeSettings, StateStore};
 use crate::web;
 
-pub const DEFAULT_WEB_HOST: &str = "127.0.0.1";
-pub const DEFAULT_WEB_PORT: u16 = 9837;
-pub const MAX_MCP_CALLS: usize = 500;
 pub const TASK_METRICS_SAMPLE_INTERVAL_MS: u64 = 1_000;
 pub const MAX_TASK_METRIC_SAMPLES: usize = 600;
 
 #[derive(Clone)]
 pub struct DaemonState {
+    pub store: Arc<StateStore>,
+    pub settings: Arc<Mutex<NodeSettings>>,
+    pub cluster: LeaderCluster,
     pub sessions: Arc<Mutex<Sessions>>,
-    pub mcp_calls: Arc<Mutex<VecDeque<Arc<McpCallHistoryEntry>>>>,
-    pub next_mcp_call_id: Arc<AtomicU64>,
+    pub unavailable_sessions: Arc<Mutex<BTreeMap<String, UnavailableSession>>>,
     pub task_metrics: Arc<Mutex<TaskMetricsStore>>,
+    run_triggers: Arc<Mutex<HashMap<ScheduleKey, String>>>,
     pub config_mutations: Arc<Mutex<()>>,
     pub shutdown: Arc<AtomicBool>,
     #[cfg(test)]
@@ -43,13 +51,28 @@ pub struct DaemonState {
     pub put_config_runtime_failure_after: Arc<Mutex<Option<usize>>>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UnavailableSession {
+    pub session: String,
+    pub project: PathBuf,
+    pub error: String,
+}
+
 impl DaemonState {
+    #[cfg(test)]
     pub fn new() -> Self {
+        let store = Arc::new(StateStore::open_in_memory().expect("in-memory state store"));
+        let settings = store.node_settings().expect("default node settings");
+        let cluster = LeaderCluster::new(store.clone(), settings.enrollment_token.clone())
+            .expect("test leader cluster");
         Self {
+            store,
+            settings: Arc::new(Mutex::new(settings)),
+            cluster,
             sessions: Arc::new(Mutex::new(Sessions::new())),
-            mcp_calls: Arc::new(Mutex::new(VecDeque::new())),
-            next_mcp_call_id: Arc::new(AtomicU64::new(1)),
+            unavailable_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             task_metrics: Arc::new(Mutex::new(TaskMetricsStore::default())),
+            run_triggers: Arc::new(Mutex::new(HashMap::new())),
             config_mutations: Arc::new(Mutex::new(())),
             shutdown: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -61,31 +84,188 @@ impl DaemonState {
         }
     }
 
-    pub fn record_mcp_call(&self, mut record: McpCallRecord) {
-        record.id = self.next_mcp_call_id.fetch_add(1, Ordering::Relaxed);
-        let entry = Arc::new(McpCallHistoryEntry::new(record));
-        let mut calls = self.mcp_calls.lock().expect("MCP calls lock");
-        calls.push_front(entry);
-        calls.truncate(MAX_MCP_CALLS);
+    pub fn load(paths: &GlobalPaths) -> Result<Self> {
+        let store = Arc::new(StateStore::open(&paths.root)?);
+        let settings = store.node_settings()?;
+        let cluster = LeaderCluster::new(store.clone(), settings.enrollment_token.clone())?;
+        let mut sessions = Sessions::new();
+        let mut unavailable_sessions = BTreeMap::new();
+        if settings.execution_enabled() {
+            for registration in store.registrations()? {
+                match config::discover(&registration.project, Some(&registration.session)) {
+                    Ok(definition) => {
+                        let mut runtime = SessionRuntime::new(definition);
+                        runtime.auto_start();
+                        sessions.insert(registration.session, runtime);
+                    }
+                    Err(error) => {
+                        unavailable_sessions.insert(
+                            registration.session.clone(),
+                            UnavailableSession {
+                                session: registration.session,
+                                project: registration.project,
+                                error: format!("{error:#}"),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        let auth = store.apply_auth_environment()?;
+        if auth.enabled {
+            let _ = store.record_event(
+                "auth",
+                "access-key authentication enabled",
+                serde_json::json!({"enabled":true}),
+            );
+        }
+        Ok(Self {
+            store,
+            settings: Arc::new(Mutex::new(settings)),
+            cluster,
+            sessions: Arc::new(Mutex::new(sessions)),
+            unavailable_sessions: Arc::new(Mutex::new(unavailable_sessions)),
+            task_metrics: Arc::new(Mutex::new(TaskMetricsStore::default())),
+            run_triggers: Arc::new(Mutex::new(HashMap::new())),
+            config_mutations: Arc::new(Mutex::new(())),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            put_config_post_check_delay: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            put_config_before_finalize_content: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            put_config_runtime_failure_after: Arc::new(Mutex::new(None)),
+        })
     }
 
-    pub fn recent_mcp_calls(&self, limit: usize) -> Vec<Arc<McpCallHistoryEntry>> {
-        self.mcp_calls
+    pub fn execution_enabled(&self) -> bool {
+        self.settings
             .lock()
-            .expect("MCP calls lock")
-            .iter()
-            .take(limit.min(MAX_MCP_CALLS))
-            .cloned()
+            .expect("node settings lock")
+            .execution_enabled()
+    }
+
+    pub fn public_settings(&self) -> crate::state::PublicNodeSettings {
+        self.settings.lock().expect("node settings lock").public()
+    }
+
+    pub fn local_inventory(&self) -> Vec<crate::protocol::SessionSnapshot> {
+        if !self.execution_enabled() {
+            return Vec::new();
+        }
+        self.sessions
+            .lock()
+            .expect("sessions lock")
+            .values_mut()
+            .filter_map(|runtime| runtime.snapshot(0).ok())
             .collect()
     }
 
-    pub fn mcp_call(&self, id: u64) -> Option<Arc<McpCallHistoryEntry>> {
-        self.mcp_calls
-            .lock()
-            .expect("MCP calls lock")
-            .iter()
-            .find(|call| call.record.id == id)
-            .cloned()
+    pub fn node_summaries(&self) -> Vec<crate::protocol::NodeSummary> {
+        let settings = self.settings.lock().expect("node settings lock").clone();
+        let mut nodes = Vec::new();
+        if settings.execution_enabled() {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .expect("sessions lock")
+                .keys()
+                .cloned()
+                .chain(
+                    self.unavailable_sessions
+                        .lock()
+                        .expect("unavailable sessions lock")
+                        .keys()
+                        .cloned(),
+                )
+                .collect::<Vec<_>>();
+            sessions.sort();
+            sessions.dedup();
+            nodes.push(crate::protocol::NodeSummary {
+                id: "self".to_string(),
+                name: settings.name.clone(),
+                role: settings.role.as_label().to_string(),
+                mode: if settings.role == NodeRole::Leader {
+                    settings.leader_mode.as_label().to_string()
+                } else {
+                    "local_executor".to_string()
+                },
+                online: true,
+                is_self: true,
+                last_seen_ms: Some(current_timestamp_ms()),
+                sessions,
+            });
+        }
+        if settings.role == NodeRole::Leader {
+            nodes.extend(self.cluster.remote_nodes());
+        }
+        nodes
+    }
+
+    pub async fn dispatch_node(&self, node: &str, request: RemoteRequest) -> Response {
+        let settings = self.settings.lock().expect("node settings lock").clone();
+        if node == "self" {
+            if !settings.execution_enabled() {
+                return Response::error("pure master does not have a self executor");
+            }
+            return dispatch_async(self.clone(), request.into_local()).await;
+        }
+        if settings.role != NodeRole::Leader {
+            return Response::error("worker nodes can only control their local self executor");
+        }
+        self.cluster.request(node, request).await
+    }
+
+    pub fn service_rows(&self, node: Option<&str>) -> Vec<serde_json::Value> {
+        let inventories = match node {
+            Some("self") => vec![("self".to_string(), self.local_inventory())],
+            Some(node) => self
+                .cluster
+                .cached_inventory(node)
+                .map(|inventory| vec![(node.to_string(), inventory)])
+                .unwrap_or_default(),
+            None => {
+                let mut inventories = Vec::new();
+                let settings = self.settings.lock().expect("node settings lock");
+                if settings.execution_enabled() {
+                    inventories.push(("self".to_string(), self.local_inventory()));
+                }
+                if settings.role == NodeRole::Leader {
+                    for node in self.cluster.remote_nodes() {
+                        if let Some(inventory) = self.cluster.cached_inventory(&node.id) {
+                            inventories.push((node.id, inventory));
+                        }
+                    }
+                }
+                inventories
+            }
+        };
+        inventories
+            .into_iter()
+            .flat_map(|(node_id, sessions)| {
+                sessions.into_iter().flat_map(move |session| {
+                    let node_id = node_id.clone();
+                    session
+                        .tasks
+                        .into_iter()
+                        .filter_map(move |(task, snapshot)| {
+                            let service = snapshot.service;
+                            if service.classification
+                                == crate::protocol::ServiceClassification::Unknown
+                                && service.endpoints.is_empty()
+                            {
+                                return None;
+                            }
+                            Some(serde_json::json!({
+                                "node": node_id,
+                                "session": session.name,
+                                "task": task,
+                                "service": service,
+                            }))
+                        })
+                })
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -95,7 +275,6 @@ impl DaemonState {
             .lock()
             .expect("config write delay lock") = Some(delay);
     }
-
     #[cfg(test)]
     fn put_config_post_check_delay(&self) -> Option<Duration> {
         *self
@@ -103,23 +282,20 @@ impl DaemonState {
             .lock()
             .expect("config write delay lock")
     }
-
     #[cfg(test)]
     pub fn set_put_config_before_finalize_content(&self, content: impl Into<String>) {
         *self
             .put_config_before_finalize_content
             .lock()
-            .expect("config finalize hook lock") = Some(content.into());
+            .expect("config write finalize hook lock") = Some(content.into());
     }
-
     #[cfg(test)]
     fn take_put_config_before_finalize_content(&self) -> Option<String> {
         self.put_config_before_finalize_content
             .lock()
-            .expect("config finalize hook lock")
+            .expect("config write finalize hook lock")
             .take()
     }
-
     #[cfg(test)]
     pub fn set_put_config_runtime_failure_after(&self, count: usize) {
         *self
@@ -127,15 +303,6 @@ impl DaemonState {
             .lock()
             .expect("runtime failure hook lock") = Some(count);
     }
-
-    #[cfg(test)]
-    pub fn clear_put_config_runtime_failure(&self) {
-        *self
-            .put_config_runtime_failure_after
-            .lock()
-            .expect("runtime failure hook lock") = None;
-    }
-
     #[cfg(test)]
     fn put_config_runtime_failure_after(&self) -> Option<usize> {
         *self
@@ -143,63 +310,13 @@ impl DaemonState {
             .lock()
             .expect("runtime failure hook lock")
     }
-}
-
-#[derive(Debug)]
-pub struct McpCallHistoryEntry {
-    pub record: McpCallRecord,
-    pub input: serde_json::Value,
-    pub session: Option<String>,
-    pub task: Option<String>,
-    pub searchable_text: String,
-}
-
-impl McpCallHistoryEntry {
-    fn new(record: McpCallRecord) -> Self {
-        let input = record
-            .request
-            .pointer("/params/arguments")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let session = input
-            .get("session")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let task = input
-            .get("task")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let searchable_text = build_mcp_call_searchable_text(
-            &record.tool,
-            record.operation.as_deref(),
-            session.as_deref(),
-            task.as_deref(),
-            &input,
-        );
-        Self {
-            record,
-            input,
-            session,
-            task,
-            searchable_text,
-        }
+    #[cfg(test)]
+    pub fn clear_put_config_runtime_failure(&self) {
+        *self
+            .put_config_runtime_failure_after
+            .lock()
+            .expect("runtime failure hook lock") = None;
     }
-}
-
-fn build_mcp_call_searchable_text(
-    tool: &str,
-    operation: Option<&str>,
-    session: Option<&str>,
-    task: Option<&str>,
-    input: &serde_json::Value,
-) -> String {
-    let serialized_input = serde_json::to_string(input).unwrap_or_default();
-    casefold_search_text(&format!(
-        "{tool}\u{1f}{operation}\u{1f}{session}\u{1f}{task}\u{1f}{serialized_input}",
-        operation = operation.unwrap_or(""),
-        session = session.unwrap_or(""),
-        task = task.unwrap_or(""),
-    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -214,6 +331,7 @@ struct TaskMetricsTarget {
     task: String,
     root_pid: Option<u32>,
     start_generation: u64,
+    history_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -239,6 +357,7 @@ struct TaskMetricsEntry {
     current: TaskMetricsAggregate,
     processes: Vec<TaskProcessSnapshot>,
     samples: VecDeque<TaskMetricsSample>,
+    restart_markers_ms: VecDeque<u64>,
 }
 
 impl TaskMetricsEntry {
@@ -269,6 +388,8 @@ impl TaskMetricsEntry {
     fn snapshot(&self, window_seconds: usize) -> TaskMetricsSnapshot {
         let sample_count = window_seconds.min(MAX_TASK_METRIC_SAMPLES);
         let skip = self.samples.len().saturating_sub(sample_count);
+        let samples = self.samples.iter().skip(skip).cloned().collect::<Vec<_>>();
+        let first_timestamp = samples.first().map(|sample| sample.timestamp_ms);
         TaskMetricsSnapshot {
             sample_interval_ms: TASK_METRICS_SAMPLE_INTERVAL_MS,
             window_seconds: sample_count as u64,
@@ -277,8 +398,21 @@ impl TaskMetricsEntry {
                     .to_string(),
             running: self.running,
             current: self.current.clone(),
-            samples: self.samples.iter().skip(skip).cloned().collect(),
+            samples,
             processes: self.processes.clone(),
+            restart_markers_ms: self
+                .restart_markers_ms
+                .iter()
+                .copied()
+                .filter(|timestamp| first_timestamp.is_none_or(|first| *timestamp >= first))
+                .collect(),
+        }
+    }
+
+    fn mark_restart(&mut self, timestamp_ms: u64) {
+        self.restart_markers_ms.push_back(timestamp_ms);
+        while self.restart_markers_ms.len() > MAX_TASK_METRIC_SAMPLES {
+            self.restart_markers_ms.pop_front();
         }
     }
 }
@@ -320,6 +454,23 @@ impl TaskMetricsStore {
         self.entries.retain(|key, _| key.session != session);
     }
 
+    fn clear_task(&mut self, session: &str, task: &str) {
+        self.entries.remove(&TaskMetricsKey {
+            session: session.to_string(),
+            task: task.to_string(),
+        });
+    }
+
+    fn mark_restart(&mut self, session: &str, task: &str, timestamp_ms: u64) {
+        self.entries
+            .entry(TaskMetricsKey {
+                session: session.to_string(),
+                task: task.to_string(),
+            })
+            .or_default()
+            .mark_restart(timestamp_ms);
+    }
+
     fn retain_current_tasks(&mut self, current: &HashSet<TaskMetricsKey>) {
         self.entries.retain(|key, _| current.contains(key));
     }
@@ -332,17 +483,315 @@ fn current_timestamp_ms() -> u64 {
         .as_millis() as u64
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ScheduleKey {
+    session: String,
+    task: String,
+}
+
+fn status_label(status: TaskStatus) -> String {
+    serde_json::to_value(&status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{status:?}"))
+}
+
+enum RunTransition {
+    Started(String, Box<crate::protocol::TaskSnapshot>, String),
+    Finished {
+        session: String,
+        task: String,
+        generation: u64,
+        status: String,
+        exit_code: Option<i32>,
+        error_message: Option<String>,
+    },
+}
+
+fn trigger_for(
+    state: &DaemonState,
+    key: &ScheduleKey,
+    snapshot: &crate::protocol::TaskSnapshot,
+) -> String {
+    state
+        .run_triggers
+        .lock()
+        .expect("run trigger lock")
+        .remove(key)
+        .unwrap_or_else(|| {
+            if snapshot.auto_start {
+                "auto_start".to_string()
+            } else {
+                "manual".to_string()
+            }
+        })
+}
+
+fn finished_run_details(
+    session: &str,
+    task_snapshot: &crate::protocol::TaskSnapshot,
+) -> RunTransition {
+    let status = if matches!(task_snapshot.status, TaskStatus::Idle) {
+        "stopped".to_string()
+    } else {
+        status_label(task_snapshot.status.clone())
+    };
+    RunTransition::Finished {
+        session: session.to_string(),
+        task: task_snapshot.label.clone(),
+        generation: task_snapshot.run_generation,
+        status,
+        exit_code: task_snapshot.exit_code,
+        error_message: if matches!(task_snapshot.status, TaskStatus::Failed)
+            || task_snapshot.exit_code.is_none()
+        {
+            task_snapshot.last_exit.clone()
+        } else {
+            None
+        },
+    }
+}
+
+fn collect_run_transitions(
+    state: &DaemonState,
+    tracked: &mut HashMap<ScheduleKey, (u64, TaskStatus)>,
+) -> Vec<RunTransition> {
+    let mut transitions = Vec::new();
+    {
+        let mut sessions = state.sessions.lock().expect("sessions lock");
+        for (session_name, runtime) in sessions.iter_mut() {
+            let Ok(snapshot) = runtime.snapshot(0) else {
+                continue;
+            };
+            for task_snapshot in snapshot.tasks.into_values() {
+                let key = ScheduleKey {
+                    session: session_name.clone(),
+                    task: task_snapshot.label.clone(),
+                };
+                let previous = tracked
+                    .get(&key)
+                    .map(|(generation, status)| (*generation, status.clone()));
+                let (previous_generation, previous_status) = previous
+                    .map(|(generation, status)| (Some(generation), Some(status)))
+                    .unwrap_or((None, None));
+                let generation_changed = previous_generation != Some(task_snapshot.run_generation);
+                let previous_active = previous_status.is_some_and(|status| {
+                    matches!(status, TaskStatus::Running | TaskStatus::Paused)
+                });
+                let current_finished = matches!(
+                    task_snapshot.status,
+                    TaskStatus::Exited | TaskStatus::Failed | TaskStatus::Idle
+                );
+                let generation = task_snapshot.run_generation;
+
+                // A restart can replace a still-active generation before the sampler observes
+                // its stop. Close the previous row before recording the replacement.
+                if generation > 0 && generation_changed && previous_active {
+                    transitions.push(RunTransition::Finished {
+                        session: session_name.clone(),
+                        task: task_snapshot.label.clone(),
+                        generation: previous_generation.expect("previous generation"),
+                        status: "stopped".to_string(),
+                        exit_code: None,
+                        error_message: None,
+                    });
+                }
+
+                // Sampling is asynchronous: a sub-second task can already be Exited/Failed on
+                // its first observation. Record both boundaries from that snapshot.
+                if generation > 0 && generation_changed {
+                    transitions.push(RunTransition::Started(
+                        session_name.clone(),
+                        Box::new(task_snapshot.clone()),
+                        trigger_for(state, &key, &task_snapshot),
+                    ));
+                    if current_finished {
+                        transitions.push(finished_run_details(session_name, &task_snapshot));
+                    }
+                } else if generation > 0 && previous_active && current_finished {
+                    transitions.push(finished_run_details(session_name, &task_snapshot));
+                }
+
+                tracked.insert(key.clone(), (generation, task_snapshot.status.clone()));
+            }
+        }
+    }
+    transitions
+}
+
+fn spawn_task_history_sampler(state: DaemonState) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut tracked = HashMap::<ScheduleKey, (u64, TaskStatus)>::new();
+        while !state.shutdown.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(500));
+            let transitions = collect_run_transitions(&state, &mut tracked);
+            if transitions.is_empty() {
+                continue;
+            }
+            let node_id = match state.store.node_settings() {
+                Ok(v) => v.node_id,
+                Err(_) => continue,
+            };
+            for transition in transitions {
+                match transition {
+                    RunTransition::Started(session, snapshot, trigger) => {
+                        if let Err(error) = state
+                            .store
+                            .record_task_run_start(&node_id, &snapshot, &trigger, &session)
+                        {
+                            eprintln!("failed to persist task run: {error:#}");
+                        }
+                    }
+                    RunTransition::Finished {
+                        session,
+                        task,
+                        generation,
+                        status,
+                        exit_code,
+                        error_message,
+                    } => {
+                        let _ = state.store.finish_task_run(
+                            &node_id,
+                            &session,
+                            &task,
+                            generation,
+                            &status,
+                            exit_code,
+                            error_message.as_deref(),
+                        );
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn spawn_task_scheduler(state: DaemonState) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut last_processed_second = current_timestamp_ms() / 1000;
+        let _ = state.store.record_event(
+            "scheduler",
+            "scheduler started; missed executions while offline were not replayed",
+            serde_json::json!({}),
+        );
+        loop {
+            thread::sleep(Duration::from_millis(250));
+            if state.shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            let now = current_timestamp_ms();
+            let now_second = now / 1000;
+            if now_second <= last_processed_second {
+                continue;
+            }
+            let mut due_actions: Vec<ScheduleKey> = Vec::new();
+            {
+                let mut sessions = state.sessions.lock().expect("sessions lock");
+                for (session_name, runtime) in sessions.iter_mut() {
+                    let Ok(snapshot) = runtime.snapshot(0) else {
+                        continue;
+                    };
+                    for task_snapshot in snapshot.tasks.into_values() {
+                        let Some(expression) = task_snapshot.schedule.as_deref() else {
+                            continue;
+                        };
+                        let fields = expression.split_whitespace().count();
+                        let normalized = if fields == 5 {
+                            format!("0 {expression}")
+                        } else {
+                            expression.to_string()
+                        };
+                        let Ok(schedule) = normalized.parse::<cron::Schedule>() else {
+                            continue;
+                        };
+                        for timestamp_ms in
+                            ((last_processed_second + 1) * 1000)..=(now_second * 1000)
+                        {
+                            if let Some(after_utc) =
+                                chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+                                    timestamp_ms as i64,
+                                )
+                            {
+                                let local_after =
+                                    <chrono::Local as chrono::TimeZone>::from_utc_datetime(
+                                        &chrono::Local,
+                                        &after_utc.naive_utc(),
+                                    );
+                                if schedule.includes(local_after) {
+                                    due_actions.push(ScheduleKey {
+                                        session: session_name.clone(),
+                                        task: task_snapshot.label.clone(),
+                                    });
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            last_processed_second = now_second;
+            for key in due_actions {
+                state
+                    .run_triggers
+                    .lock()
+                    .expect("run trigger lock")
+                    .insert(key.clone(), "cron".to_string());
+                let mut sessions = state.sessions.lock().expect("sessions lock");
+                match sessions
+                    .get_mut(&key.session)
+                    .map(|runtime| runtime.scheduled_start(&key.task))
+                {
+                    Some(Ok(true)) => {
+                        let node_id = state.public_settings().node_id;
+                        if let Some(runtime) = sessions.get_mut(&key.session) {
+                            if let Ok(snapshot) = runtime.snapshot(0) {
+                                if let Some(run_snapshot) = snapshot
+                                    .tasks
+                                    .into_values()
+                                    .find(|value| value.label == key.task)
+                                {
+                                    if let Err(error) = state.store.record_task_run_start(
+                                        &node_id,
+                                        &run_snapshot,
+                                        "cron",
+                                        &key.session,
+                                    ) {
+                                        eprintln!("failed to persist scheduled run: {error:#}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(false)) => {
+                        drop(sessions);
+                        let _ = state.store.record_event(
+                            "scheduler",
+                            "scheduled task already running; execution skipped",
+                            serde_json::json!({"session":key.session,"task":key.task}),
+                        );
+                    }
+                    Some(Err(error)) => {
+                        drop(sessions);
+                        let _=state.store.record_event("scheduler","scheduled task failed to start",serde_json::json!({"session":key.session,"task":key.task,"error":error.to_string()}));
+                    }
+                    None => {}
+                }
+            }
+        }
+    })
+}
 fn collect_metric_targets(state: &DaemonState) -> Vec<TaskMetricsTarget> {
     let sessions = &mut *state.sessions.lock().expect("sessions lock");
     sessions
         .iter_mut()
         .flat_map(|(session, runtime)| {
             runtime.task_root_pids_for_metrics().into_iter().map(
-                |(task, root_pid, start_generation)| TaskMetricsTarget {
+                |(task, root_pid, start_generation, history_generation)| TaskMetricsTarget {
                     session: session.clone(),
                     task,
                     root_pid,
                     start_generation,
+                    history_generation,
                 },
             )
         })
@@ -449,8 +898,10 @@ fn record_task_metrics_for_targets(
             let is_current = sessions
                 .get(&target.session)
                 .and_then(|runtime| runtime.task_metric_identity(&target.task))
-                .is_some_and(|(pid, generation)| {
-                    pid == target.root_pid && generation == target.start_generation
+                .is_some_and(|(pid, generation, history_generation)| {
+                    pid == target.root_pid
+                        && generation == target.start_generation
+                        && history_generation == target.history_generation
                 });
             let observation = if is_current {
                 target
@@ -469,9 +920,74 @@ fn record_task_metrics_for_targets(
         }
     }
 
+    let service_updates = targets
+        .iter()
+        .map(|target| {
+            let key = TaskMetricsKey {
+                session: target.session.clone(),
+                task: target.task.clone(),
+            };
+            let pids = observations
+                .get(&key)
+                .and_then(Option::as_ref)
+                .map(|observation| {
+                    observation
+                        .processes
+                        .iter()
+                        .map(|process| process.pid)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let (endpoints, inspection) = service::inspect_listeners(&pids);
+            (target, endpoints, inspection)
+        })
+        .collect::<Vec<_>>();
+    {
+        let mut sessions = state.sessions.lock().expect("sessions lock");
+        for (target, endpoints, inspection) in service_updates {
+            let is_current = sessions
+                .get(&target.session)
+                .and_then(|runtime| runtime.task_metric_identity(&target.task))
+                .is_some_and(|(pid, generation, history_generation)| {
+                    pid == target.root_pid
+                        && generation == target.start_generation
+                        && history_generation == target.history_generation
+                });
+            if is_current {
+                if let Some(runtime) = sessions.get_mut(&target.session) {
+                    runtime.set_service_observation(&target.task, endpoints, inspection);
+                }
+            }
+        }
+    }
+
+    // History can be cleared while listener inspection is running. Revalidate while
+    // holding the same sessions -> metrics lock order as clear/restart so a stale
+    // observation cannot repopulate a newly cleared metrics entry.
+    let sessions = state.sessions.lock().expect("sessions lock");
+    let current_keys = current_keys
+        .into_iter()
+        .filter(|key| {
+            sessions
+                .get(&key.session)
+                .and_then(|runtime| runtime.task_metric_identity(&key.task))
+                .is_some()
+        })
+        .collect::<HashSet<_>>();
     let mut metrics = state.task_metrics.lock().expect("task metrics lock");
     metrics.retain_current_tasks(&current_keys);
     for target in targets {
+        let is_current = sessions
+            .get(&target.session)
+            .and_then(|runtime| runtime.task_metric_identity(&target.task))
+            .is_some_and(|(pid, generation, history_generation)| {
+                pid == target.root_pid
+                    && generation == target.start_generation
+                    && history_generation == target.history_generation
+            });
+        if !is_current {
+            continue;
+        }
         let key = TaskMetricsKey {
             session: target.session.clone(),
             task: target.task.clone(),
@@ -562,11 +1078,13 @@ impl GlobalPaths {
         let root = if let Some(path) = std::env::var_os("TASKDECK_HOME") {
             PathBuf::from(path)
         } else {
-            let home = std::env::var_os("HOME").context("HOME is not set")?;
+            let home = std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .context("neither HOME nor USERPROFILE is set")?;
             PathBuf::from(home).join(".taskdeck")
         };
         Ok(Self {
-            socket: root.join("taskdeck.sock"),
+            socket: ipc_path(&root),
             lock: root.join("daemon.lock"),
             log: root.join("daemon.log"),
             root,
@@ -579,7 +1097,24 @@ impl GlobalPaths {
     }
 }
 
-pub async fn run(web_port: u16) -> Result<()> {
+#[cfg(unix)]
+fn ipc_path(root: &std::path::Path) -> PathBuf {
+    root.join("taskdeck.sock")
+}
+
+#[cfg(windows)]
+fn ipc_path(root: &std::path::Path) -> PathBuf {
+    let hash = root
+        .to_string_lossy()
+        .to_lowercase()
+        .bytes()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        });
+    PathBuf::from(format!(r"\\.\pipe\taskdeck-{hash:016x}"))
+}
+
+pub async fn run(web_port_override: Option<u16>) -> Result<()> {
     let paths = GlobalPaths::discover()?;
     paths.prepare()?;
     let lock = OpenOptions::new()
@@ -592,20 +1127,46 @@ pub async fn run(web_port: u16) -> Result<()> {
     lock.try_lock_exclusive()
         .map_err(|_| anyhow::anyhow!("taskdeck daemon is already running"))?;
 
-    if paths.socket.exists() {
-        let _ = fs::remove_file(&paths.socket);
-    }
-    let listener = UnixListener::bind(&paths.socket)
-        .with_context(|| format!("failed to bind {}", paths.socket.display()))?;
-    let web_listener = tokio::net::TcpListener::bind((DEFAULT_WEB_HOST, web_port))
-        .await
-        .with_context(|| format!("failed to bind Web UI to {DEFAULT_WEB_HOST}:{web_port}"))?;
-    let state = DaemonState::new();
+    #[cfg(unix)]
+    let listener = {
+        if paths.socket.exists() {
+            let _ = fs::remove_file(&paths.socket);
+        }
+        UnixListener::bind(&paths.socket)
+            .with_context(|| format!("failed to bind {}", paths.socket.display()))?
+    };
+    #[cfg(windows)]
+    let mut listener = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&paths.socket)
+        .with_context(|| format!("failed to create named pipe {}", paths.socket.display()))?;
+    let state = DaemonState::load(&paths)?;
+    let public_settings = state.public_settings();
+    let worker_settings = state.settings.lock().expect("node settings lock").clone();
+    let web_port = web_port_override.unwrap_or(public_settings.web_port);
+    let web_listener =
+        tokio::net::TcpListener::bind((public_settings.bind_host.as_str(), web_port))
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to bind Web UI to {}:{web_port}",
+                    public_settings.bind_host
+                )
+            })?;
     let metrics_sampler = spawn_task_metrics_sampler(state.clone());
+    let history_sampler = spawn_task_history_sampler(state.clone());
+    let task_scheduler = spawn_task_scheduler(state.clone());
+    let worker_client =
+        if worker_settings.role == NodeRole::Worker && worker_settings.leader_url.is_some() {
+            Some(spawn_worker_client(state.clone(), worker_settings))
+        } else {
+            None
+        };
     let web_state = state.clone();
     let web_task = tokio::spawn(async move { web::serve(web_state, web_listener).await });
 
     while !state.shutdown.load(Ordering::SeqCst) {
+        #[cfg(unix)]
         tokio::select! {
             accepted = listener.accept() => {
                 match accepted {
@@ -623,18 +1184,56 @@ pub async fn run(web_port: u16) -> Result<()> {
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {}
         }
+        #[cfg(windows)]
+        tokio::select! {
+            connected = listener.connect() => {
+                match connected {
+                    Ok(()) => {
+                        let stream = listener;
+                        listener = ServerOptions::new()
+                            .create(&paths.socket)
+                            .with_context(|| {
+                                format!(
+                                    "failed to create named pipe {}",
+                                    paths.socket.display()
+                                )
+                            })?;
+                        let connection_state = state.clone();
+                        tokio::spawn(async move {
+                            let _ = serve_connection(connection_state, stream).await;
+                        });
+                    }
+                    Err(error) => eprintln!("IPC accept error: {error}"),
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                state.shutdown.store(true, Ordering::SeqCst);
+            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
     }
 
     web_task.abort();
-    if let Err(payload) = metrics_sampler.join() {
+    if let Some(worker_client) = worker_client {
+        worker_client.abort();
+    }
+    let metrics_panic = metrics_sampler.join().err();
+    for (name, handle) in [("history", history_sampler), ("scheduler", task_scheduler)] {
+        if let Err(payload) = handle.join() {
+            eprintln!("{name} worker panicked: {}", panic_message(payload));
+        }
+    }
+    if let Some(payload) = metrics_panic {
         let message = panic_message(payload);
         eprintln!("task metrics sampler thread panicked: {message}");
         stop_all(&state);
+        #[cfg(unix)]
         let _ = fs::remove_file(&paths.socket);
         drop(lock);
         bail!("task metrics sampler thread panicked: {message}");
     }
     stop_all(&state);
+    #[cfg(unix)]
     let _ = fs::remove_file(&paths.socket);
     drop(lock);
     Ok(())
@@ -647,8 +1246,11 @@ fn stop_all(state: &DaemonState) {
     }
 }
 
-async fn serve_connection(state: DaemonState, stream: UnixStream) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
+async fn serve_connection<S>(state: DaemonState, stream: S) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
         let response = match serde_json::from_str::<Request>(&line) {
@@ -677,10 +1279,12 @@ fn dispatch(state: &DaemonState, request: Request) -> Response {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_session_config_write(
     state: &DaemonState,
     project: &std::path::Path,
     revision: &str,
+    workspace_env: Option<&std::collections::BTreeMap<String, String>>,
     tasks: Vec<crate::protocol::EditableTaskInput>,
 ) -> std::result::Result<config::PreparedSessionConfigWrite, config::WriteConfigError> {
     #[cfg(not(test))]
@@ -692,13 +1296,14 @@ fn prepare_session_config_write(
             project,
             revision,
             tasks,
+            workspace_env,
             state.put_config_post_check_delay(),
         )
     }
 
     #[cfg(not(test))]
     {
-        config::prepare_session_config_write(project, revision, tasks)
+        config::prepare_session_config_write(project, revision, tasks, workspace_env)
     }
 }
 
@@ -729,6 +1334,7 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
     match request {
         Request::Ping => Ok(Response::empty("pong")),
         Request::Register { project, session } => {
+            require_local_execution(state)?;
             let _config_mutation = state
                 .config_mutations
                 .lock()
@@ -753,13 +1359,20 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
             let mut runtime = SessionRuntime::new(definition);
             runtime.auto_start();
             let snapshot = runtime.snapshot(200)?;
+            state.store.upsert_registration(&name, &project)?;
             sessions.insert(name.clone(), runtime);
+            state
+                .unavailable_sessions
+                .lock()
+                .expect("unavailable sessions lock")
+                .remove(&name);
             Ok(Response::ok(
                 format!("registered session '{name}'"),
                 snapshot,
             ))
         }
         Request::Update { project, session } => {
+            require_local_execution(state)?;
             let _config_mutation = state
                 .config_mutations
                 .lock()
@@ -801,11 +1414,24 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
             Ok(Response::ok(format!("updated session '{name}'"), snapshot))
         }
         Request::ListSessions => {
+            require_local_execution(state)?;
             let sessions = state.sessions.lock().expect("sessions lock");
-            let names = sessions.keys().cloned().collect::<Vec<_>>();
+            let unavailable = state
+                .unavailable_sessions
+                .lock()
+                .expect("unavailable sessions lock");
+            let mut names = sessions
+                .keys()
+                .chain(unavailable.keys())
+                .cloned()
+                .collect::<Vec<_>>();
+            names.sort();
+            names.dedup();
             Ok(Response::ok("sessions", names))
         }
         Request::Snapshot { session, tail } => {
+            require_local_execution(state)?;
+            reject_unavailable_session(state, &session)?;
             let mut sessions = state.sessions.lock().expect("sessions lock");
             let runtime = sessions
                 .get_mut(&session)
@@ -815,12 +1441,22 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
                 runtime.snapshot(tail.unwrap_or(500))?,
             ))
         }
+        Request::ListTaskRuns { filter } => {
+            let records = state.store.list_task_runs(&filter)?;
+            Ok(Response::ok("task runs", records))
+        }
+        Request::ListEvents { filter } => {
+            let events = state.store.list_events(&filter)?;
+            Ok(Response::ok("events", events))
+        }
         Request::TaskLogs {
             session,
             task,
             after,
             limit,
         } => {
+            require_local_execution(state)?;
+            reject_unavailable_session(state, &session)?;
             let mut sessions = state.sessions.lock().expect("sessions lock");
             let runtime = sessions
                 .get_mut(&session)
@@ -835,6 +1471,8 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
             task,
             window_seconds,
         } => {
+            require_local_execution(state)?;
+            reject_unavailable_session(state, &session)?;
             {
                 let sessions = state.sessions.lock().expect("sessions lock");
                 let runtime = sessions
@@ -850,7 +1488,26 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
                 metrics.snapshot(&session, &task, window_seconds),
             ))
         }
+        Request::ClearTaskHistory { session, task } => {
+            require_local_execution(state)?;
+            reject_unavailable_session(state, &session)?;
+            let mut sessions = state.sessions.lock().expect("sessions lock");
+            let runtime = sessions
+                .get_mut(&session)
+                .with_context(|| format!("session '{session}' not found"))?;
+            runtime.clear_task_history(&task)?;
+            state
+                .task_metrics
+                .lock()
+                .expect("task metrics lock")
+                .clear_task(&session, &task);
+            Ok(Response::empty(format!(
+                "cleared history for task '{task}'"
+            )))
+        }
         Request::GetSessionConfig { session } => {
+            require_local_execution(state)?;
+            reject_unavailable_session(state, &session)?;
             let sessions = state.sessions.lock().expect("sessions lock");
             let runtime = sessions
                 .get(&session)
@@ -861,8 +1518,11 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
         Request::PutSessionConfig {
             session,
             revision,
+            workspace_env,
             tasks,
         } => {
+            require_local_execution(state)?;
+            reject_unavailable_session(state, &session)?;
             let _config_mutation = state
                 .config_mutations
                 .lock()
@@ -881,8 +1541,13 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
                 (project, names)
             };
 
-            let mut prepared = match prepare_session_config_write(state, &project, &revision, tasks)
-            {
+            let mut prepared = match prepare_session_config_write(
+                state,
+                &project,
+                &revision,
+                workspace_env.as_ref(),
+                tasks,
+            ) {
                 Ok(prepared) => prepared,
                 Err(error) => return config_write_error_response(error),
             };
@@ -962,22 +1627,86 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
             task,
             action,
         } => {
+            require_local_execution(state)?;
+            reject_unavailable_session(state, &session)?;
+            let mut sessions = state.sessions.lock().expect("sessions lock");
+            let mut pre_stop_runs: Vec<(String, u64)> = Vec::new();
+            if matches!(
+                action,
+                crate::protocol::Action::Stop | crate::protocol::Action::Restart
+            ) {
+                if let Ok(snapshot) = sessions.get_mut(&session).expect("checked").snapshot(0) {
+                    let task_filter = task.as_deref();
+                    for value in snapshot.tasks.into_values() {
+                        if task_filter.is_none_or(|label| label == value.label)
+                            && matches!(value.status, TaskStatus::Running | TaskStatus::Paused)
+                            && value.run_generation > 0
+                        {
+                            pre_stop_runs.push((value.label, value.run_generation));
+                        }
+                    }
+                }
+            }
+            let runtime = sessions
+                .get_mut(&session)
+                .with_context(|| format!("session '{session}' not found"))?;
+            let effects = runtime.apply(task.as_deref(), action.clone())?;
+            let timestamp_ms = current_timestamp_ms();
+            let mut metrics = state.task_metrics.lock().expect("task metrics lock");
+            for effect in effects.iter().filter(|effect| effect.restarted) {
+                if effect.history_cleared {
+                    metrics.clear_task(&session, &effect.task);
+                } else {
+                    metrics.mark_restart(&session, &effect.task, timestamp_ms);
+                }
+            }
+            drop(metrics);
+            drop(sessions);
+            if matches!(
+                action,
+                crate::protocol::Action::Stop | crate::protocol::Action::Restart
+            ) {
+                let node_id = state
+                    .store
+                    .node_settings()
+                    .map(|v| v.node_id)
+                    .unwrap_or_default();
+                for (stopped_task, generation) in pre_stop_runs {
+                    let _ = state.store.finish_task_run(
+                        &node_id,
+                        &session,
+                        &stopped_task,
+                        generation,
+                        "stopped",
+                        None,
+                        None,
+                    );
+                }
+            }
             let mut sessions = state.sessions.lock().expect("sessions lock");
             let runtime = sessions
                 .get_mut(&session)
                 .with_context(|| format!("session '{session}' not found"))?;
-            runtime.apply(task.as_deref(), action.clone())?;
             Ok(Response::ok(
                 format!("{action:?} completed"),
                 runtime.snapshot(50)?,
             ))
         }
         Request::RemoveSession { session } => {
+            require_local_execution(state)?;
             let mut sessions = state.sessions.lock().expect("sessions lock");
-            let mut runtime = sessions
+            if let Some(mut runtime) = sessions.remove(&session) {
+                runtime.stop_all();
+            } else if state
+                .unavailable_sessions
+                .lock()
+                .expect("unavailable sessions lock")
                 .remove(&session)
-                .with_context(|| format!("session '{session}' not found"))?;
-            runtime.stop_all();
+                .is_none()
+            {
+                bail!("session '{session}' not found");
+            }
+            state.store.remove_registration(&session)?;
             drop(sessions);
             state
                 .task_metrics
@@ -993,12 +1722,59 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
     }
 }
 
+fn require_local_execution(state: &DaemonState) -> Result<()> {
+    if state.execution_enabled() {
+        Ok(())
+    } else {
+        bail!("this node is a pure master and does not provide local task execution")
+    }
+}
+
+fn reject_unavailable_session(state: &DaemonState, session: &str) -> Result<()> {
+    if let Some(unavailable) = state
+        .unavailable_sessions
+        .lock()
+        .expect("unavailable sessions lock")
+        .get(session)
+    {
+        bail!(
+            "session '{}' is unavailable from {}: {}",
+            unavailable.session,
+            unavailable.project.display(),
+            unavailable.error
+        );
+    }
+    Ok(())
+}
+
 pub async fn request(request: &Request) -> Result<Response> {
     let paths = GlobalPaths::discover()?;
+    #[cfg(unix)]
     let stream = UnixStream::connect(&paths.socket)
         .await
         .with_context(|| format!("cannot connect to daemon at {}", paths.socket.display()))?;
-    let (reader, mut writer) = stream.into_split();
+    #[cfg(windows)]
+    let stream = loop {
+        match ClientOptions::new().open(&paths.socket) {
+            Ok(stream) => break stream,
+            Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("cannot connect to daemon at {}", paths.socket.display())
+                });
+            }
+        }
+    };
+    request_on_stream(request, stream).await
+}
+
+async fn request_on_stream<S>(request: &Request, stream: S) -> Result<Response>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut payload = serde_json::to_vec(request)?;
     payload.push(b'\n');
     writer.write_all(&payload).await?;
@@ -1032,6 +1808,11 @@ pub fn root_path() -> Result<PathBuf> {
     Ok(GlobalPaths::discover()?.root)
 }
 
+pub fn configured_settings() -> Result<crate::state::PublicNodeSettings> {
+    let paths = GlobalPaths::discover()?;
+    Ok(StateStore::open(&paths.root)?.node_settings()?.public())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
@@ -1042,7 +1823,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::protocol::{EditableTaskInput, SessionConfigSnapshot, TaskMetricsAggregate};
+    use crate::protocol::{
+        EditableTaskInput, McpCallRecord, SessionConfigSnapshot, TaskMetricsAggregate,
+    };
 
     fn call_record() -> McpCallRecord {
         McpCallRecord {
@@ -1052,32 +1835,287 @@ mod tests {
             started_at_ms: 1,
             duration_ms: 2,
             success: true,
+            target_node: None,
             request: json!({"method": "tools/call"}),
             response: json!({"result": {"isError": false}}),
         }
     }
 
     #[test]
-    fn mcp_call_history_is_newest_first_and_bounded() {
+    fn history_sampler_records_a_subsecond_run_and_exit_code() {
         let state = DaemonState::new();
-        for _ in 0..MAX_MCP_CALLS + 2 {
-            state.record_mcp_call(call_record());
+        let project = tempfile::tempdir().unwrap();
+        let mut runtime = SessionRuntime::new(crate::config::ProjectDefinition {
+            session: "demo".to_string(),
+            project: project.path().to_path_buf(),
+            source: "taskdeck.yaml".to_string(),
+            tasks: std::collections::BTreeMap::from([(
+                "quick".to_string(),
+                crate::config::TaskSpec {
+                    label: "quick".to_string(),
+                    program: "exit".to_string(),
+                    args: vec!["7".to_string()],
+                    cwd: project.path().to_path_buf(),
+                    env: Default::default(),
+                    shell: true,
+                    auto_start: false,
+                    stop_timeout_ms: 500,
+                    clear_logs_on_restart: false,
+                    schedule: None,
+                },
+            )]),
+            task_order: vec!["quick".to_string()],
+        });
+        runtime
+            .apply(Some("quick"), crate::protocol::Action::Start)
+            .unwrap();
+        state
+            .sessions
+            .lock()
+            .expect("sessions lock")
+            .insert("demo".to_string(), runtime);
+
+        let mut tracked = std::collections::HashMap::new();
+        let mut transitions = collect_run_transitions(&state, &mut tracked);
+        for _ in 0..100 {
+            if transitions.len() >= 2 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+            transitions.extend(collect_run_transitions(&state, &mut tracked));
+        }
+        assert_eq!(transitions.len(), 2);
+        let node_id = state.store.node_settings().unwrap().node_id;
+        for transition in transitions {
+            match transition {
+                RunTransition::Started(session, snapshot, trigger) => {
+                    state
+                        .store
+                        .record_task_run_start(&node_id, &snapshot, &trigger, &session)
+                        .unwrap();
+                }
+                RunTransition::Finished {
+                    session,
+                    task,
+                    generation,
+                    status,
+                    exit_code,
+                    error_message,
+                } => {
+                    assert!(
+                        state
+                            .store
+                            .finish_task_run(
+                                &node_id,
+                                &session,
+                                &task,
+                                generation,
+                                &status,
+                                exit_code,
+                                error_message.as_deref(),
+                            )
+                            .unwrap()
+                    );
+                }
+            }
         }
 
-        let calls = state.recent_mcp_calls(MAX_MCP_CALLS + 20);
-        assert_eq!(calls.len(), MAX_MCP_CALLS);
-        assert_eq!(calls.first().map(|call| call.record.id), Some(502));
-        assert_eq!(calls.last().map(|call| call.record.id), Some(3));
-        assert!(state.mcp_call(1).is_none());
-        assert_eq!(
-            state.mcp_call(502).map(|call| call.record.tool.clone()),
-            Some("taskdeck_control".to_string())
+        let runs = state
+            .store
+            .list_task_runs(&crate::protocol::TaskRunFilter {
+                session: Some("demo".into()),
+                task: Some("quick".into()),
+                status: None,
+                trigger: None,
+                page: 1,
+                page_size: 20,
+            })
+            .unwrap();
+        assert_eq!(runs.total, 1);
+        assert_eq!(runs.items[0].trigger, "manual");
+        assert_eq!(runs.items[0].status, "failed");
+        assert_eq!(runs.items[0].exit_code, Some(7));
+        assert!(runs.items[0].duration_ms.is_some());
+    }
+
+    #[test]
+    fn history_sampler_finishes_a_stopped_run_with_exit_code() {
+        let state = DaemonState::new();
+        let project = tempfile::tempdir().unwrap();
+        let mut runtime = SessionRuntime::new(crate::config::ProjectDefinition {
+            session: "demo".to_string(),
+            project: project.path().to_path_buf(),
+            source: "taskdeck.yaml".to_string(),
+            tasks: std::collections::BTreeMap::from([(
+                "long".to_string(),
+                crate::config::TaskSpec {
+                    label: "long".to_string(),
+                    program: "trap 'exit 0' TERM; while :; do sleep 1; done".to_string(),
+                    args: Vec::new(),
+                    cwd: project.path().to_path_buf(),
+                    env: Default::default(),
+                    shell: true,
+                    auto_start: false,
+                    stop_timeout_ms: 3000,
+                    clear_logs_on_restart: false,
+                    schedule: None,
+                },
+            )]),
+            task_order: vec!["long".to_string()],
+        });
+        runtime
+            .apply(Some("long"), crate::protocol::Action::Start)
+            .unwrap();
+        state
+            .sessions
+            .lock()
+            .expect("sessions lock")
+            .insert("demo".to_string(), runtime);
+
+        let mut tracked = std::collections::HashMap::new();
+        let started = collect_run_transitions(&state, &mut tracked);
+        assert_eq!(started.len(), 1);
+        assert!(matches!(started[0], RunTransition::Started(_, _, _)));
+
+        state
+            .sessions
+            .lock()
+            .expect("sessions lock")
+            .get_mut("demo")
+            .unwrap()
+            .apply(Some("long"), crate::protocol::Action::Stop)
+            .unwrap();
+        let finished = collect_run_transitions(&state, &mut tracked);
+        assert_eq!(finished.len(), 1);
+        let RunTransition::Finished {
+            exit_code,
+            session,
+            task,
+            generation,
+            status,
+            error_message,
+        } = &finished[0]
+        else {
+            panic!("expected finished transition");
+        };
+        assert_eq!(*exit_code, None);
+        assert_eq!(status, "stopped");
+        assert!(
+            error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("signal"))
+        );
+        let node_id = state.store.node_settings().unwrap().node_id;
+        if let RunTransition::Started(_, snapshot, trigger) = &started[0] {
+            state
+                .store
+                .record_task_run_start(&node_id, snapshot, trigger, session)
+                .unwrap();
+        }
+        state
+            .store
+            .finish_task_run(
+                &node_id,
+                session,
+                task,
+                *generation,
+                status,
+                *exit_code,
+                error_message.as_deref(),
+            )
+            .unwrap();
+        let runs = state
+            .store
+            .list_task_runs(&crate::protocol::TaskRunFilter {
+                session: Some("demo".into()),
+                task: Some("long".into()),
+                status: None,
+                trigger: None,
+                page: 1,
+                page_size: 20,
+            })
+            .unwrap();
+        assert_eq!(runs.items[0].status, "stopped");
+        assert_eq!(runs.items[0].exit_code, None);
+        assert!(
+            runs.items[0]
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("signal"))
         );
     }
 
     #[test]
-    fn web_server_binds_to_loopback_by_default() {
-        assert_eq!(DEFAULT_WEB_HOST, "127.0.0.1");
+    fn mcp_call_history_is_persisted_with_database_ids() {
+        let state = DaemonState::new();
+        for _ in 0..3 {
+            let _ = state.store.record_mcp_call(call_record());
+        }
+        let page = state
+            .store
+            .list_mcp_calls(None, None, None, None, None, 1, 20)
+            .unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(page.items[0].id, 3);
+        assert_eq!(page.items[0].tool, "taskdeck_control");
+        assert!(state.store.mcp_call_detail(1).unwrap().is_some());
+    }
+
+    #[test]
+    fn worker_binds_to_all_interfaces_by_default() {
+        let state = DaemonState::new();
+        assert_eq!(state.public_settings().bind_host, "0.0.0.0");
+    }
+
+    #[test]
+    fn restores_registered_project_after_state_recreation() {
+        let root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        fs::write(
+            project.path().join("taskdeck.yaml"),
+            "version: 1\nsession: restored\ntasks:\n  idle:\n    command: echo\n    args: [ready]\n",
+        )
+        .unwrap();
+        let project = project.path().canonicalize().unwrap();
+        let paths = GlobalPaths {
+            root: root.path().to_path_buf(),
+            socket: root.path().join("taskdeck.sock"),
+            lock: root.path().join("daemon.lock"),
+            log: root.path().join("daemon.log"),
+        };
+        StateStore::open(root.path())
+            .unwrap()
+            .upsert_registration("restored", &project)
+            .unwrap();
+
+        let state = DaemonState::load(&paths).unwrap();
+        let response = dispatch(&state, Request::ListSessions);
+        assert!(response.ok);
+        assert_eq!(response.data.unwrap(), json!(["restored"]));
+    }
+
+    #[test]
+    fn pure_master_rejects_local_registration() {
+        let state = DaemonState::new();
+        let settings = state
+            .store
+            .configure(crate::state::NodeSettingsUpdate {
+                role: Some(crate::state::NodeRole::Leader),
+                leader_mode: Some(crate::state::LeaderMode::PureMaster),
+                ..crate::state::NodeSettingsUpdate::default()
+            })
+            .unwrap();
+        *state.settings.lock().expect("node settings lock") = settings;
+
+        let response = dispatch(
+            &state,
+            Request::Register {
+                project: PathBuf::from("/tmp/missing"),
+                session: None,
+            },
+        );
+        assert!(!response.ok);
+        assert!(response.message.contains("pure master"));
     }
 
     fn task_input(label: &str, command: &str) -> EditableTaskInput {
@@ -1090,6 +2128,8 @@ mod tests {
             shell: true,
             auto_start: false,
             stop_timeout_ms: 3_000,
+            clear_logs_on_restart: false,
+            schedule: None,
         }
     }
 
@@ -1195,6 +2235,31 @@ mod tests {
     }
 
     #[test]
+    fn task_metrics_restart_markers_are_windowed_and_clear_with_history() {
+        let mut store = TaskMetricsStore::default();
+        for timestamp_ms in [100, 200, 300] {
+            store.record(
+                "demo",
+                "api",
+                timestamp_ms,
+                Some(AggregatedProcessTree {
+                    aggregate: TaskMetricsAggregate::zero(),
+                    processes: Vec::new(),
+                }),
+            );
+        }
+        store.mark_restart("demo", "api", 150);
+        store.mark_restart("demo", "api", 250);
+
+        assert_eq!(store.snapshot("demo", "api", 2).restart_markers_ms, [250]);
+        store.clear_task("demo", "api");
+        let cleared = store.snapshot("demo", "api", 600);
+        assert!(cleared.samples.is_empty());
+        assert!(cleared.restart_markers_ms.is_empty());
+        assert!(cleared.processes.is_empty());
+    }
+
+    #[test]
     fn task_metrics_prune_deleted_tasks_but_keep_existing_stopped_history() {
         let state = DaemonState::new();
         state.sessions.lock().expect("sessions lock").insert(
@@ -1214,8 +2279,12 @@ mod tests {
                         shell: false,
                         auto_start: false,
                         stop_timeout_ms: 500,
+                        clear_logs_on_restart: false,
+
+                        schedule: None,
                     },
                 )]),
+                task_order: vec!["worker".to_string()],
             }),
         );
 
@@ -1274,8 +2343,12 @@ mod tests {
                         shell: false,
                         auto_start: false,
                         stop_timeout_ms: 500,
+                        clear_logs_on_restart: false,
+
+                        schedule: None,
                     },
                 )]),
+                task_order: vec!["idle".to_string()],
             }),
         );
 
@@ -1305,8 +2378,12 @@ mod tests {
                     shell: true,
                     auto_start: false,
                     stop_timeout_ms: 500,
+                    clear_logs_on_restart: false,
+
+                    schedule: None,
                 },
             )]),
+            task_order: vec!["clock".to_string()],
         });
         runtime
             .apply(Some("clock"), crate::protocol::Action::Start)
@@ -1374,8 +2451,12 @@ mod tests {
                     shell: true,
                     auto_start: false,
                     stop_timeout_ms: 500,
+                    clear_logs_on_restart: false,
+
+                    schedule: None,
                 },
             )]),
+            task_order: vec!["flash".to_string()],
         });
         runtime
             .apply(Some("flash"), crate::protocol::Action::Start)
@@ -1495,6 +2576,7 @@ mod tests {
             Request::PutSessionConfig {
                 session: "one".to_string(),
                 revision,
+                workspace_env: None,
                 tasks: vec![
                     task_input("api", "echo new"),
                     task_input("worker", "echo worker"),
@@ -1583,6 +2665,7 @@ mod tests {
             Request::PutSessionConfig {
                 session: "demo".to_string(),
                 revision: config.revision,
+                workspace_env: None,
                 tasks: vec![task_input("api", "echo ready"), broken],
             },
         )
@@ -1652,6 +2735,7 @@ mod tests {
             Request::PutSessionConfig {
                 session: "one".to_string(),
                 revision: snapshot.revision,
+                workspace_env: None,
                 tasks: vec![task_input("api", "echo changed")],
             },
         )
@@ -1710,6 +2794,7 @@ mod tests {
                 Request::PutSessionConfig {
                     session: "one".to_string(),
                     revision: first_revision,
+                    workspace_env: None,
                     tasks: vec![task_input("api", "echo one")],
                 },
             )
@@ -1726,6 +2811,7 @@ mod tests {
                 Request::PutSessionConfig {
                     session: "one".to_string(),
                     revision: second_revision,
+                    workspace_env: None,
                     tasks: vec![task_input("api", "echo two")],
                 },
             )
@@ -1793,6 +2879,7 @@ mod tests {
             Request::PutSessionConfig {
                 session: "one".to_string(),
                 revision: snapshot.revision,
+                workspace_env: None,
                 tasks: vec![task_input("api", "echo submitted")],
             },
         )
@@ -1922,6 +3009,7 @@ mod tests {
             Request::PutSessionConfig {
                 session: "a".to_string(),
                 revision: snapshot.revision,
+                workspace_env: None,
                 tasks: vec![task_input("api", "echo new")],
             },
         )
@@ -1967,6 +3055,7 @@ mod tests {
             Request::PutSessionConfig {
                 session: "a".to_string(),
                 revision: current_revision,
+                workspace_env: None,
                 tasks: vec![task_input("api", "echo new")],
             },
         )

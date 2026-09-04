@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -10,9 +10,18 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::fs::File;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+};
 
 use crate::protocol::{EditableTask, EditableTaskInput, EditableTaskOrigin, SessionConfigSnapshot};
+use crate::state::validate_cron_expression;
 
 pub const PROJECT_CONFIG: &str = "taskdeck.yaml";
 const DEFAULT_STOP_TIMEOUT_MS: u64 = 3_000;
@@ -28,6 +37,8 @@ pub struct TaskSpec {
     pub shell: bool,
     pub auto_start: bool,
     pub stop_timeout_ms: u64,
+    pub clear_logs_on_restart: bool,
+    pub schedule: Option<String>,
 }
 
 impl TaskSpec {
@@ -45,6 +56,7 @@ pub struct ProjectDefinition {
     pub project: PathBuf,
     pub source: String,
     pub tasks: BTreeMap<String, TaskSpec>,
+    pub task_order: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -96,6 +108,10 @@ struct YamlConfig {
     #[serde(default = "default_version")]
     version: u32,
     session: Option<String>,
+    #[serde(default)]
+    workspace_env: BTreeMap<String, String>,
+    #[serde(default)]
+    task_order: Vec<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -109,6 +125,8 @@ struct TaskOverride {
     shell: Option<bool>,
     auto_start: Option<bool>,
     stop_timeout_ms: Option<u64>,
+    clear_logs_on_restart: Option<bool>,
+    schedule: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -119,8 +137,11 @@ struct TaskYamlEntry {
 
 #[derive(Debug, Clone)]
 struct YamlDocument {
+    workspace_env: BTreeMap<String, String>,
     root: Mapping,
     tasks: BTreeMap<String, TaskYamlEntry>,
+    declared_order: Vec<String>,
+    task_order: Vec<String>,
     session: Option<String>,
     raw_content: String,
 }
@@ -132,6 +153,8 @@ struct ProjectConfigState {
     vscode_raw_content: Option<String>,
     vscode_tasks: BTreeMap<String, EditableTaskInput>,
     merged_tasks: BTreeMap<String, EditableTaskInput>,
+    workspace_env: BTreeMap<String, String>,
+    task_order: Vec<String>,
     yaml: Option<YamlDocument>,
 }
 
@@ -148,6 +171,8 @@ pub struct PreparedSessionConfigWrite {
     expected_revision: String,
     vscode_tasks: BTreeMap<String, EditableTaskInput>,
     merged_tasks: BTreeMap<String, EditableTaskInput>,
+    workspace_env: BTreeMap<String, String>,
+    task_order: Vec<String>,
     yaml_task_labels: HashSet<String>,
     temp_path: PathBuf,
     finalized: bool,
@@ -170,7 +195,7 @@ impl PreparedSessionConfigWrite {
             .map(|task| {
                 Ok((
                     task.label.clone(),
-                    compile_task(&self.project, task).map_err(|error| {
+                    compile_task(&self.project, task, &self.workspace_env).map_err(|error| {
                         anyhow::anyhow!("invalid task '{}': {error}", task.label)
                     })?,
                 ))
@@ -181,14 +206,16 @@ impl PreparedSessionConfigWrite {
             project: self.project.clone(),
             source: self.source.clone(),
             tasks,
+            task_order: self.task_order.clone(),
         })
     }
 
     pub fn session_snapshot(&self, session: &str) -> Result<SessionConfigSnapshot> {
         validate_session_name(session)?;
         let tasks = self
-            .merged_tasks
-            .values()
+            .task_order
+            .iter()
+            .filter_map(|label| self.merged_tasks.get(label))
             .map(|task| EditableTask {
                 label: task.label.clone(),
                 command: task.command.clone(),
@@ -198,6 +225,8 @@ impl PreparedSessionConfigWrite {
                 shell: task.shell,
                 auto_start: task.auto_start,
                 stop_timeout_ms: task.stop_timeout_ms,
+                clear_logs_on_restart: task.clear_logs_on_restart,
+                schedule: task.schedule.clone(),
                 origin: EditableTaskOrigin {
                     imported: self.vscode_tasks.contains_key(&task.label),
                     has_yaml_override: self.yaml_task_labels.contains(&task.label)
@@ -210,6 +239,7 @@ impl PreparedSessionConfigWrite {
             project: self.project.clone(),
             source: self.source.clone(),
             revision: revision_for_project(&self.project)?,
+            workspace_env: self.workspace_env.clone(),
             tasks,
         })
     }
@@ -275,7 +305,7 @@ fn discover_inner(
         .map(|task| {
             Ok((
                 task.label.clone(),
-                compile_task(&state.project, task)
+                compile_task(&state.project, task, &state.workspace_env)
                     .map_err(|error| anyhow::anyhow!("invalid task '{}': {error}", task.label))?,
             ))
         })
@@ -285,6 +315,7 @@ fn discover_inner(
         project: state.project,
         source: state.source,
         tasks,
+        task_order: state.task_order,
     })
 }
 
@@ -292,8 +323,9 @@ pub fn read_session_config(project: &Path, session: &str) -> Result<SessionConfi
     validate_session_name(session)?;
     let state = load_project_state(project)?;
     let tasks = state
-        .merged_tasks
-        .values()
+        .task_order
+        .iter()
+        .filter_map(|label| state.merged_tasks.get(label))
         .map(|task| EditableTask {
             label: task.label.clone(),
             command: task.command.clone(),
@@ -303,6 +335,8 @@ pub fn read_session_config(project: &Path, session: &str) -> Result<SessionConfi
             shell: task.shell,
             auto_start: task.auto_start,
             stop_timeout_ms: task.stop_timeout_ms,
+            clear_logs_on_restart: task.clear_logs_on_restart,
+            schedule: task.schedule.clone(),
             origin: EditableTaskOrigin {
                 imported: state.vscode_tasks.contains_key(&task.label),
                 has_yaml_override: state
@@ -320,6 +354,7 @@ pub fn read_session_config(project: &Path, session: &str) -> Result<SessionConfi
         project: state.project,
         source: state.source,
         revision,
+        workspace_env: state.workspace_env.clone(),
         tasks,
     })
 }
@@ -330,7 +365,7 @@ pub fn write_session_config(
     revision: &str,
     tasks: Vec<EditableTaskInput>,
 ) -> std::result::Result<(), WriteConfigError> {
-    let mut prepared = prepare_session_config_write(project, revision, tasks)?;
+    let mut prepared = prepare_session_config_write(project, revision, tasks, None)?;
     prepared.finalize()
 }
 
@@ -338,24 +373,28 @@ pub fn prepare_session_config_write(
     project: &Path,
     revision: &str,
     tasks: Vec<EditableTaskInput>,
+    workspace_env: Option<&BTreeMap<String, String>>,
 ) -> std::result::Result<PreparedSessionConfigWrite, WriteConfigError> {
-    prepare_session_config_write_inner(project, revision, tasks, None)
+    prepare_session_config_write_inner(project, revision, tasks, workspace_env, None)
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_session_config_write_for_test(
     project: &Path,
     revision: &str,
     tasks: Vec<EditableTaskInput>,
+    workspace_env: Option<&BTreeMap<String, String>>,
     post_check_delay: Option<Duration>,
 ) -> std::result::Result<PreparedSessionConfigWrite, WriteConfigError> {
-    prepare_session_config_write_inner(project, revision, tasks, post_check_delay)
+    prepare_session_config_write_inner(project, revision, tasks, workspace_env, post_check_delay)
 }
 
 fn prepare_session_config_write_inner(
     project: &Path,
     revision: &str,
     tasks: Vec<EditableTaskInput>,
+    workspace_env: Option<&BTreeMap<String, String>>,
     post_check_delay: Option<Duration>,
 ) -> std::result::Result<PreparedSessionConfigWrite, WriteConfigError> {
     let state = load_project_state(project).map_err(WriteConfigError::Other)?;
@@ -367,13 +406,28 @@ fn prepare_session_config_write_inner(
         std::thread::sleep(delay);
     }
 
-    let submitted = validate_submitted_tasks(tasks)?;
+    let effective_workspace = match workspace_env {
+        Some(values) => values,
+        None => &state.workspace_env,
+    };
+    validate_workspace_env(effective_workspace).map_err(WriteConfigError::validation)?;
+    let (submitted, task_order) = validate_submitted_tasks(tasks)?;
     let mut root = state
         .yaml
         .as_ref()
         .map(|yaml| yaml.root.clone())
         .unwrap_or_default();
     root.insert(yaml_key("version"), Value::from(1u32));
+    root.insert(
+        yaml_key("task_order"),
+        Value::Sequence(task_order.iter().cloned().map(Value::String).collect()),
+    );
+    let saved_workspace = effective_workspace.clone();
+    if saved_workspace.is_empty() {
+        root.remove(yaml_key("workspace_env"));
+    } else {
+        root.insert(yaml_key("workspace_env"), yaml_string_map(&saved_workspace));
+    }
 
     let mut task_entries = BTreeMap::new();
     for (label, task) in &submitted {
@@ -427,6 +481,8 @@ fn prepare_session_config_write_inner(
         expected_revision: revision.to_string(),
         vscode_tasks: state.vscode_tasks,
         merged_tasks: submitted,
+        workspace_env: saved_workspace,
+        task_order,
         yaml_task_labels,
         temp_path,
         finalized: false,
@@ -437,9 +493,22 @@ fn load_project_state(project: &Path) -> Result<ProjectConfigState> {
     let project = project
         .canonicalize()
         .with_context(|| format!("project directory does not exist: {}", project.display()))?;
-    let (vscode_tasks, vscode_raw_content) = load_vscode_tasks(&project)?;
+    let (vscode_tasks, vscode_order, vscode_raw_content) = load_vscode_tasks(&project)?;
     let yaml = load_yaml_document(&project)?;
     let merged_tasks = merge_tasks(&vscode_tasks, yaml.as_ref())?;
+    let mut source_order = vscode_order;
+    if let Some(yaml) = &yaml {
+        for label in &yaml.declared_order {
+            if !source_order.contains(label) {
+                source_order.push(label.clone());
+            }
+        }
+    }
+    let configured_order = yaml
+        .as_ref()
+        .map(|yaml| yaml.task_order.as_slice())
+        .unwrap_or_default();
+    let task_order = resolve_task_order(configured_order, source_order, &merged_tasks)?;
     let source = match (vscode_raw_content.is_some(), yaml.is_some()) {
         (true, true) => ".vscode/tasks.json + taskdeck.yaml",
         (true, false) => ".vscode/tasks.json",
@@ -453,22 +522,32 @@ fn load_project_state(project: &Path) -> Result<ProjectConfigState> {
         vscode_raw_content,
         vscode_tasks,
         merged_tasks,
+        workspace_env: yaml
+            .as_ref()
+            .map(|yaml| yaml.workspace_env.clone())
+            .unwrap_or_default(),
+        task_order,
         yaml,
     })
 }
 
-fn load_vscode_tasks(
-    project: &Path,
-) -> Result<(BTreeMap<String, EditableTaskInput>, Option<String>)> {
+type LoadedVscodeTasks = (
+    BTreeMap<String, EditableTaskInput>,
+    Vec<String>,
+    Option<String>,
+);
+
+fn load_vscode_tasks(project: &Path) -> Result<LoadedVscodeTasks> {
     let path = project.join(".vscode/tasks.json");
     if !path.exists() {
-        return Ok((BTreeMap::new(), None));
+        return Ok((BTreeMap::new(), Vec::new(), None));
     }
     let content =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let file: VscodeFile =
         json5::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))?;
     let mut tasks = BTreeMap::new();
+    let mut order = Vec::new();
     for task in file.tasks {
         let editable = EditableTaskInput {
             label: task.label.clone(),
@@ -479,13 +558,18 @@ fn load_vscode_tasks(
             shell: task.kind == "shell",
             auto_start: false,
             stop_timeout_ms: DEFAULT_STOP_TIMEOUT_MS,
+            clear_logs_on_restart: false,
+            schedule: None,
         };
         validate_task_input(&editable).map_err(|error| {
             anyhow::anyhow!("invalid VS Code task '{}': {error}", editable.label)
         })?;
-        tasks.insert(task.label, editable);
+        if tasks.insert(task.label.clone(), editable).is_some() {
+            bail!("duplicate VS Code task label '{}'", task.label);
+        }
+        order.push(task.label);
     }
-    Ok((tasks, Some(content)))
+    Ok((tasks, order, Some(content)))
 }
 
 fn load_yaml_document(project: &Path) -> Result<Option<YamlDocument>> {
@@ -512,6 +596,7 @@ fn load_yaml_document(project: &Path) -> Result<Option<YamlDocument>> {
     }
 
     let mut tasks = BTreeMap::new();
+    let mut declared_order = Vec::new();
     if let Some(value) = root.get(yaml_key("tasks")) {
         match value {
             Value::Mapping(mapping) => {
@@ -536,6 +621,7 @@ fn load_yaml_document(project: &Path) -> Result<Option<YamlDocument>> {
                             );
                         }
                     }
+                    declared_order.push(label.clone());
                     tasks.insert(label, TaskYamlEntry { raw, patch });
                 }
             }
@@ -545,8 +631,11 @@ fn load_yaml_document(project: &Path) -> Result<Option<YamlDocument>> {
     }
 
     Ok(Some(YamlDocument {
+        workspace_env: config.workspace_env,
         root,
         tasks,
+        declared_order,
+        task_order: config.task_order,
         session: config.session,
         raw_content,
     }))
@@ -573,6 +662,30 @@ fn merge_tasks(
         }
     }
     Ok(tasks)
+}
+
+fn resolve_task_order(
+    configured: &[String],
+    source_order: Vec<String>,
+    tasks: &BTreeMap<String, EditableTaskInput>,
+) -> Result<Vec<String>> {
+    let mut seen = HashSet::new();
+    let mut order = Vec::with_capacity(tasks.len());
+    for label in configured {
+        if !seen.insert(label.clone()) {
+            bail!("task_order contains duplicate task '{label}'");
+        }
+        if !tasks.contains_key(label) {
+            bail!("task_order references unknown or disabled task '{label}'");
+        }
+        order.push(label.clone());
+    }
+    for label in source_order.into_iter().chain(tasks.keys().cloned()) {
+        if tasks.contains_key(&label) && seen.insert(label.clone()) {
+            order.push(label);
+        }
+    }
+    Ok(order)
 }
 
 fn apply_override(task: &mut EditableTaskInput, patch: &TaskOverride) {
@@ -606,10 +719,23 @@ fn apply_override(task: &mut EditableTaskInput, patch: &TaskOverride) {
     if let Some(timeout) = patch.stop_timeout_ms {
         task.stop_timeout_ms = timeout;
     }
+    if let Some(clear) = patch.clear_logs_on_restart {
+        task.clear_logs_on_restart = clear;
+    }
+    if let Some(schedule) = &patch.schedule {
+        task.schedule = Some(schedule.clone());
+    }
 }
 
-fn compile_task(project: &Path, task: &EditableTaskInput) -> Result<TaskSpec> {
+fn compile_task(
+    project: &Path,
+    task: &EditableTaskInput,
+    workspace_env: &BTreeMap<String, String>,
+) -> Result<TaskSpec> {
     validate_task_input(task).map_err(anyhow::Error::msg)?;
+    if let Some(schedule) = &task.schedule {
+        validate_cron_expression(schedule)?;
+    }
     let expanded_cwd = expand(&task.cwd, project);
     let cwd = PathBuf::from(&expanded_cwd);
     Ok(TaskSpec {
@@ -621,22 +747,31 @@ fn compile_task(project: &Path, task: &EditableTaskInput) -> Result<TaskSpec> {
         } else {
             project.join(cwd)
         },
-        env: task
-            .env
-            .iter()
-            .map(|(key, value)| (key.clone(), expand(value, project)))
-            .collect(),
+        env: {
+            let mut merged = workspace_env.clone();
+            for (key, value) in task.env.iter() {
+                merged.insert(key.clone(), expand(value, project));
+            }
+            let values = merged.clone();
+            values
+                .into_iter()
+                .map(|(key, value)| (key, expand_with_overrides(&value, project, &merged)))
+                .collect::<BTreeMap<_, _>>()
+        },
         shell: task.shell,
         auto_start: task.auto_start,
         stop_timeout_ms: task.stop_timeout_ms,
+        clear_logs_on_restart: task.clear_logs_on_restart,
+        schedule: task.schedule.clone(),
     })
 }
 
 fn validate_submitted_tasks(
     tasks: Vec<EditableTaskInput>,
-) -> std::result::Result<BTreeMap<String, EditableTaskInput>, WriteConfigError> {
+) -> std::result::Result<(BTreeMap<String, EditableTaskInput>, Vec<String>), WriteConfigError> {
     let mut labels = HashSet::new();
     let mut submitted = BTreeMap::new();
+    let mut order = Vec::new();
     for task in tasks {
         validate_task_input(&task).map_err(WriteConfigError::validation)?;
         if !labels.insert(task.label.clone()) {
@@ -645,9 +780,17 @@ fn validate_submitted_tasks(
                 task.label
             )));
         }
+        order.push(task.label.clone());
         submitted.insert(task.label.clone(), task);
     }
-    Ok(submitted)
+    Ok((submitted, order))
+}
+
+fn validate_workspace_env(values: &BTreeMap<String, String>) -> std::result::Result<(), String> {
+    if values.keys().any(|key| key.trim().is_empty()) {
+        return Err("workspace environment keys must not be empty".to_string());
+    }
+    Ok(())
 }
 
 fn validate_task_input(task: &EditableTaskInput) -> std::result::Result<(), String> {
@@ -674,6 +817,14 @@ fn validate_task_input(task: &EditableTaskInput) -> std::result::Result<(), Stri
     }
     if task.env.keys().any(|key| key.trim().is_empty()) {
         return Err(format!("task '{}' env keys must not be empty", task.label));
+    }
+    if let Some(schedule) = &task.schedule {
+        if crate::state::validate_cron_expression(schedule).is_err() {
+            return Err(format!(
+                "task '{}' has an invalid cron expression '{schedule}'",
+                task.label
+            ));
+        }
     }
     Ok(())
 }
@@ -709,6 +860,18 @@ fn build_imported_task_mapping(
             Value::from(submitted.stop_timeout_ms),
         );
     }
+    if submitted.schedule != base.schedule {
+        match &submitted.schedule {
+            Some(schedule) => raw.insert(yaml_key("schedule"), yaml_string(schedule)),
+            None => raw.insert(yaml_key("schedule"), Value::Null),
+        };
+    }
+    if submitted.clear_logs_on_restart != base.clear_logs_on_restart {
+        raw.insert(
+            yaml_key("clear_logs_on_restart"),
+            Value::Bool(submitted.clear_logs_on_restart),
+        );
+    }
     raw
 }
 
@@ -724,6 +887,13 @@ fn build_yaml_task_mapping(submitted: &EditableTaskInput, mut raw: Mapping) -> M
         yaml_key("stop_timeout_ms"),
         Value::from(submitted.stop_timeout_ms),
     );
+    raw.insert(
+        yaml_key("clear_logs_on_restart"),
+        Value::Bool(submitted.clear_logs_on_restart),
+    );
+    if let Some(schedule) = &submitted.schedule {
+        raw.insert(yaml_key("schedule"), yaml_string(schedule));
+    }
     raw
 }
 
@@ -743,6 +913,8 @@ fn clear_known_task_fields(mapping: &mut Mapping) {
         "shell",
         "auto_start",
         "stop_timeout_ms",
+        "clear_logs_on_restart",
+        "schedule",
     ] {
         mapping.remove(yaml_key(key));
     }
@@ -758,6 +930,8 @@ fn default_task_input(label: &str) -> EditableTaskInput {
         shell: true,
         auto_start: false,
         stop_timeout_ms: DEFAULT_STOP_TIMEOUT_MS,
+        clear_logs_on_restart: false,
+        schedule: None,
     }
 }
 
@@ -781,10 +955,12 @@ fn write_temp_config_file(path: &Path, content: &str) -> Result<PathBuf> {
             .with_context(|| format!("failed to create {}", temp.display()))?;
         file.write_all(content.as_bytes())
             .with_context(|| format!("failed to write {}", temp.display()))?;
-        let permissions = target_permissions(path)
-            .with_context(|| format!("failed to determine permissions for {}", path.display()))?;
-        fs::set_permissions(&temp, permissions)
-            .with_context(|| format!("failed to apply permissions to {}", temp.display()))?;
+        if let Some(permissions) = target_permissions(path)
+            .with_context(|| format!("failed to determine permissions for {}", path.display()))?
+        {
+            fs::set_permissions(&temp, permissions)
+                .with_context(|| format!("failed to apply permissions to {}", temp.display()))?;
+        }
         file.sync_all()
             .with_context(|| format!("failed to sync {}", temp.display()))?;
         Ok(temp.clone())
@@ -795,22 +971,12 @@ fn write_temp_config_file(path: &Path, content: &str) -> Result<PathBuf> {
     result
 }
 
-fn target_permissions(path: &Path) -> Result<fs::Permissions> {
+fn target_permissions(path: &Path) -> Result<Option<fs::Permissions>> {
     match fs::metadata(path) {
-        Ok(metadata) => Ok(metadata.permissions()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(default_permissions()),
+        Ok(metadata) => Ok(Some(metadata.permissions())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
-}
-
-#[cfg(unix)]
-fn default_permissions() -> fs::Permissions {
-    fs::Permissions::from_mode(0o600)
-}
-
-#[cfg(not(unix))]
-fn default_permissions() -> fs::Permissions {
-    fs::Permissions::readonly(false)
 }
 
 fn sync_parent_directory(path: &Path) -> Result<()> {
@@ -824,6 +990,8 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
             .sync_all()
             .with_context(|| format!("failed to sync {}", parent.display()))?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -831,6 +999,7 @@ fn revision_for_project(project: &Path) -> Result<String> {
     load_project_state(project).map(|state| state.revision())
 }
 
+#[cfg(unix)]
 fn rename_temp_file(temp: &Path, path: &Path) -> Result<()> {
     match fs::rename(temp, path) {
         Ok(()) => Ok(()),
@@ -845,6 +1014,39 @@ fn rename_temp_file(temp: &Path, path: &Path) -> Result<()> {
             })
         }
     }
+}
+
+#[cfg(windows)]
+fn rename_temp_file(temp: &Path, path: &Path) -> Result<()> {
+    let temp_wide = temp
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let path_wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let replaced = unsafe {
+        MoveFileExW(
+            temp_wide.as_ptr(),
+            path_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced != 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    let _ = fs::remove_file(temp);
+    Err(error).with_context(|| {
+        format!(
+            "failed to replace {} with {}",
+            path.display(),
+            temp.display()
+        )
+    })
 }
 
 fn yaml_key(key: &str) -> Value {
@@ -935,6 +1137,14 @@ impl Fnv64 {
 }
 
 fn expand(input: &str, project: &Path) -> String {
+    expand_with_overrides(input, project, &BTreeMap::new())
+}
+
+fn expand_with_overrides(
+    input: &str,
+    project: &Path,
+    overrides: &BTreeMap<String, String>,
+) -> String {
     let basename = project
         .file_name()
         .and_then(|name| name.to_str())
@@ -942,7 +1152,10 @@ fn expand(input: &str, project: &Path) -> String {
     let mut output = input
         .replace("${workspaceFolderBasename}", basename)
         .replace("${workspaceFolder}", &project.to_string_lossy());
-    let environment: HashMap<String, String> = env::vars().collect();
+    let mut environment: HashMap<String, String> = env::vars().collect();
+    for (key, value) in overrides {
+        environment.insert(key.clone(), value.clone());
+    }
     for (key, value) in environment {
         output = output.replace(&format!("${{env:{key}}}"), &value);
     }
@@ -1154,6 +1367,8 @@ tasks:
                 shell: true,
                 auto_start: false,
                 stop_timeout_ms: 0,
+                clear_logs_on_restart: false,
+                schedule: None,
             }],
         )
         .unwrap_err();
@@ -1336,10 +1551,104 @@ tasks:
                 shell: true,
                 auto_start: false,
                 stop_timeout_ms: 300_001,
+                clear_logs_on_restart: false,
+                schedule: None,
             }],
         )
         .unwrap_err();
 
         assert!(matches!(error, WriteConfigError::Validation { .. }));
+    }
+
+    #[test]
+    fn task_order_and_restart_history_setting_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(PROJECT_CONFIG),
+            "version: 1\ntask_order: [web]\ntasks:\n  api:\n    command: echo api\n  web:\n    command: echo web\n",
+        )
+        .unwrap();
+        let snapshot = read_session_config(dir.path(), "demo").unwrap();
+        assert_eq!(
+            snapshot
+                .tasks
+                .iter()
+                .map(|task| task.label.as_str())
+                .collect::<Vec<_>>(),
+            ["web", "api"]
+        );
+
+        let mut tasks = snapshot.tasks_to_inputs();
+        tasks.reverse();
+        tasks[0].clear_logs_on_restart = true;
+        write_session_config(dir.path(), &snapshot.revision, tasks).unwrap();
+
+        let saved = read_session_config(dir.path(), "demo").unwrap();
+        assert_eq!(
+            saved
+                .tasks
+                .iter()
+                .map(|task| task.label.as_str())
+                .collect::<Vec<_>>(),
+            ["api", "web"]
+        );
+        assert!(saved.tasks[0].clear_logs_on_restart);
+        let yaml = fs::read_to_string(dir.path().join(PROJECT_CONFIG)).unwrap();
+        assert!(yaml.contains("task_order:"));
+        assert!(yaml.contains("clear_logs_on_restart: true"));
+    }
+
+    #[test]
+    fn task_order_rejects_unknown_and_duplicate_labels() {
+        for order in ["[missing]", "[api, api]"] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(
+                dir.path().join(PROJECT_CONFIG),
+                format!("version: 1\ntask_order: {order}\ntasks:\n  api:\n    command: echo api\n"),
+            )
+            .unwrap();
+            assert!(read_session_config(dir.path(), "demo").is_err());
+        }
+    }
+
+    #[test]
+    fn workspace_env_overrides_daemon_and_task_env_overrides_workspace() {
+        // The "daemon environment" is intentionally represented by the VS Code default VARIABLE=vscode;
+        // this test proves the two layers below it without unsafe process-environment mutation.
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".vscode")).unwrap();
+        fs::write(dir.path().join(".vscode/tasks.json"), r#"{"version":"2.0.0","tasks":[{"label":"api","type":"shell","command":"echo ready","options":{"env":{"VARIABLE":"vscode"}}}]}"#).unwrap();
+        std::fs::write(dir.path().join(PROJECT_CONFIG),"version: 1\nworkspace_env:\n  VARIABLE: workspace\n  WORKSPACE_ONLY: yes\ntasks:\n  api:\n    env:\n      VARIABLE: task\n").unwrap();
+        let definition = discover(dir.path(), Some("demo")).unwrap();
+        let env = definition.tasks["api"].env.clone();
+        assert_eq!(env["VARIABLE"], "task");
+        assert_eq!(env["WORKSPACE_ONLY"], "yes");
+    }
+
+    #[test]
+    fn schedule_is_validated_loaded_and_persisted_by_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(PROJECT_CONFIG),"version: 1\nworkspace_env:\n  APP_ENV: development\ntasks:\n  cleanup:\n    command: ./cleanup.sh\n    shell: true\n    cwd: .\n    auto_start: false\n    stop_timeout_ms: 3000\n    clear_logs_on_restart: false\n    schedule: \"*/10 * * * *\"\n").unwrap();
+        let definition = discover(dir.path(), Some("demo")).unwrap();
+        assert_eq!(
+            definition.tasks["cleanup"].schedule.as_deref(),
+            Some("*/10 * * * *")
+        );
+        let mut snapshot = read_session_config(dir.path(), "demo").unwrap();
+        assert_eq!(
+            snapshot.workspace_env.get("APP_ENV").map(String::as_str),
+            Some("development")
+        );
+        snapshot.tasks[0].schedule = Some("bad cron".into());
+        let error =
+            write_session_config(dir.path(), &snapshot.revision, snapshot.tasks_to_inputs())
+                .unwrap_err();
+        assert!(matches!(error, WriteConfigError::Validation { .. }));
+        snapshot = read_session_config(dir.path(), "demo").unwrap();
+        snapshot.tasks[0].schedule = None;
+        write_session_config(dir.path(), &snapshot.revision, snapshot.tasks_to_inputs()).unwrap();
+        let saved = fs::read_to_string(dir.path().join(PROJECT_CONFIG)).unwrap();
+        assert!(saved.contains("APP_ENV"));
+        assert!(!saved.contains("*/10"));
     }
 }

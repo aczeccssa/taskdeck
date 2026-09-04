@@ -1,18 +1,26 @@
+mod cluster;
 mod config;
 mod daemon;
 mod protocol;
 mod runtime;
+mod service;
+mod state;
 mod tui;
 mod web;
 
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::time::Duration;
+
+#[cfg(windows)]
+use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::protocol::{Action, Request, Response};
+use crate::state::{LeaderMode, NodeRole, NodeSettingsUpdate, StateStore};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -40,10 +48,15 @@ fn parse_project_path(value: &str) -> std::result::Result<PathBuf, String> {
 enum Commands {
     /// Run the singleton daemon in the foreground.
     Daemon {
-        #[arg(long, default_value_t = daemon::DEFAULT_WEB_PORT)]
-        web_port: u16,
+        #[arg(long)]
+        web_port: Option<u16>,
         #[arg(long, hide = true)]
         background: bool,
+    },
+    /// Inspect or configure this Taskdeck installation.
+    Node {
+        #[command(subcommand)]
+        command: NodeCommands,
     },
     /// Open the terminal interface (default command).
     Tui,
@@ -89,6 +102,53 @@ enum Commands {
     Endpoints,
     /// Stop the global daemon and every managed task.
     Shutdown,
+    /// Configure single-user access-key authentication.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthCommands {
+    /// Print whether access-key authentication is enabled and configured.
+    Status,
+    /// Enable authentication. Uses TASKDECK_ACCESS_KEY or generates a one-time key.
+    Enable {
+        #[arg(long)]
+        generate: bool,
+    },
+    /// Disable authentication and remove its configured key hash.
+    Disable,
+    /// Replace the configured key by reading a new value from stdin.
+    SetKey,
+}
+
+#[derive(Subcommand)]
+enum NodeCommands {
+    /// Print the persisted node role and connection settings.
+    Show,
+    /// Configure this installation as a worker or leader.
+    Configure {
+        #[arg(long)]
+        role: Option<NodeRole>,
+        #[arg(long)]
+        leader_mode: Option<LeaderMode>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, conflicts_with = "clear_leader")]
+        leader_url: Option<String>,
+        #[arg(long)]
+        clear_leader: bool,
+        #[arg(long, conflicts_with = "clear_token")]
+        token: Option<String>,
+        #[arg(long)]
+        clear_token: bool,
+        #[arg(long)]
+        bind_host: Option<String>,
+        #[arg(long)]
+        web_port: Option<u16>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -100,13 +160,18 @@ fn main() -> Result<()> {
             ..
         })
     ) {
-        let log = daemon::open_daemon_log()?;
-        let stderr = log.try_clone()?;
-        daemonize::Daemonize::new()
-            .stdout(log)
-            .stderr(stderr)
-            .start()
-            .context("failed to detach taskdeck daemon")?;
+        #[cfg(unix)]
+        {
+            let log = daemon::open_daemon_log()?;
+            let stderr = log.try_clone()?;
+            daemonize::Daemonize::new()
+                .stdout(log)
+                .stderr(stderr)
+                .start()
+                .context("failed to detach taskdeck daemon")?;
+        }
+        #[cfg(windows)]
+        attach_daemon_log()?;
     }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -115,8 +180,14 @@ fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    if let Some(Commands::Daemon { web_port, .. }) = cli.command {
-        return daemon::run(web_port).await;
+    if let Some(Commands::Daemon { web_port, .. }) = &cli.command {
+        return daemon::run(*web_port).await;
+    }
+    if let Some(Commands::Auth { command }) = cli.command {
+        return run_auth_command(command).await;
+    }
+    if let Some(Commands::Node { command }) = cli.command {
+        return run_node_command(command).await;
     }
 
     ensure_daemon().await?;
@@ -159,14 +230,107 @@ async fn run(cli: Cli) -> Result<()> {
             print_response(daemon::request(&Request::RemoveSession { session }).await?)
         }
         Commands::Endpoints => {
-            println!("Web UI: http://127.0.0.1:{}", daemon::DEFAULT_WEB_PORT);
-            println!("MCP:    http://127.0.0.1:{}/mcp", daemon::DEFAULT_WEB_PORT);
+            let settings = daemon::configured_settings()?;
+            let display_host = if settings.bind_host == "0.0.0.0" {
+                "127.0.0.1"
+            } else {
+                settings.bind_host.as_str()
+            };
+            println!("Web UI: http://{}:{}", display_host, settings.web_port);
+            println!("MCP:    http://{}:{}/mcp", display_host, settings.web_port);
             println!("IPC:    {}", daemon::socket_path()?.display());
             Ok(())
         }
         Commands::Shutdown => print_response(daemon::request(&Request::Shutdown).await?),
-        Commands::Daemon { .. } => unreachable!(),
+        Commands::Daemon { .. } | Commands::Node { .. } | Commands::Auth { .. } => unreachable!(),
     }
+}
+
+async fn run_auth_command(command: AuthCommands) -> Result<()> {
+    let root = daemon::root_path()?;
+    let store = StateStore::open(&root)?;
+    match command {
+        AuthCommands::Status => {
+            let settings = store.auth_settings()?;
+            println!("{}", serde_json::to_string_pretty(&settings.public())?);
+        }
+        AuthCommands::Enable { generate } => {
+            let generated = generate.then(|| uuid::Uuid::new_v4().simple().to_string());
+            if let Some(key) = &generated {
+                store.set_access_key(key)?;
+            } else if !generate && std::env::var_os("TASKDECK_ACCESS_KEY").is_none() {
+                bail!("provide TASKDECK_ACCESS_KEY or pass --generate");
+            }
+            let settings = store.configure_auth(true)?;
+            println!("{}", serde_json::to_string_pretty(&settings.public())?);
+            if let Some(key) = generated {
+                println!("access key: {key}");
+            }
+            if daemon::is_running().await {
+                let _ = daemon::request(&Request::Shutdown).await;
+            }
+        }
+        AuthCommands::Disable => {
+            let settings = store.configure_auth(false)?;
+            println!("{}", serde_json::to_string_pretty(&settings.public())?);
+        }
+        AuthCommands::SetKey => {
+            let mut line = String::new();
+            std::io::Write::write_all(&mut std::io::stderr(), b"Enter new access key: ")?;
+            std::io::stdin().read_line(&mut line)?;
+            let key = line.trim();
+            store.set_access_key(key)?;
+            println!("access key updated");
+        }
+    }
+    Ok(())
+}
+
+async fn run_node_command(command: NodeCommands) -> Result<()> {
+    let root = daemon::root_path()?;
+    let store = StateStore::open(&root)?;
+    match command {
+        NodeCommands::Show => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store.node_settings()?.public())?
+            );
+        }
+        NodeCommands::Configure {
+            role,
+            leader_mode,
+            name,
+            leader_url,
+            clear_leader,
+            token,
+            clear_token,
+            bind_host,
+            web_port,
+        } => {
+            let settings = store.configure(NodeSettingsUpdate {
+                role,
+                leader_mode,
+                name,
+                leader_url: if clear_leader {
+                    Some(None)
+                } else {
+                    leader_url.map(Some)
+                },
+                enrollment_token: if clear_token {
+                    Some(None)
+                } else {
+                    token.map(Some)
+                },
+                bind_host,
+                web_port,
+            })?;
+            if daemon::is_running().await {
+                let _ = daemon::request(&Request::Shutdown).await;
+            }
+            println!("{}", serde_json::to_string_pretty(&settings.public())?);
+        }
+    }
+    Ok(())
 }
 
 async fn control(
@@ -231,14 +395,7 @@ async fn ensure_daemon() -> Result<()> {
         return Ok(());
     }
     let executable = std::env::current_exe().context("cannot locate taskdeck executable")?;
-    Command::new(executable)
-        .arg("daemon")
-        .arg("--background")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to launch taskdeck daemon")?;
+    spawn_background_daemon(&executable)?;
     for _ in 0..50 {
         if daemon::is_running().await {
             return Ok(());
@@ -249,6 +406,83 @@ async fn ensure_daemon() -> Result<()> {
         "daemon did not become ready; inspect {}/daemon.log",
         daemon::root_path()?.display()
     )
+}
+
+#[cfg(unix)]
+fn spawn_background_daemon(executable: &std::path::Path) -> Result<()> {
+    Command::new(executable)
+        .arg("daemon")
+        .arg("--background")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to launch taskdeck daemon")?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn spawn_background_daemon(executable: &std::path::Path) -> Result<()> {
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::Threading::{
+            CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CreateProcessW, PROCESS_INFORMATION,
+            STARTUPINFOW,
+        },
+    };
+
+    let application = executable
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut command_line = format!("\"{}\" daemon --background", executable.display())
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut process = PROCESS_INFORMATION::default();
+    let created = unsafe {
+        CreateProcessW(
+            application.as_ptr(),
+            command_line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB,
+            std::ptr::null(),
+            std::ptr::null(),
+            &startup,
+            &mut process,
+        )
+    };
+    if created == 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to launch taskdeck daemon");
+    }
+    unsafe {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn attach_daemon_log() -> Result<()> {
+    use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle};
+
+    let stdout = daemon::open_daemon_log()?;
+    let stderr = stdout.try_clone()?;
+    let stdout_set = unsafe { SetStdHandle(STD_OUTPUT_HANDLE, stdout.as_raw_handle().cast()) } != 0;
+    let stderr_set = unsafe { SetStdHandle(STD_ERROR_HANDLE, stderr.as_raw_handle().cast()) } != 0;
+    if !stdout_set || !stderr_set {
+        return Err(std::io::Error::last_os_error()).context("failed to attach daemon log");
+    }
+    std::mem::forget(stdout);
+    std::mem::forget(stderr);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -264,5 +498,30 @@ mod tests {
             cli.project,
             std::env::current_dir().unwrap().canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn parses_pure_master_configuration() {
+        let cli = Cli::try_parse_from([
+            "taskdeck",
+            "node",
+            "configure",
+            "--role",
+            "leader",
+            "--leader-mode",
+            "pure-master",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Node {
+                command: NodeCommands::Configure {
+                    role: Some(NodeRole::Leader),
+                    leader_mode: Some(LeaderMode::PureMaster),
+                    ..
+                }
+            })
+        ));
     }
 }
