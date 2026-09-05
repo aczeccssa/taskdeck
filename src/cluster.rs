@@ -10,14 +10,14 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use uuid::Uuid;
 
-use crate::daemon::{DaemonState, dispatch_async};
+use crate::daemon::{DaemonState, dispatch_async_with_audit};
 use crate::protocol::{
-    Action, EditableTaskInput, EventFilter, NodeSummary, Request, Response, SessionSnapshot,
-    TaskRunFilter,
+    Action, AuditContext, AuditRecord, AuditStatus, EditableTaskInput, EventFilter, NodeSummary,
+    Request, Response, SessionSnapshot, TaskRunFilter,
 };
 use crate::state::{NodeSettings, StateStore};
 
-pub const AGENT_PROTOCOL_VERSION: u32 = 1;
+pub const AGENT_PROTOCOL_VERSION: u32 = 2;
 const MAX_AGENT_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const COMMAND_CACHE_SIZE: usize = 256;
@@ -44,10 +44,18 @@ pub enum AgentMessage {
     Command {
         id: String,
         request: RemoteRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audit: Option<AuditContext>,
     },
     CommandResult {
         id: String,
         response: Response,
+    },
+    AuditBatch {
+        records: Vec<AuditRecord>,
+    },
+    AuditAck {
+        audit_ids: Vec<String>,
     },
     Error {
         message: String,
@@ -351,17 +359,31 @@ impl LeaderCluster {
             .map(|worker| worker.inventory.clone())
     }
 
-    pub async fn request(&self, node_id: &str, request: RemoteRequest) -> Response {
+    pub async fn request_with_audit(
+        &self,
+        node_id: &str,
+        request: RemoteRequest,
+        audit: Option<AuditContext>,
+    ) -> (Response, AuditStatus) {
         let (sender, command_id) = {
             let inner = self.inner.lock().expect("leader cluster lock");
             let Some(worker) = inner.workers.get(node_id) else {
-                return Response::error(format!("worker '{node_id}' not found"));
+                return (
+                    Response::error(format!("worker '{node_id}' not found")),
+                    AuditStatus::Error,
+                );
             };
             if !worker.online {
-                return Response::error(format!("worker '{node_id}' is offline"));
+                return (
+                    Response::error(format!("worker '{node_id}' is offline")),
+                    AuditStatus::Error,
+                );
             }
             let Some(sender) = worker.sender.clone() else {
-                return Response::error(format!("worker '{node_id}' has no active connection"));
+                return (
+                    Response::error(format!("worker '{node_id}' has no active connection")),
+                    AuditStatus::Error,
+                );
             };
             (sender, Uuid::new_v4().to_string())
         };
@@ -375,6 +397,7 @@ impl LeaderCluster {
             .send(AgentMessage::Command {
                 id: command_id.clone(),
                 request,
+                audit,
             })
             .await
             .is_err()
@@ -384,20 +407,91 @@ impl LeaderCluster {
                 .expect("leader cluster lock")
                 .pending
                 .remove(&command_id);
-            return Response::error(format!("worker '{node_id}' disconnected"));
+            return (
+                Response::error(format!("worker '{node_id}' disconnected")),
+                AuditStatus::Error,
+            );
         }
         match tokio::time::timeout(COMMAND_TIMEOUT, result_receiver).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(_)) => Response::error(format!("worker '{node_id}' command was cancelled")),
+            Ok(Ok(response)) => {
+                let status = AuditStatus::from_ok(response.ok);
+                (response, status)
+            }
+            Ok(Err(_)) => (
+                Response::error(format!("worker '{node_id}' command was cancelled")),
+                AuditStatus::Error,
+            ),
             Err(_) => {
                 self.inner
                     .lock()
                     .expect("leader cluster lock")
                     .pending
                     .remove(&command_id);
-                Response::error(format!("worker '{node_id}' command timed out"))
+                (
+                    Response::error(format!("worker '{node_id}' command timed out")),
+                    AuditStatus::Timeout,
+                )
             }
         }
+    }
+
+    pub fn ingest_worker_audits(&self, node_id: &str, records: Vec<AuditRecord>) -> Vec<String> {
+        let now = current_timestamp_ms();
+        let mut accepted = Vec::new();
+        for mut record in records {
+            if record.audit_id.trim().is_empty() {
+                continue;
+            }
+            if record
+                .executor_node_id
+                .as_deref()
+                .is_some_and(|value| value != node_id)
+            {
+                record.details = merge_detail(
+                    record.details,
+                    serde_json::json!({"reported_executor_node_id": record.executor_node_id}),
+                );
+            }
+            if record.origin_node_id.is_none() {
+                record.origin_node_id = Some(node_id.to_string());
+            }
+            record.executor_node_id = Some(node_id.to_string());
+            record.replicated_at_ms = Some(now);
+            let audit_id = record.audit_id.clone();
+            if self.store.ingest_replicated_audit(record).is_ok()
+                && !accepted.iter().any(|accepted_id| accepted_id == &audit_id)
+            {
+                accepted.push(audit_id);
+            }
+        }
+        accepted
+    }
+
+    pub async fn send_to_worker(&self, node_id: &str, message: AgentMessage) -> Result<()> {
+        let sender = self
+            .inner
+            .lock()
+            .expect("leader cluster lock")
+            .workers
+            .get(node_id)
+            .and_then(|worker| worker.sender.clone())
+            .context("worker has no active sender")?;
+        sender
+            .send(message)
+            .await
+            .context("failed to send agent message")
+    }
+}
+
+fn merge_detail(mut existing: serde_json::Value, patch: serde_json::Value) -> serde_json::Value {
+    match (existing.as_object_mut(), patch) {
+        (Some(existing), serde_json::Value::Object(patch)) => {
+            for (key, value) in patch {
+                existing.insert(key, value);
+            }
+            serde_json::Value::Object(existing.clone())
+        }
+        (_, patch) => serde_json::json!({"existing": existing, "patch": patch}),
     }
 }
 
@@ -472,6 +566,14 @@ pub async fn serve_agent_socket(cluster: LeaderCluster, mut socket: WebSocket) {
             }
             AgentMessage::CommandResult { id, response } => {
                 cluster.resolve_result(&id, response);
+            }
+            AgentMessage::AuditBatch { records } => {
+                let audit_ids = cluster.ingest_worker_audits(&node_id, records);
+                if !audit_ids.is_empty() {
+                    let _ = cluster
+                        .send_to_worker(&node_id, AgentMessage::AuditAck { audit_ids })
+                        .await;
+                }
             }
             _ => break,
         }
@@ -554,6 +656,7 @@ async fn run_worker_connection(
         _ => bail!("leader closed before welcome"),
     }
 
+    send_pending_audit_records(&mut writer, &state).await?;
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     loop {
         tokio::select! {
@@ -564,25 +667,44 @@ async fn run_worker_connection(
                 send_worker(&mut writer, &AgentMessage::Heartbeat {
                     timestamp_ms: current_timestamp_ms(),
                 }).await?;
+                send_pending_audit_records(&mut writer, &state).await?;
             }
             message = reader.next() => {
                 let Some(message) = message else { bail!("leader connection closed"); };
                 let message = parse_worker_message(message?)?;
-                let AgentMessage::Command { id, request } = message else {
-                    bail!("unexpected leader message");
-                };
-                let cached = cache.lock().expect("command cache lock").get(&id);
-                let response = if let Some(response) = cached {
-                    response
-                } else {
-                    let response = dispatch_async(state.clone(), request.into_local()).await;
-                    cache.lock().expect("command cache lock").insert(id.clone(), response.clone());
-                    response
-                };
-                send_worker(&mut writer, &AgentMessage::CommandResult { id, response }).await?;
+                match message {
+                    AgentMessage::Command { id, request, audit } => {
+                        let cached = cache.lock().expect("command cache lock").get(&id);
+                        let response = if let Some(response) = cached {
+                            response
+                        } else {
+                            let response = dispatch_async_with_audit(state.clone(), request.into_local(), audit).await;
+                            cache.lock().expect("command cache lock").insert(id.clone(), response.clone());
+                            response
+                        };
+                        send_worker(&mut writer, &AgentMessage::CommandResult { id, response }).await?;
+                        send_pending_audit_records(&mut writer, &state).await?;
+                    }
+                    AgentMessage::AuditAck { audit_ids } => {
+                        let _ = state.store.mark_audit_replicated(&audit_ids, current_timestamp_ms());
+                    }
+                    _ => bail!("unexpected leader message"),
+                }
             }
         }
     }
+}
+
+async fn send_pending_audit_records<S>(writer: &mut S, state: &DaemonState) -> Result<()>
+where
+    S: futures_util::Sink<WsMessage> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let records = state.store.unreplicated_audit_records(100)?;
+    if !records.is_empty() {
+        send_worker(writer, &AgentMessage::AuditBatch { records }).await?;
+    }
+    Ok(())
 }
 
 async fn send_worker<S>(writer: &mut S, message: &AgentMessage) -> Result<()>
@@ -686,6 +808,60 @@ mod tests {
             token: Some("secret".to_string()),
         };
         assert!(cluster.validate_hello(&wrong_protocol).is_err());
+    }
+
+    #[test]
+    fn ingest_worker_audits_is_idempotent_and_normalizes_executor_identity() {
+        let store = Arc::new(StateStore::open_in_memory().unwrap());
+        let cluster = LeaderCluster::new(store.clone(), None).unwrap();
+        let record = AuditRecord {
+            audit_id: "audit-1".to_string(),
+            correlation_id: "corr-1".to_string(),
+            timestamp_ms: 42,
+            duration_ms: 3,
+            source: crate::protocol::AuditSource::Cli,
+            transport: crate::protocol::AuditTransport::Ipc,
+            origin_node_id: None,
+            executor_node_id: Some("spoofed-worker".to_string()),
+            request_kind: "action".to_string(),
+            operation: "start".to_string(),
+            session: Some("demo".to_string()),
+            task: Some("api".to_string()),
+            status: AuditStatus::Success,
+            success: true,
+            error: None,
+            request: serde_json::json!({"type":"action","secret":"hide-me"}),
+            response: serde_json::json!({"ok":true}),
+            details: serde_json::json!({}),
+            replicated_at_ms: None,
+        };
+
+        let accepted = cluster.ingest_worker_audits("worker-1", vec![record.clone(), record]);
+        assert_eq!(accepted, vec!["audit-1".to_string()]);
+
+        let page = store
+            .list_audit(&crate::protocol::AuditFilter {
+                q: None,
+                source: Some("cli".to_string()),
+                status: None,
+                node: Some("worker-1".to_string()),
+                session: Some("demo".to_string()),
+                task: Some("api".to_string()),
+                operation: Some("start".to_string()),
+                page: 1,
+                page_size: 20,
+            })
+            .unwrap();
+        assert_eq!(page.total, 1);
+        let detail = store.audit_detail("audit-1").unwrap().unwrap();
+        assert_eq!(detail.origin_node_id.as_deref(), Some("worker-1"));
+        assert_eq!(detail.executor_node_id.as_deref(), Some("worker-1"));
+        assert_eq!(
+            detail.details["reported_executor_node_id"],
+            "spoofed-worker"
+        );
+        assert_eq!(detail.request["secret"], "[REDACTED]");
+        assert!(detail.replicated_at_ms.is_some());
     }
 
     #[test]

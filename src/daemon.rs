@@ -4,8 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
@@ -21,8 +20,9 @@ use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 use crate::cluster::{LeaderCluster, RemoteRequest, spawn_worker_client};
 use crate::config;
 use crate::protocol::{
-    Request, Response, TaskMetricsAggregate, TaskMetricsSample, TaskMetricsSnapshot,
-    TaskProcessSnapshot, TaskStatus,
+    AuditContext, AuditRecord, AuditSource, AuditStatus, AuditTransport, Envelope, Request,
+    Response, TaskMetricsAggregate, TaskMetricsSample, TaskMetricsSnapshot, TaskProcessSnapshot,
+    TaskStatus,
 };
 use crate::runtime::{SessionRuntime, Sessions};
 use crate::service;
@@ -202,18 +202,85 @@ impl DaemonState {
         nodes
     }
 
+    #[allow(dead_code)]
     pub async fn dispatch_node(&self, node: &str, request: RemoteRequest) -> Response {
+        self.dispatch_node_with_audit(node, request, AuditContext::internal())
+            .await
+    }
+
+    pub async fn dispatch_node_with_audit(
+        &self,
+        node: &str,
+        request: RemoteRequest,
+        audit: AuditContext,
+    ) -> Response {
         let settings = self.settings.lock().expect("node settings lock").clone();
+        let local_request = request.clone().into_local();
+        let audit = audit.with_request_defaults(&local_request);
         if node == "self" {
             if !settings.execution_enabled() {
-                return Response::error("pure master does not have a self executor");
+                let response = Response::error("pure master does not have a self executor");
+                record_request_audit(
+                    self,
+                    &local_request,
+                    audit,
+                    None,
+                    current_timestamp_ms(),
+                    0,
+                    AuditStatus::Error,
+                    Some(settings.node_id),
+                    &response,
+                    serde_json::json!({"node": "self"}),
+                );
+                return response;
             }
-            return dispatch_async(self.clone(), request.into_local()).await;
+            return dispatch_async_with_audit(self.clone(), local_request, Some(audit)).await;
         }
         if settings.role != NodeRole::Leader {
-            return Response::error("worker nodes can only control their local self executor");
+            let response =
+                Response::error("worker nodes can only control their local self executor");
+            record_request_audit(
+                self,
+                &local_request,
+                audit,
+                None,
+                current_timestamp_ms(),
+                0,
+                AuditStatus::Error,
+                Some(settings.node_id),
+                &response,
+                serde_json::json!({"node": node}),
+            );
+            return response;
         }
-        self.cluster.request(node, request).await
+
+        let origin_audit_id = uuid::Uuid::new_v4().to_string();
+        let mut worker_audit = audit.clone();
+        if worker_audit.origin_node_id.is_none() {
+            worker_audit.origin_node_id = Some(settings.node_id.clone());
+        }
+        worker_audit.origin_audit_id = Some(origin_audit_id.clone());
+        worker_audit.transport = AuditTransport::Agent;
+
+        let started_at_ms = current_timestamp_ms();
+        let started = Instant::now();
+        let (response, status) = self
+            .cluster
+            .request_with_audit(node, request, Some(worker_audit))
+            .await;
+        record_request_audit(
+            self,
+            &local_request,
+            audit,
+            Some(origin_audit_id),
+            started_at_ms,
+            started.elapsed().as_millis() as u64,
+            status,
+            Some(node.to_string()),
+            &response,
+            serde_json::json!({"node": node, "remote_transport": "agent"}),
+        );
+        response
     }
 
     pub fn service_rows(&self, node: Option<&str>) -> Vec<serde_json::Value> {
@@ -736,6 +803,8 @@ fn spawn_task_scheduler(state: DaemonState) -> thread::JoinHandle<()> {
                     .lock()
                     .expect("run trigger lock")
                     .insert(key.clone(), "cron".to_string());
+                let started_at_ms = current_timestamp_ms();
+                let started = Instant::now();
                 let mut sessions = state.sessions.lock().expect("sessions lock");
                 match sessions
                     .get_mut(&key.session)
@@ -761,6 +830,23 @@ fn spawn_task_scheduler(state: DaemonState) -> thread::JoinHandle<()> {
                                 }
                             }
                         }
+                        drop(sessions);
+                        let _ = record_audit_value(
+                            &state,
+                            AuditContext::new(AuditSource::Scheduler, AuditTransport::Internal),
+                            None,
+                            "scheduler",
+                            "start",
+                            Some(&key.session),
+                            Some(&key.task),
+                            AuditStatus::Success,
+                            started_at_ms,
+                            started.elapsed().as_millis() as u64,
+                            serde_json::json!({"type":"scheduler","action":"start","session":key.session,"task":key.task}),
+                            serde_json::json!({"ok":true,"message":"scheduled task started"}),
+                            serde_json::json!({"trigger":"cron"}),
+                            Some(node_id),
+                        );
                     }
                     Some(Ok(false)) => {
                         drop(sessions);
@@ -769,10 +855,47 @@ fn spawn_task_scheduler(state: DaemonState) -> thread::JoinHandle<()> {
                             "scheduled task already running; execution skipped",
                             serde_json::json!({"session":key.session,"task":key.task}),
                         );
+                        let _ = record_audit_value(
+                            &state,
+                            AuditContext::new(AuditSource::Scheduler, AuditTransport::Internal),
+                            None,
+                            "scheduler",
+                            "start",
+                            Some(&key.session),
+                            Some(&key.task),
+                            AuditStatus::Success,
+                            started_at_ms,
+                            started.elapsed().as_millis() as u64,
+                            serde_json::json!({"type":"scheduler","action":"start","session":key.session,"task":key.task}),
+                            serde_json::json!({"ok":true,"message":"scheduled task already running; execution skipped"}),
+                            serde_json::json!({"trigger":"cron","skipped":true}),
+                            None,
+                        );
                     }
                     Some(Err(error)) => {
+                        let error_message = error.to_string();
                         drop(sessions);
-                        let _=state.store.record_event("scheduler","scheduled task failed to start",serde_json::json!({"session":key.session,"task":key.task,"error":error.to_string()}));
+                        let _ = state.store.record_event(
+                            "scheduler",
+                            "scheduled task failed to start",
+                            serde_json::json!({"session":key.session,"task":key.task,"error":error_message}),
+                        );
+                        let _ = record_audit_value(
+                            &state,
+                            AuditContext::new(AuditSource::Scheduler, AuditTransport::Internal),
+                            None,
+                            "scheduler",
+                            "start",
+                            Some(&key.session),
+                            Some(&key.task),
+                            AuditStatus::Error,
+                            started_at_ms,
+                            started.elapsed().as_millis() as u64,
+                            serde_json::json!({"type":"scheduler","action":"start","session":key.session,"task":key.task}),
+                            serde_json::json!({"ok":false,"message":error_message}),
+                            serde_json::json!({"trigger":"cron"}),
+                            None,
+                        );
                     }
                     None => {}
                 }
@@ -1253,8 +1376,13 @@ where
     let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
-        let response = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => dispatch_async(state.clone(), request).await,
+        let response = match Envelope::parse_line(&line) {
+            Ok(envelope) => match envelope.audit {
+                Some(audit) => {
+                    dispatch_async_with_audit(state.clone(), envelope.request, Some(audit)).await
+                }
+                None => dispatch_async(state.clone(), envelope.request).await,
+            },
             Err(error) => Response::error(format!("invalid request: {error}")),
         };
         let mut payload = serde_json::to_vec(&response)?;
@@ -1265,17 +1393,173 @@ where
 }
 
 pub async fn dispatch_async(state: DaemonState, request: Request) -> Response {
-    match tokio::task::spawn_blocking(move || dispatch(&state, request)).await {
+    dispatch_async_with_audit(state, request, None).await
+}
+
+pub async fn dispatch_async_with_audit(
+    state: DaemonState,
+    request: Request,
+    audit: Option<AuditContext>,
+) -> Response {
+    match tokio::task::spawn_blocking(move || dispatch_with_audit(&state, request, audit)).await {
         Ok(response) => response,
         Err(error) => Response::error(format!("request worker failed: {error}")),
     }
 }
 
+#[cfg(test)]
 fn dispatch(state: &DaemonState, request: Request) -> Response {
-    let result = handle(state, request);
-    match result {
+    dispatch_with_audit(state, request, None)
+}
+
+fn dispatch_with_audit(
+    state: &DaemonState,
+    request: Request,
+    audit: Option<AuditContext>,
+) -> Response {
+    let context = audit
+        .unwrap_or_else(AuditContext::internal)
+        .with_request_defaults(&request);
+    let started_at_ms = current_timestamp_ms();
+    let started = Instant::now();
+    let result = handle(state, request.clone());
+    let response = match result {
         Ok(response) => response,
         Err(error) => Response::error(format!("{error:#}")),
+    };
+    let status = AuditStatus::from_ok(response.ok);
+    let executor_node_id = state
+        .store
+        .node_settings()
+        .ok()
+        .map(|settings| settings.node_id);
+    record_request_audit(
+        state,
+        &request,
+        context,
+        None,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+        status,
+        executor_node_id,
+        &response,
+        serde_json::json!({}),
+    );
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn record_audit_value(
+    state: &DaemonState,
+    context: AuditContext,
+    audit_id: Option<String>,
+    request_kind: &str,
+    operation: &str,
+    session: Option<&str>,
+    task: Option<&str>,
+    status: AuditStatus,
+    started_at_ms: u64,
+    duration_ms: u64,
+    request: serde_json::Value,
+    response: serde_json::Value,
+    details: serde_json::Value,
+    executor_node_id: Option<String>,
+) -> Result<AuditRecord> {
+    let settings = state.store.node_settings()?;
+    let mut context = context;
+    if context.origin_node_id.is_none() {
+        context.origin_node_id = Some(settings.node_id.clone());
+    }
+    let success = matches!(status, AuditStatus::Success | AuditStatus::Started);
+    let error = (!success)
+        .then(|| {
+            response
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("request failed")
+        })
+        .map(truncate_error_summary);
+    let replicated_at_ms = if settings.role == NodeRole::Worker {
+        None
+    } else {
+        Some(current_timestamp_ms())
+    };
+    state.store.record_audit(AuditRecord {
+        audit_id: audit_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        correlation_id: context.correlation_id,
+        timestamp_ms: started_at_ms,
+        duration_ms,
+        source: context.source,
+        transport: context.transport,
+        origin_node_id: context.origin_node_id,
+        executor_node_id: executor_node_id.or(Some(settings.node_id)),
+        request_kind: request_kind.to_string(),
+        operation: operation.to_string(),
+        session: session.map(str::to_string).or(context.session),
+        task: task.map(str::to_string).or(context.task),
+        status,
+        success,
+        error,
+        request,
+        response,
+        details,
+        replicated_at_ms,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_request_audit(
+    state: &DaemonState,
+    request: &Request,
+    context: AuditContext,
+    audit_id: Option<String>,
+    started_at_ms: u64,
+    duration_ms: u64,
+    status: AuditStatus,
+    executor_node_id: Option<String>,
+    response: &Response,
+    mut details: serde_json::Value,
+) {
+    if let Some(origin_audit_id) = context.origin_audit_id.as_deref() {
+        if let Some(object) = details.as_object_mut() {
+            object.insert(
+                "origin_audit_id".to_string(),
+                serde_json::Value::String(origin_audit_id.to_string()),
+            );
+        }
+    }
+    let request_value = serde_json::to_value(request).unwrap_or_else(|error| {
+        serde_json::json!({"serialization_error": error.to_string(), "kind": request.kind()})
+    });
+    let response_value = serde_json::to_value(response).unwrap_or_else(
+        |error| serde_json::json!({"serialization_error": error.to_string(), "ok": response.ok}),
+    );
+    if let Err(error) = record_audit_value(
+        state,
+        context,
+        audit_id,
+        request.kind(),
+        &request.operation(),
+        request.session(),
+        request.task(),
+        status,
+        started_at_ms,
+        duration_ms,
+        request_value,
+        response_value,
+        details,
+        executor_node_id,
+    ) {
+        eprintln!("failed to persist audit record: {error:#}");
+    }
+}
+
+fn truncate_error_summary(message: &str) -> String {
+    const LIMIT: usize = 512;
+    if message.len() <= LIMIT {
+        message.to_string()
+    } else {
+        format!("{}...", message.chars().take(LIMIT).collect::<String>())
     }
 }
 
@@ -1650,7 +1934,7 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
             let runtime = sessions
                 .get_mut(&session)
                 .with_context(|| format!("session '{session}' not found"))?;
-            let effects = runtime.apply(task.as_deref(), action.clone())?;
+            let effects = runtime.apply(task.as_deref(), action)?;
             let timestamp_ms = current_timestamp_ms();
             let mut metrics = state.task_metrics.lock().expect("task metrics lock");
             for effect in effects.iter().filter(|effect| effect.restarted) {
@@ -1748,7 +2032,12 @@ fn reject_unavailable_session(state: &DaemonState, session: &str) -> Result<()> 
 }
 
 pub async fn request(request: &Request) -> Result<Response> {
+    request_from(request, AuditSource::Cli).await
+}
+
+pub async fn request_from(request: &Request, source: AuditSource) -> Result<Response> {
     let paths = GlobalPaths::discover()?;
+    let audit = client_audit_context(&paths, request, source);
     #[cfg(unix)]
     let stream = UnixStream::connect(&paths.socket)
         .await
@@ -1767,15 +2056,28 @@ pub async fn request(request: &Request) -> Result<Response> {
             }
         }
     };
-    request_on_stream(request, stream).await
+    request_on_stream(request, audit, stream).await
 }
 
-async fn request_on_stream<S>(request: &Request, stream: S) -> Result<Response>
+fn client_audit_context(
+    paths: &GlobalPaths,
+    request: &Request,
+    source: AuditSource,
+) -> AuditContext {
+    let mut audit = AuditContext::new(source, AuditTransport::Ipc).with_request_defaults(request);
+    if let Ok(settings) = StateStore::open(&paths.root).and_then(|store| store.node_settings()) {
+        audit.origin_node_id = Some(settings.node_id);
+    }
+    audit
+}
+
+async fn request_on_stream<S>(request: &Request, audit: AuditContext, stream: S) -> Result<Response>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (reader, mut writer) = tokio::io::split(stream);
-    let mut payload = serde_json::to_vec(request)?;
+    let envelope = Envelope::new(request.clone(), audit);
+    let mut payload = serde_json::to_vec(&envelope)?;
     payload.push(b'\n');
     writer.write_all(&payload).await?;
     let mut lines = BufReader::new(reader).lines();
@@ -1839,6 +2141,153 @@ mod tests {
             request: json!({"method": "tools/call"}),
             response: json!({"result": {"isError": false}}),
         }
+    }
+
+    #[test]
+    fn dispatch_with_audit_records_success_and_error_sources() {
+        let state = DaemonState::new();
+        let cli_context =
+            AuditContext::new(AuditSource::Cli, AuditTransport::Ipc).with_origin_node("cli-origin");
+        let response = dispatch_with_audit(&state, Request::Ping, Some(cli_context));
+        assert!(response.ok);
+
+        let page = state
+            .store
+            .list_audit(&crate::protocol::AuditFilter {
+                q: None,
+                source: Some("cli".to_string()),
+                status: Some("success".to_string()),
+                node: Some("cli-origin".to_string()),
+                session: None,
+                task: None,
+                operation: Some("ping".to_string()),
+                page: 1,
+                page_size: 20,
+            })
+            .unwrap();
+        assert_eq!(page.total, 1);
+        let success = state
+            .store
+            .audit_detail(&page.items[0].audit_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(success.source, AuditSource::Cli);
+        assert_eq!(success.transport, AuditTransport::Ipc);
+        assert_eq!(success.origin_node_id.as_deref(), Some("cli-origin"));
+        assert!(success.executor_node_id.is_some());
+
+        let response = dispatch_with_audit(
+            &state,
+            Request::Snapshot {
+                session: "missing".to_string(),
+                tail: None,
+            },
+            Some(AuditContext::new(AuditSource::Tui, AuditTransport::Ipc)),
+        );
+        assert!(!response.ok);
+        let errors = state
+            .store
+            .list_audit(&crate::protocol::AuditFilter {
+                q: Some("session 'missing'".to_string()),
+                source: Some("tui".to_string()),
+                status: Some("error".to_string()),
+                node: None,
+                session: Some("missing".to_string()),
+                task: None,
+                operation: Some("snapshot".to_string()),
+                page: 1,
+                page_size: 20,
+            })
+            .unwrap();
+        assert_eq!(errors.total, 1);
+        assert!(
+            errors.items[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_node_compatibility_wrapper_still_audits_failures() {
+        let state = DaemonState::new();
+        let response = state
+            .dispatch_node(
+                "remote-on-worker",
+                crate::cluster::RemoteRequest::ListSessions,
+            )
+            .await;
+        assert!(!response.ok);
+        let page = state
+            .store
+            .list_audit(&crate::protocol::AuditFilter {
+                q: Some("worker nodes can only control".to_string()),
+                source: Some("internal".to_string()),
+                status: Some("error".to_string()),
+                node: None,
+                session: None,
+                task: None,
+                operation: Some("list_sessions".to_string()),
+                page: 1,
+                page_size: 20,
+            })
+            .unwrap();
+        assert_eq!(page.total, 1);
+        let detail = state
+            .store
+            .audit_detail(&page.items[0].audit_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.details["node"], "remote-on-worker");
+    }
+
+    #[tokio::test]
+    async fn leader_remote_worker_failures_are_audited_with_requested_executor() {
+        let state = DaemonState::new();
+        let settings = state
+            .store
+            .configure(crate::state::NodeSettingsUpdate {
+                role: Some(crate::state::NodeRole::Leader),
+                ..crate::state::NodeSettingsUpdate::default()
+            })
+            .unwrap();
+        *state.settings.lock().expect("node settings lock") = settings.clone();
+        let response = state
+            .dispatch_node_with_audit(
+                "missing-worker",
+                crate::cluster::RemoteRequest::ListSessions,
+                AuditContext::new(AuditSource::Web, AuditTransport::Http),
+            )
+            .await;
+        assert!(!response.ok);
+
+        let page = state
+            .store
+            .list_audit(&crate::protocol::AuditFilter {
+                q: Some("worker 'missing-worker' not found".to_string()),
+                source: Some("web".to_string()),
+                status: Some("error".to_string()),
+                node: Some("missing-worker".to_string()),
+                session: None,
+                task: None,
+                operation: Some("list_sessions".to_string()),
+                page: 1,
+                page_size: 20,
+            })
+            .unwrap();
+        assert_eq!(page.total, 1);
+        let detail = state
+            .store
+            .audit_detail(&page.items[0].audit_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            detail.origin_node_id.as_deref(),
+            Some(settings.node_id.as_str())
+        );
+        assert_eq!(detail.executor_node_id.as_deref(), Some("missing-worker"));
+        assert_eq!(detail.source, AuditSource::Web);
     }
 
     #[test]

@@ -15,7 +15,7 @@ pub enum TaskStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
     Start,
@@ -23,6 +23,24 @@ pub enum Action {
     Restart,
     Pause,
     Resume,
+}
+
+impl Action {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+        }
+    }
+}
+
+impl std::fmt::Display for Action {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -473,6 +491,475 @@ pub fn casefold_search_text(value: &str) -> String {
     value.case_fold().collect()
 }
 
+pub const AUDIT_PAYLOAD_LIMIT_BYTES: usize = 64 * 1024;
+pub const REDACTED_VALUE: &str = "[REDACTED]";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditSource {
+    Cli,
+    Tui,
+    Web,
+    Mcp,
+    Scheduler,
+    Internal,
+}
+
+impl AuditSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Tui => "tui",
+            Self::Web => "web",
+            Self::Mcp => "mcp",
+            Self::Scheduler => "scheduler",
+            Self::Internal => "internal",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        let normalized = value.trim().replace('-', "_").to_ascii_lowercase();
+        match normalized.as_str() {
+            "cli" => Some(Self::Cli),
+            "tui" => Some(Self::Tui),
+            "web" => Some(Self::Web),
+            "mcp" => Some(Self::Mcp),
+            "scheduler" => Some(Self::Scheduler),
+            "internal" => Some(Self::Internal),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditStatus {
+    Started,
+    Success,
+    Error,
+    Timeout,
+}
+
+impl AuditStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Success => "success",
+            Self::Error => "error",
+            Self::Timeout => "timeout",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        let normalized = value.trim().replace('-', "_").to_ascii_lowercase();
+        match normalized.as_str() {
+            "started" => Some(Self::Started),
+            "success" => Some(Self::Success),
+            "error" => Some(Self::Error),
+            "timeout" => Some(Self::Timeout),
+            _ => None,
+        }
+    }
+
+    pub fn from_ok(ok: bool) -> Self {
+        if ok { Self::Success } else { Self::Error }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditTransport {
+    Ipc,
+    Http,
+    Mcp,
+    Agent,
+    Internal,
+}
+
+impl AuditTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ipc => "ipc",
+            Self::Http => "http",
+            Self::Mcp => "mcp",
+            Self::Agent => "agent",
+            Self::Internal => "internal",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        let normalized = value.trim().replace('-', "_").to_ascii_lowercase();
+        match normalized.as_str() {
+            "ipc" => Some(Self::Ipc),
+            "http" => Some(Self::Http),
+            "mcp" => Some(Self::Mcp),
+            "agent" => Some(Self::Agent),
+            "internal" => Some(Self::Internal),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditContext {
+    pub correlation_id: String,
+    pub source: AuditSource,
+    pub transport: AuditTransport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_audit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+
+impl AuditContext {
+    pub fn new(source: AuditSource, transport: AuditTransport) -> Self {
+        Self {
+            correlation_id: uuid::Uuid::new_v4().to_string(),
+            source,
+            transport,
+            origin_node_id: None,
+            origin_audit_id: None,
+            session: None,
+            task: None,
+            action: None,
+        }
+    }
+
+    pub fn with_origin_node(mut self, node_id: impl Into<String>) -> Self {
+        self.origin_node_id = Some(node_id.into());
+        self
+    }
+
+    pub fn with_request_defaults(mut self, request: &Request) -> Self {
+        if self.session.is_none() {
+            self.session = request.session().map(str::to_string);
+        }
+        if self.task.is_none() {
+            self.task = request.task().map(str::to_string);
+        }
+        if self.action.is_none() {
+            self.action = Some(request.operation());
+        }
+        self
+    }
+
+    pub fn internal() -> Self {
+        Self::new(AuditSource::Internal, AuditTransport::Internal)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Envelope {
+    pub request: Request,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit: Option<AuditContext>,
+}
+
+impl Envelope {
+    pub fn new(request: Request, audit: AuditContext) -> Self {
+        Self {
+            request,
+            audit: Some(audit),
+        }
+    }
+
+    pub fn parse_line(line: &str) -> Result<Self, String> {
+        if let Ok(envelope) = serde_json::from_str::<Envelope>(line) {
+            return Ok(envelope);
+        }
+        match serde_json::from_str::<Request>(line) {
+            Ok(request) => Ok(Self {
+                request,
+                audit: None,
+            }),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AuditRecord {
+    pub audit_id: String,
+    pub correlation_id: String,
+    pub timestamp_ms: u64,
+    pub duration_ms: u64,
+    pub source: AuditSource,
+    pub transport: AuditTransport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_node_id: Option<String>,
+    pub request_kind: String,
+    pub operation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    pub status: AuditStatus,
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub request: Value,
+    #[serde(default)]
+    pub response: Value,
+    #[serde(default)]
+    pub details: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicated_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AuditListItem {
+    pub audit_id: String,
+    pub correlation_id: String,
+    pub timestamp_ms: u64,
+    pub duration_ms: u64,
+    pub source: AuditSource,
+    pub transport: AuditTransport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_node_id: Option<String>,
+    pub request_kind: String,
+    pub operation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    pub status: AuditStatus,
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicated_at_ms: Option<u64>,
+}
+
+impl From<&AuditRecord> for AuditListItem {
+    fn from(record: &AuditRecord) -> Self {
+        Self {
+            audit_id: record.audit_id.clone(),
+            correlation_id: record.correlation_id.clone(),
+            timestamp_ms: record.timestamp_ms,
+            duration_ms: record.duration_ms,
+            source: record.source,
+            transport: record.transport,
+            origin_node_id: record.origin_node_id.clone(),
+            executor_node_id: record.executor_node_id.clone(),
+            request_kind: record.request_kind.clone(),
+            operation: record.operation.clone(),
+            session: record.session.clone(),
+            task: record.task.clone(),
+            status: record.status,
+            success: record.success,
+            error: record.error.clone(),
+            replicated_at_ms: record.replicated_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditFilter {
+    pub q: Option<String>,
+    pub source: Option<String>,
+    pub status: Option<String>,
+    pub node: Option<String>,
+    pub session: Option<String>,
+    pub task: Option<String>,
+    pub operation: Option<String>,
+    pub page: usize,
+    pub page_size: usize,
+}
+
+impl AuditFilter {
+    pub fn parse(
+        query: &std::collections::HashMap<String, String>,
+    ) -> std::result::Result<Self, Response> {
+        let optional = |key: &str| {
+            query
+                .get(key)
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        let source = match optional("source").as_deref() {
+            None | Some("all") => None,
+            Some(value) => Some(
+                AuditSource::parse(value)
+                    .ok_or_else(|| {
+                        Response::error_with_data(
+                            "invalid source",
+                            serde_json::json!({"kind": "validation_error", "status": 400}),
+                        )
+                    })?
+                    .as_str()
+                    .to_string(),
+            ),
+        };
+        let status = match optional("status").as_deref() {
+            None | Some("all") => None,
+            Some(value) => Some(
+                AuditStatus::parse(value)
+                    .ok_or_else(|| {
+                        Response::error_with_data(
+                            "invalid status",
+                            serde_json::json!({"kind": "validation_error", "status": 400}),
+                        )
+                    })?
+                    .as_str()
+                    .to_string(),
+            ),
+        };
+        Ok(Self {
+            q: optional("q"),
+            source,
+            status,
+            node: optional("node"),
+            session: optional("session"),
+            task: optional("task"),
+            operation: optional("operation"),
+            page: parse_positive_usize(query, "page", 1)?,
+            page_size: parse_history_page_size(query)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditListPage {
+    pub items: Vec<AuditListItem>,
+    pub page: usize,
+    pub page_size: usize,
+    pub total: usize,
+    pub total_pages: usize,
+    pub has_next: bool,
+    pub has_previous: bool,
+}
+
+fn sensitive_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .map(|ch| if ch == '-' { '_' } else { ch })
+        .collect::<String>()
+        .to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "token"
+            | "password"
+            | "secret"
+            | "api_key"
+            | "apikey"
+            | "authorization"
+            | "cookie"
+            | "credential"
+            | "credentials"
+            | "access_key"
+            | "accesskey"
+            | "private_key"
+            | "privatekey"
+            | "enrollment_token"
+    ) || normalized.ends_with("_token")
+        || normalized.ends_with("_secret")
+        || normalized.ends_with("_password")
+        || normalized.ends_with("_key")
+}
+
+pub fn redact_json(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, nested)| {
+                    let redacted = if sensitive_key(key) {
+                        Value::String(REDACTED_VALUE.to_string())
+                    } else {
+                        redact_json(nested)
+                    };
+                    (key.clone(), redacted)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(redact_json).collect()),
+        other => other.clone(),
+    }
+}
+
+pub fn truncate_json(value: Value, limit: usize) -> Value {
+    let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string());
+    if serialized.len() <= limit {
+        return value;
+    }
+    serde_json::json!({
+        "truncated": true,
+        "original_bytes": serialized.len(),
+        "preview": serialized.chars().take(256).collect::<String>(),
+    })
+}
+
+pub fn sanitize_audit_value(value: &Value) -> Value {
+    truncate_json(redact_json(value), AUDIT_PAYLOAD_LIMIT_BYTES)
+}
+
+impl Request {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Ping => "ping",
+            Self::ListTaskRuns { .. } => "list_task_runs",
+            Self::ListEvents { .. } => "list_events",
+            Self::Register { .. } => "register",
+            Self::Update { .. } => "update",
+            Self::ListSessions => "list_sessions",
+            Self::Snapshot { .. } => "snapshot",
+            Self::TaskLogs { .. } => "task_logs",
+            Self::TaskMetrics { .. } => "task_metrics",
+            Self::ClearTaskHistory { .. } => "clear_task_history",
+            Self::GetSessionConfig { .. } => "get_session_config",
+            Self::PutSessionConfig { .. } => "put_session_config",
+            Self::Action { .. } => "action",
+            Self::RemoveSession { .. } => "remove_session",
+            Self::Shutdown => "shutdown",
+        }
+    }
+
+    pub fn operation(&self) -> String {
+        match self {
+            Self::Action { action, .. } => action.as_str().to_string(),
+            other => other.kind().to_string(),
+        }
+    }
+
+    pub fn session(&self) -> Option<&str> {
+        match self {
+            Self::Register { session, .. } | Self::Update { session, .. } => session.as_deref(),
+            Self::Snapshot { session, .. }
+            | Self::TaskLogs { session, .. }
+            | Self::TaskMetrics { session, .. }
+            | Self::ClearTaskHistory { session, .. }
+            | Self::GetSessionConfig { session, .. }
+            | Self::PutSessionConfig { session, .. }
+            | Self::Action { session, .. }
+            | Self::RemoveSession { session } => Some(session.as_str()),
+            Self::ListTaskRuns { filter } => filter.session.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn task(&self) -> Option<&str> {
+        match self {
+            Self::TaskLogs { task, .. }
+            | Self::TaskMetrics { task, .. }
+            | Self::ClearTaskHistory { task, .. } => Some(task.as_str()),
+            Self::Action { task, .. } => task.as_deref(),
+            Self::ListTaskRuns { filter } => filter.task.as_deref(),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
@@ -576,7 +1063,11 @@ impl Response {
 
 #[cfg(test)]
 mod tests {
-    use super::casefold_search_text;
+    use super::{
+        AuditSource, AuditTransport, Envelope, Request, casefold_search_text, redact_json,
+        sanitize_audit_value,
+    };
+    use serde_json::json;
 
     #[test]
     fn casefold_search_text_matches_expanding_equivalents() {
@@ -589,5 +1080,41 @@ mod tests {
     #[test]
     fn casefold_search_text_matches_sigma_and_final_sigma() {
         assert_eq!(casefold_search_text("οσ"), casefold_search_text("ος"));
+    }
+
+    #[test]
+    fn envelope_parses_bare_request_and_wrapped_request() {
+        let bare = r#"{"type":"ping"}"#;
+        let parsed = Envelope::parse_line(bare).unwrap();
+        assert!(matches!(parsed.request, Request::Ping));
+        assert!(parsed.audit.is_none());
+
+        let wrapped = serde_json::to_string(&Envelope::new(
+            Request::ListSessions,
+            super::AuditContext::new(AuditSource::Cli, AuditTransport::Ipc),
+        ))
+        .unwrap();
+        let parsed = Envelope::parse_line(&wrapped).unwrap();
+        assert!(matches!(parsed.request, Request::ListSessions));
+        assert_eq!(parsed.audit.unwrap().source, AuditSource::Cli);
+    }
+
+    #[test]
+    fn redacts_nested_sensitive_fields_and_truncates_large_payloads() {
+        let value = json!({
+            "token": "secret-value",
+            "nested": {"api_key": "abc", "ok": true},
+            "items": [{"password": "p", "name": "keep"}]
+        });
+        let redacted = redact_json(&value);
+        assert_eq!(redacted["token"], "[REDACTED]");
+        assert_eq!(redacted["nested"]["api_key"], "[REDACTED]");
+        assert_eq!(redacted["items"][0]["password"], "[REDACTED]");
+        assert_eq!(redacted["items"][0]["name"], "keep");
+
+        let huge = json!({"blob": "x".repeat(70_000)});
+        let sanitized = sanitize_audit_value(&huge);
+        assert_eq!(sanitized["truncated"], true);
+        assert!(sanitized["original_bytes"].as_u64().unwrap() > 64_000);
     }
 }

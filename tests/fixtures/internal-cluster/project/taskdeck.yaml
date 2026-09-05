@@ -1,0 +1,41 @@
+version: 1
+session: cluster-lab
+
+task_order:
+  - ticker
+  - marker
+  - oneshot
+
+tasks:
+  ticker:
+    command: /bin/sh
+    args:
+      - -c
+      - |
+        i=0
+        while true; do
+          i=$((i + 1))
+          printf 'tick %s\n' "$i"
+          sleep 0.2
+        done
+    auto_start: false
+    stop_timeout_ms: 1000
+    clear_logs_on_restart: true
+
+  marker:
+    command: /bin/sh
+    args:
+      - -c
+      - |
+        printf 'marker-ready\n'
+        printf 'secret=not-a-token\n'
+        sleep 2
+        printf 'marker-done\n'
+    auto_start: false
+    stop_timeout_ms: 1000
+
+  oneshot:
+    command: /bin/echo
+    args: [cluster-lab-ready]
+    auto_start: false
+    stop_timeout_ms: 500

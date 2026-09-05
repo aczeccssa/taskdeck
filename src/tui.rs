@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 
 use crate::daemon;
 use crate::protocol::{
-    Action, LogLine, Request, Response, SessionSnapshot, TaskLogsSnapshot, TaskStatus,
+    Action, AuditSource, LogLine, Request, Response, SessionSnapshot, TaskLogsSnapshot, TaskStatus,
 };
 
 const LOG_CACHE_LIMIT: usize = 1_000;
@@ -174,10 +174,13 @@ enum RefreshResult {
 }
 
 pub async fn run(project: &Path, requested_session: Option<String>) -> Result<()> {
-    let register = daemon::request(&Request::Register {
-        project: project.to_path_buf(),
-        session: requested_session,
-    })
+    let register = daemon::request_from(
+        &Request::Register {
+            project: project.to_path_buf(),
+            session: requested_session,
+        },
+        AuditSource::Tui,
+    )
     .await?;
     if !register.ok {
         bail!(register.message);
@@ -292,9 +295,12 @@ pub async fn run(project: &Path, requested_session: Option<String>) -> Result<()
 }
 
 async fn timed_request(request: Request) -> Result<Response> {
-    tokio::time::timeout(REQUEST_TIMEOUT, daemon::request(&request))
-        .await
-        .context("daemon request timed out")?
+    tokio::time::timeout(
+        REQUEST_TIMEOUT,
+        daemon::request_from(&request, AuditSource::Tui),
+    )
+    .await
+    .context("daemon request timed out")?
 }
 
 fn handle_key(
