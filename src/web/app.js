@@ -42,6 +42,15 @@ const state = {
   callPage: { page: 1, page_size: 20, total: 0, total_pages: 0, has_next: false, has_previous: false },
   callFilters: { q: "", operation: "", status: "all", session: "", task: "", page: 1, pageSize: 20 },
   callsDebounce: null,
+  auditRequest: 0,
+  auditDetailRequest: 0,
+  auditDetailId: null,
+  auditDetailMode: "summary",
+  audits: [],
+  auditSignature: "",
+  auditPage: { page: 1, page_size: 20, total: 0, total_pages: 0, has_next: false, has_previous: false },
+  auditFilters: { q: "", source: "all", status: "all", node: "", session: "", task: "", operation: "", page: 1, pageSize: 20 },
+  auditDebounce: null,
   config: null,
   configSession: null,
   configNode: null,
@@ -163,8 +172,9 @@ function setView(view) {
   });
   $("#sessions").hidden = view !== "tasks";
   $("#nodes").hidden = view !== "tasks";
-  $("#page-title").textContent = view === "calls" ? "MCP Calls" : view === "runs" ? "Task Runs" : view === "docs" ? "MCP Guide" : "Task workspace";
+  $("#page-title").textContent = view === "calls" ? "MCP Calls" : view === "audit" ? "Audit Log" : view === "runs" ? "Task Runs" : view === "docs" ? "MCP Guide" : "Task workspace";
   if (view === "calls") loadMcpCalls();
+  if (view === "audit") loadAudit();
   if (view === "runs") loadRuns().catch((error) => showToast(error.message || "Unable to load runs"));
   updateMeta();
 }
@@ -217,6 +227,8 @@ function updateMeta() {
   const meta = $("#meta");
   if (state.view === "calls") {
     meta.textContent = `${state.callPage.total || 0} retained call${state.callPage.total === 1 ? "" : "s"}`;
+  } else if (state.view === "audit") {
+    meta.textContent = `${state.auditPage.total || 0} audit record${state.auditPage.total === 1 ? "" : "s"}`;
   } else if (state.view === "runs") {
     meta.textContent = `${state.runPage.total||0} run${(state.runPage.total||0)===1?"":"s"}`;
   } else if (state.view === "docs") {
@@ -1130,6 +1142,161 @@ function closeCallDetails() {
   if ($("#call-dialog").open) $("#call-dialog").close();
 }
 
+function auditQuery() {
+  const filters = state.auditFilters;
+  const query = new URLSearchParams({ page: String(filters.page), page_size: String(filters.pageSize) });
+  if (filters.q) query.set("q", filters.q);
+  if (filters.source && filters.source !== "all") query.set("source", filters.source);
+  if (filters.status && filters.status !== "all") query.set("status", filters.status);
+  if (filters.node) query.set("node", filters.node);
+  if (filters.session) query.set("session", filters.session);
+  if (filters.task) query.set("task", filters.task);
+  if (filters.operation) query.set("operation", filters.operation);
+  return query.toString();
+}
+
+async function loadAudit() {
+  const query = auditQuery();
+  const requestId = ++state.auditRequest;
+  if (!state.audits.length) {
+    $("#audit-summary").textContent = "Loading audit records...";
+    $("#audit-body").innerHTML = '<tr class="empty-row loading-row"><td colspan="9">Loading audit records...</td></tr>';
+  }
+  try {
+    const response = await requestJson(`/api/audit?${query}`);
+    if (requestId !== state.auditRequest || query !== auditQuery()) return;
+    if (!response.ok) throw new Error(response.message);
+    state.auditPage = response.data || state.auditPage;
+    state.audits = state.auditPage.items || [];
+    renderAudit();
+    updateMeta();
+  } catch (error) {
+    if (requestId === state.auditRequest) {
+      const message = error.message || "Audit log unavailable";
+      $("#audit-summary").textContent = message;
+      $("#audit-body").innerHTML = `<tr class="empty-row error-row"><td colspan="9">${escapeHtml(message)}</td></tr>`;
+      $("#audit-page-label").textContent = "Page 0 of 0";
+      $("#audit-prev").disabled = true;
+      $("#audit-next").disabled = true;
+    }
+  }
+}
+
+function renderAudit() {
+  const body = $("#audit-body");
+  const signature = JSON.stringify(state.audits.map((record) => [record.audit_id, record.status, record.duration_ms, record.replicated_at_ms]));
+  if (signature !== state.auditSignature) {
+    state.auditSignature = signature;
+    const focused = document.activeElement?.closest?.("[data-audit-id]")?.dataset.auditId;
+    body.innerHTML = state.audits.length ? state.audits.map((record) => {
+      const target = auditTarget(record);
+      const node = auditNode(record);
+      return `<tr><td>${escapeHtml(new Date(record.timestamp_ms).toLocaleString())}</td><td><span class="source-pill">${escapeHtml(String(record.source || "unknown").toUpperCase())}</span></td><td><div class="cell-stack"><strong>${escapeHtml(node.primary)}</strong><span>${escapeHtml(node.secondary)}</span></div></td><td><div class="cell-stack"><strong>${escapeHtml(titleCase(record.operation || record.request_kind || "request"))}</strong><span>${escapeHtml(record.request_kind || "request")}</span></div></td><td><div class="cell-stack"><strong>${escapeHtml(target.primary)}</strong><span>${escapeHtml(target.secondary)}</span></div></td><td><span class="status-pill ${auditStatusClass(record.status)}">${escapeHtml(titleCase(record.status || "unknown"))}</span></td><td>${Number(record.duration_ms || 0)} ms</td><td>${escapeHtml(auditSyncLabel(record))}</td><td><button class="button compact" type="button" data-audit-id="${escapeAttr(record.audit_id)}">View</button></td></tr>`;
+    }).join("") : '<tr class="empty-row"><td colspan="9">No matching audit records.</td></tr>';
+    if (focused) $(`[data-audit-id="${CSS.escape(focused)}"]`, body)?.focus();
+  }
+  $("#audit-summary").textContent = `${state.auditPage.total || 0} retained audit record${state.auditPage.total === 1 ? "" : "s"}`;
+  $("#audit-page-label").textContent = state.auditPage.total_pages ? `Page ${state.auditPage.page} of ${state.auditPage.total_pages}` : "Page 0 of 0";
+  $("#audit-prev").disabled = !state.auditPage.has_previous;
+  $("#audit-next").disabled = !state.auditPage.has_next;
+}
+
+function auditStatusClass(status) {
+  if (status === "error" || status === "timeout") return "error";
+  if (status === "started") return "paused";
+  return "success";
+}
+
+function auditNode(record) {
+  const origin = record.origin_node_id || "unknown";
+  const executor = record.executor_node_id || "unknown";
+  if (origin === executor) return { primary: executor, secondary: "origin + executor" };
+  return { primary: executor, secondary: `from ${origin}` };
+}
+
+function auditTarget(record) {
+  if (record.task) return { primary: record.task, secondary: record.session || "Task" };
+  if (record.session) return { primary: record.session, secondary: "Session" };
+  return { primary: record.operation || record.request_kind || "Request", secondary: record.correlation_id || "No target" };
+}
+
+function auditSyncLabel(record) {
+  if (record.replicated_at_ms) return `Synced ${new Date(record.replicated_at_ms).toLocaleTimeString()}`;
+  if (record.transport === "agent") return "Awaiting ack";
+  return "Local pending";
+}
+
+function scheduleAuditReload() {
+  clearTimeout(state.auditDebounce);
+  state.auditDebounce = setTimeout(() => {
+    state.auditFilters.page = 1;
+    loadAudit();
+  }, 200);
+}
+
+async function openAuditDetails(id) {
+  const targetId = String(id);
+  const requestId = ++state.auditDetailRequest;
+  state.auditDetailId = targetId;
+  try {
+    const response = await requestJson(`/api/audit/${encodeURIComponent(id)}`);
+    if (requestId !== state.auditDetailRequest || state.auditDetailId !== targetId || state.view !== "audit") return;
+    if (!response.ok) throw new Error(response.message);
+    const record = response.data;
+    if (String(record.audit_id) !== targetId) throw new Error("Audit detail response did not match the requested record");
+    const target = auditTarget(record);
+    const node = auditNode(record);
+    $("#audit-dialog-title").textContent = `${titleCase(record.operation || record.request_kind || "Request")} audit`;
+    $("#audit-dialog-subtitle").textContent = `${String(record.source || "unknown").toUpperCase()} · ${record.audit_id}`;
+    const icon = $("#audit-detail-status-icon");
+    icon.classList.toggle("error", !record.success);
+    icon.innerHTML = record.success ? '<svg viewBox="0 0 24 24"><path d="m7.5 12 3 3 6-7"/></svg>' : '<svg viewBox="0 0 24 24"><path d="m8 8 8 8m0-8-8 8"/></svg>';
+    $("#audit-overview").innerHTML = `<div class="overview-item"><span>Time</span><strong>${escapeHtml(new Date(record.timestamp_ms).toLocaleString())}</strong></div><div class="overview-item"><span>Duration</span><strong>${Number(record.duration_ms || 0)} ms</strong></div><div class="overview-item"><span>Correlation</span><strong>${escapeHtml(record.correlation_id || "-")}</strong></div><div class="overview-item"><span>Sync</span><strong>${escapeHtml(auditSyncLabel(record))}</strong></div>`;
+    $("#audit-context-fields").innerHTML = auditContextFields(record, node, target);
+    $("#audit-response-summary").innerHTML = `<div class="outcome ${record.success ? "" : "error"}"><span class="outcome-icon">${record.success ? "✓" : "×"}</span><strong>${record.success ? "Completed successfully" : titleCase(record.status || "Failed")}</strong><p>${escapeHtml(record.error || record.response?.message || "No error summary.")}</p></div>`;
+    $("#audit-request").textContent = formatCallValue(record.request);
+    $("#audit-response").textContent = formatCallValue(record.response);
+    $("#audit-details").textContent = formatCallValue(record.details);
+    setAuditDetailMode("summary");
+    if (!$("#audit-dialog").open) $("#audit-dialog").showModal();
+  } catch (error) {
+    if (requestId === state.auditDetailRequest && state.auditDetailId === targetId) showToast(error.message || "Unable to load audit record");
+  }
+}
+
+function auditContextFields(record, node, target) {
+  const fields = [
+    ["Source", titleCase(record.source || "unknown"), false],
+    ["Transport", titleCase(record.transport || "unknown"), false],
+    ["Executor node", node.primary, true],
+    ["Origin node", record.origin_node_id || "unknown", true],
+    ["Operation", titleCase(record.operation || record.request_kind || "request"), false],
+    ["Target", target.primary, true],
+  ];
+  if (record.session) fields.push(["Session", record.session, true]);
+  if (record.task) fields.push(["Task", record.task, false]);
+  if (record.error) fields.push(["Error", record.error, false]);
+  return fields.map(([label, value, mono]) => `<div class="field-row"><span class="field-label">${escapeHtml(label)}</span><strong class="field-value ${mono ? "mono" : ""}">${escapeHtml(value)}</strong></div>`).join("");
+}
+
+function setAuditDetailMode(mode) {
+  state.auditDetailMode = mode;
+  $$('[data-audit-mode]', $("#audit-dialog")).forEach((button) => {
+    const active = button.dataset.auditMode === mode;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+  });
+  $$('[data-audit-panel]', $("#audit-dialog")).forEach((panel) => {
+    panel.hidden = panel.dataset.auditPanel !== mode;
+  });
+}
+
+function closeAuditDetails() {
+  state.auditDetailRequest += 1;
+  state.auditDetailId = null;
+  if ($("#audit-dialog").open) $("#audit-dialog").close();
+}
+
 function taskToDraft(task) {
   return {
     _key: globalThis.crypto?.randomUUID?.() || `task-${Date.now()}-${Math.random()}`,
@@ -1452,14 +1619,41 @@ function bindEvents() {
   });
   $("#calls-prev").addEventListener("click", () => { if (state.callPage.has_previous) { state.callFilters.page -= 1; loadMcpCalls(); } });
   $("#calls-next").addEventListener("click", () => { if (state.callPage.has_next) { state.callFilters.page += 1; loadMcpCalls(); } });
+  $("#refresh-audit").addEventListener("click", loadAudit);
+  $("#audit-body").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-audit-id]");
+    if (button) openAuditDetails(button.dataset.auditId);
+  });
+  $("#audit-search").addEventListener("input", (event) => { state.auditFilters.q = event.target.value.trim(); scheduleAuditReload(); });
+  $("#audit-source").addEventListener("change", (event) => { state.auditFilters.source = event.target.value; scheduleAuditReload(); });
+  $("#audit-status").addEventListener("change", (event) => { state.auditFilters.status = event.target.value; scheduleAuditReload(); });
+  $("#audit-node").addEventListener("input", (event) => { state.auditFilters.node = event.target.value.trim(); scheduleAuditReload(); });
+  $("#audit-session").addEventListener("input", (event) => { state.auditFilters.session = event.target.value.trim(); scheduleAuditReload(); });
+  $("#audit-task").addEventListener("input", (event) => { state.auditFilters.task = event.target.value.trim(); scheduleAuditReload(); });
+  $("#audit-operation").addEventListener("input", (event) => { state.auditFilters.operation = event.target.value.trim(); scheduleAuditReload(); });
+  $("#audit-page-size").addEventListener("change", (event) => { state.auditFilters.pageSize = Number(event.target.value); scheduleAuditReload(); });
+  $("#clear-audit-filters").addEventListener("click", () => {
+    state.auditFilters = { q: "", source: "all", status: "all", node: "", session: "", task: "", operation: "", page: 1, pageSize: Number($("#audit-page-size").value) || 20 };
+    $("#audit-search").value = ""; $("#audit-source").value = "all"; $("#audit-status").value = "all"; $("#audit-node").value = ""; $("#audit-session").value = ""; $("#audit-task").value = ""; $("#audit-operation").value = "";
+    loadAudit();
+  });
+  $("#audit-prev").addEventListener("click", () => { if (state.auditPage.has_previous) { state.auditFilters.page -= 1; loadAudit(); } });
+  $("#audit-next").addEventListener("click", () => { if (state.auditPage.has_next) { state.auditFilters.page += 1; loadAudit(); } });
   $("#close-call-dialog").addEventListener("click", closeCallDetails);
   $("#call-dialog").addEventListener("click", (event) => {
     const mode = event.target.closest("[data-call-mode]");
     if (mode) setCallDetailMode(mode.dataset.callMode);
   });
+  $("#close-audit-dialog").addEventListener("click", closeAuditDetails);
+  $("#audit-dialog").addEventListener("click", (event) => {
+    const mode = event.target.closest("[data-audit-mode]");
+    if (mode) setAuditDetailMode(mode.dataset.auditMode);
+  });
   $("#close-config").addEventListener("click", requestCloseConfig);
   $("#call-dialog").addEventListener("click", (event) => { if (event.target === $("#call-dialog")) closeCallDetails(); });
   $("#call-dialog").addEventListener("close", () => { state.callDetailRequest += 1; state.callDetailId = null; });
+  $("#audit-dialog").addEventListener("click", (event) => { if (event.target === $("#audit-dialog")) closeAuditDetails(); });
+  $("#audit-dialog").addEventListener("close", () => { state.auditDetailRequest += 1; state.auditDetailId = null; });
   $("#config-dialog").addEventListener("click", (event) => { if (event.target === $("#config-dialog")) requestCloseConfig(); });
   $("#config-dialog").addEventListener("cancel", (event) => { event.preventDefault(); requestCloseConfig(); });
   $("#add-config-task").addEventListener("click", addConfigTask);
@@ -1571,6 +1765,8 @@ function tick() {
     loadMetrics();
   } else if (state.view === "calls") {
     loadMcpCalls();
+  } else if (state.view === "audit") {
+    loadAudit();
   } else if (state.view === "runs") {
     loadRuns().catch(() => {});
   }

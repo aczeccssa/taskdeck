@@ -754,7 +754,7 @@ impl SessionRuntime {
         let mut failures = Vec::new();
         let mut effects = Vec::new();
         for (label, runtime) in &mut self.tasks {
-            match runtime.apply(action.clone()) {
+            match runtime.apply(action) {
                 Ok((restarted, history_cleared)) => effects.push(TaskActionEffect {
                     task: label.clone(),
                     restarted,

@@ -29,6 +29,9 @@
           <button class="nav-button" type="button" data-view="calls" aria-label="MCP Calls" title="MCP Calls">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 4h8v4H8zM5 14h4m6 0h4M7 8v3h10V8M7 11v3m10-3v3"/></svg><span>MCP Calls</span>
           </button>
+          <button class="nav-button" type="button" data-view="audit" aria-label="Audit Log" title="Audit Log">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v14H5zM8 9h8M8 13h5M8 17h7"/></svg><span>Audit Log</span>
+          </button>
           <button class="nav-button" type="button" data-view="docs" aria-label="MCP Guide" title="MCP Guide">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h8l4 4v14H7zM15 3v5h4M10 12h6M10 16h6"/></svg><span>MCP Guide</span>
           </button>
@@ -81,6 +84,30 @@
           </div>
         </section>
 
+        <section class="view" id="audit-view" hidden>
+          <div class="audit-log">
+            <header class="section-heading">
+              <div><h1>Audit Log</h1><p id="audit-summary">0 retained records</p></div>
+              <button class="button" id="refresh-audit" type="button">Refresh</button>
+            </header>
+            <div class="calls-toolbar audit-toolbar" aria-label="Audit filters">
+              <label class="search-field"><span class="sr-only">Search audit log</span><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg><input id="audit-search" type="search" placeholder="Search audit" autocomplete="off"></label>
+              <select id="audit-source" aria-label="Filter by source"><option value="all">All sources</option><option value="cli">CLI</option><option value="tui">TUI</option><option value="web">Web</option><option value="mcp">MCP</option><option value="scheduler">Scheduler</option><option value="internal">Internal</option></select>
+              <select id="audit-status" aria-label="Filter by status"><option value="all">All statuses</option><option value="success">Success</option><option value="error">Error</option><option value="timeout">Timeout</option><option value="started">Started</option></select>
+              <input id="audit-node" type="text" placeholder="Node" aria-label="Filter by node">
+              <input id="audit-session" type="text" placeholder="Session" aria-label="Filter by exact session">
+              <input id="audit-task" type="text" placeholder="Task" aria-label="Filter by exact task">
+              <input id="audit-operation" type="text" placeholder="Operation" aria-label="Filter by operation">
+              <select id="audit-page-size" aria-label="Audit records per page"><option value="20">20 / page</option><option value="50">50 / page</option><option value="100">100 / page</option></select>
+              <button class="icon-button" id="clear-audit-filters" type="button" aria-label="Clear audit filters" title="Clear filters"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"/></svg></button>
+            </div>
+            <div class="calls-table-wrap audit-table-wrap">
+              <table class="calls-table audit-table"><thead><tr><th>Time</th><th>Source</th><th>Node</th><th>Operation</th><th>Target</th><th>Result</th><th>Duration</th><th>Sync</th><th></th></tr></thead><tbody id="audit-body"><tr class="empty-row"><td colspan="9">No audit records recorded.</td></tr></tbody></table>
+            </div>
+            <footer class="pager"><span id="audit-page-label">Page 0 of 0</span><div><button class="button" id="audit-prev" type="button">Previous</button><button class="button" id="audit-next" type="button">Next</button></div></footer>
+          </div>
+        </section>
+
         <section class="view" id="docs-view" hidden>
           <article class="docs">
             <header class="docs-header"><div class="eyebrow">Streamable HTTP</div><h1>MCP Guide</h1><p>Use the local endpoint to inspect and control registered sessions.</p><div class="endpoint"><i></i><code id="endpoint-label">127.0.0.1:9837/mcp</code></div></header>
@@ -115,6 +142,21 @@
             <section class="detail-section"><header><span>Result</span><h3>What Taskdeck returned</h3></header><div id="response-summary"></div><div id="response-data"></div></section>
           </div>
           <div class="call-raw-view" id="call-raw-panel" role="tabpanel" data-call-panel="raw" hidden><section><h3>Request</h3><pre id="call-request"></pre></section><section><h3>Response</h3><pre id="call-response"></pre></section></div>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog class="drawer audit-dialog" id="audit-dialog" aria-labelledby="audit-dialog-title">
+      <div class="drawer-shell">
+        <header class="drawer-header call-header">
+          <div class="detail-status-icon" id="audit-detail-status-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m7.5 12 3 3 6-7"/></svg></div>
+          <div class="call-title"><span id="audit-dialog-subtitle">Audit record</span><h2 id="audit-dialog-title">Audit details</h2></div>
+          <button class="icon-button" id="close-audit-dialog" type="button" aria-label="Close audit details" title="Close"><svg viewBox="0 0 24 24"><path d="m7 7 10 10M17 7 7 17"/></svg></button>
+        </header>
+        <div class="call-detail" id="audit-detail">
+          <div class="detail-modes" role="tablist" aria-label="Audit detail view"><button class="active" type="button" role="tab" data-audit-mode="summary" aria-controls="audit-summary-panel" aria-selected="true">Summary</button><button type="button" role="tab" data-audit-mode="raw" aria-controls="audit-raw-panel" aria-selected="false">Raw</button></div>
+          <div class="call-result-view" id="audit-summary-panel" role="tabpanel" data-audit-panel="summary"><div class="call-overview" id="audit-overview"></div><section class="detail-section"><header><span>Context</span><h3>Who did what, where</h3></header><div class="field-list" id="audit-context-fields"></div></section><section class="detail-section"><header><span>Outcome</span><h3>Result summary</h3></header><div id="audit-response-summary"></div></section></div>
+          <div class="call-raw-view" id="audit-raw-panel" role="tabpanel" data-audit-panel="raw" hidden><section><h3>Request</h3><pre id="audit-request"></pre></section><section><h3>Response</h3><pre id="audit-response"></pre></section><section><h3>Details</h3><pre id="audit-details"></pre></section></div>
         </div>
       </div>
     </dialog>

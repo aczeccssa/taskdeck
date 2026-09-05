@@ -1,0 +1,109 @@
+name: ${TASKDECK_INTERNAL_COMPOSE_PROJECT:-taskdeck-internal}
+
+services:
+  leader:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: ${TASKDECK_IMAGE:-taskdeck:local}
+    hostname: leader
+    networks:
+      - cluster
+    environment:
+      TASKDECK_HOME: /var/lib/taskdeck
+      TASKDECK_ROLE: leader
+      TASKDECK_LEADER_MODE: pure_master
+      TASKDECK_NODE_NAME: cluster-leader
+      TASKDECK_BIND_HOST: 0.0.0.0
+      TASKDECK_WEB_PORT: "9837"
+      TASKDECK_ENROLLMENT_TOKEN: ${TASKDECK_ENROLLMENT_TOKEN:?set TASKDECK_ENROLLMENT_TOKEN}
+    volumes:
+      - leader-state:/var/lib/taskdeck
+      - bus:/shared/bus
+      - ./leader-entrypoint.sh:/usr/local/bin/taskdeck-leader-entrypoint:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/taskdeck-leader-entrypoint"]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:9837/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    expose:
+      - "9837"
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: ${TASKDECK_IMAGE:-taskdeck:local}
+    hostname: worker
+    depends_on:
+      leader:
+        condition: service_healthy
+    networks:
+      - cluster
+    environment:
+      TASKDECK_HOME: /var/lib/taskdeck
+      TASKDECK_ROLE: worker
+      TASKDECK_NODE_NAME: cluster-worker
+      TASKDECK_BIND_HOST: 0.0.0.0
+      TASKDECK_WEB_PORT: "9837"
+      TASKDECK_LEADER_URL: http://leader:9837
+      TASKDECK_ENROLLMENT_TOKEN: ${TASKDECK_ENROLLMENT_TOKEN:?set TASKDECK_ENROLLMENT_TOKEN}
+      TASKDECK_PROJECT: /work/project
+      TASKDECK_SESSION: cluster-lab
+    volumes:
+      - worker-state:/var/lib/taskdeck
+      - bus:/shared/bus
+      - ../../tests/fixtures/internal-cluster/project:/work/project:ro
+      - ./worker-entrypoint.sh:/usr/local/bin/taskdeck-worker-entrypoint:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/taskdeck-worker-entrypoint"]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:9837/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 8s
+    expose:
+      - "9837"
+
+  middleman:
+    image: ${TASKDECK_IMAGE:-taskdeck:local}
+    hostname: middleman
+    depends_on:
+      leader:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+    networks:
+      - cluster
+    environment:
+      TASKDECK_LEADER_URL: http://leader:9837
+      TASKDECK_WORKER_URL: http://worker:9837
+      TASKDECK_SESSION: cluster-lab
+      TASKDECK_TASK: ticker
+      TASKDECK_CLUSTER_MODE: ${TASKDECK_CLUSTER_MODE:-self-check}
+      TASKDECK_BUS_DIR: /shared/bus
+      TASKDECK_REPORT_DIR: /shared/bus/report
+    volumes:
+      - bus:/shared/bus
+      - ./middleman.sh:/usr/local/bin/taskdeck-middleman:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/taskdeck-middleman"]
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "sh", "-c", "test -f /shared/bus/phase.json && grep -q 'complete' /shared/bus/phase.json"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+
+networks:
+  cluster:
+    driver: bridge
+    name: ${TASKDECK_INTERNAL_NETWORK:-taskdeck-internal}
+
+volumes:
+  leader-state:
+  worker-state:
+  bus:
+    name: ${TASKDECK_INTERNAL_BUS:-taskdeck-internal-bus}

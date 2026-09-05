@@ -14,12 +14,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::cluster::{self, RemoteRequest};
-use crate::daemon::DaemonState;
+use crate::daemon::{DaemonState, record_audit_value};
 #[cfg(test)]
 use crate::protocol::McpCallListPage;
 use crate::protocol::{
-    Action, EditableTaskInput, EventFilter, McpCallRecord, Response, TaskRunFilter,
-    casefold_search_text,
+    Action, AuditContext, AuditFilter, AuditSource, AuditStatus, AuditTransport, EditableTaskInput,
+    EventFilter, McpCallRecord, Response, TaskRunFilter, casefold_search_text,
 };
 
 pub async fn serve(state: DaemonState, listener: tokio::net::TcpListener) -> Result<()> {
@@ -53,6 +53,8 @@ fn app(state: DaemonState) -> Router {
             "/api/sessions/{session}/config",
             get(session_config).put(update_session_config),
         )
+        .route("/api/audit", get(list_audit))
+        .route("/api/audit/{audit_id}", get(audit_detail))
         .route("/api/mcp-calls", get(list_mcp_calls))
         .route("/api/mcp-calls/{id}", get(mcp_call_detail))
         .route("/api/action", post(action))
@@ -292,6 +294,62 @@ fn selected_node(
     }
 }
 
+fn audit_context_for_remote_request(
+    state: &DaemonState,
+    source: AuditSource,
+    transport: AuditTransport,
+    request: &RemoteRequest,
+) -> AuditContext {
+    let local_request = request.clone().into_local();
+    AuditContext::new(source, transport)
+        .with_request_defaults(&local_request)
+        .with_origin_node(state.public_settings().node_id)
+}
+
+fn web_audit_context(state: &DaemonState, request: &RemoteRequest) -> AuditContext {
+    audit_context_for_remote_request(state, AuditSource::Web, AuditTransport::Http, request)
+}
+
+fn mcp_audit_context(state: &DaemonState, request: &RemoteRequest) -> AuditContext {
+    audit_context_for_remote_request(state, AuditSource::Mcp, AuditTransport::Mcp, request)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_mcp_direct_audit(
+    state: &DaemonState,
+    params: &Value,
+    operation: &str,
+    response: &Response,
+    started_at_ms: u64,
+    duration_ms: u64,
+    node: Option<&str>,
+    session: Option<&str>,
+    task: Option<&str>,
+) {
+    let mut context = AuditContext::new(AuditSource::Mcp, AuditTransport::Mcp);
+    context.origin_node_id = Some(state.public_settings().node_id);
+    let response_value = serde_json::to_value(response).unwrap_or_else(
+        |error| json!({"serialization_error": error.to_string(), "ok": response.ok}),
+    );
+    let _ = record_audit_value(
+        state,
+        context,
+        None,
+        "mcp_tools_call",
+        operation,
+        session,
+        task,
+        AuditStatus::from_ok(response.ok),
+        started_at_ms,
+        duration_ms,
+        params.clone(),
+        response_value,
+        json!({"node": node}),
+        node.map(str::to_string)
+            .or_else(|| Some(state.public_settings().node_id)),
+    );
+}
+
 async fn list_sessions(
     State(state): State<DaemonState>,
     Query(query): Query<HashMap<String, String>>,
@@ -300,9 +358,10 @@ async fn list_sessions(
         Ok(node) => node,
         Err(response) => return Json(response),
     };
+    let request = RemoteRequest::ListSessions;
     Json(
         state
-            .dispatch_node(&node, RemoteRequest::ListSessions)
+            .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
             .await,
     )
 }
@@ -317,9 +376,10 @@ async fn session_snapshot(
         Err(response) => return Json(response),
     };
     let tail = query.get("tail").and_then(|value| value.parse().ok());
+    let request = RemoteRequest::Snapshot { session, tail };
     Json(
         state
-            .dispatch_node(&node, RemoteRequest::Snapshot { session, tail })
+            .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
             .await,
     )
 }
@@ -357,17 +417,15 @@ async fn task_logs(
         },
         None => 1_000,
     };
+    let request = RemoteRequest::TaskLogs {
+        session,
+        task,
+        after,
+        limit,
+    };
     Json(
         state
-            .dispatch_node(
-                &node,
-                RemoteRequest::TaskLogs {
-                    session,
-                    task,
-                    after,
-                    limit,
-                },
-            )
+            .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
             .await,
     )
 }
@@ -405,16 +463,14 @@ async fn task_metrics(
         Ok(window_seconds) => window_seconds,
         Err(response) => return Json(response),
     };
+    let request = RemoteRequest::TaskMetrics {
+        session,
+        task,
+        window_seconds,
+    };
     Json(
         state
-            .dispatch_node(
-                &node,
-                RemoteRequest::TaskMetrics {
-                    session,
-                    task,
-                    window_seconds,
-                },
-            )
+            .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
             .await,
     )
 }
@@ -428,9 +484,10 @@ async fn clear_task_history(
         Ok(node) => node,
         Err(response) => return Json(response),
     };
+    let request = RemoteRequest::ClearTaskHistory { session, task };
     Json(
         state
-            .dispatch_node(&node, RemoteRequest::ClearTaskHistory { session, task })
+            .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
             .await,
     )
 }
@@ -444,9 +501,10 @@ async fn session_config(
         Ok(node) => node,
         Err(response) => return Json(response),
     };
+    let request = RemoteRequest::GetSessionConfig { session };
     Json(
         state
-            .dispatch_node(&node, RemoteRequest::GetSessionConfig { session })
+            .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
             .await,
     )
 }
@@ -469,17 +527,15 @@ async fn update_session_config(
         Ok(node) => node,
         Err(response) => return Json(response),
     };
+    let request = RemoteRequest::PutSessionConfig {
+        session,
+        revision: body.revision,
+        workspace_env: body.workspace_env,
+        tasks: body.tasks,
+    };
     Json(
         state
-            .dispatch_node(
-                &node,
-                RemoteRequest::PutSessionConfig {
-                    session,
-                    revision: body.revision,
-                    workspace_env: body.workspace_env,
-                    tasks: body.tasks,
-                },
-            )
+            .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
             .await,
     )
 }
@@ -503,18 +559,44 @@ async fn action(State(state): State<DaemonState>, Json(body): Json<ActionBody>) 
             ));
         }
     };
+    let request = RemoteRequest::Action {
+        session: body.session,
+        task: body.task,
+        action: body.action,
+    };
     Json(
         state
-            .dispatch_node(
-                &node,
-                RemoteRequest::Action {
-                    session: body.session,
-                    task: body.task,
-                    action: body.action,
-                },
-            )
+            .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
             .await,
     )
+}
+
+async fn list_audit(
+    State(state): State<DaemonState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Response> {
+    let filter = match AuditFilter::parse(&query) {
+        Ok(filter) => filter,
+        Err(response) => return Json(response),
+    };
+    match state.store.list_audit(&filter) {
+        Ok(page) => Json(Response::ok("audit records", page)),
+        Err(error) => Json(Response::error(format!("{error:#}"))),
+    }
+}
+
+async fn audit_detail(
+    State(state): State<DaemonState>,
+    Path(audit_id): Path<String>,
+) -> Json<Response> {
+    match state.store.audit_detail(&audit_id) {
+        Ok(Some(record)) => Json(Response::ok("audit record", record)),
+        Ok(None) => Json(Response::error_with_data(
+            "audit record not found",
+            json!({"kind": "not_found", "status": 404}),
+        )),
+        Err(error) => Json(Response::error(format!("{error:#}"))),
+    }
 }
 
 async fn list_mcp_calls(
@@ -670,9 +752,10 @@ async fn list_task_runs(
         Ok(node) => node,
         Err(response) => return Json(response),
     };
+    let request = RemoteRequest::ListTaskRuns { filter };
     Json(
         state
-            .dispatch_node(&node, RemoteRequest::ListTaskRuns { filter })
+            .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
             .await,
     )
 }
@@ -717,7 +800,7 @@ async fn mcp(State(state): State<DaemonState>, Json(rpc): Json<Value>) -> AxumRe
         "tools/list" => json!({"tools": [mcp_tool_definition(&state)]}),
         "tools/call" => {
             let params = rpc.get("params").cloned().unwrap_or_else(|| json!({}));
-            match call_mcp_tool(state.clone(), params).await {
+            match call_mcp_tool(state.clone(), params, started_at_ms).await {
                 Ok(result) => result,
                 Err(message) => json!({
                     "content": [{"type": "text", "text": message}],
@@ -820,21 +903,61 @@ fn mcp_tool_definition(state: &DaemonState) -> Value {
     }
 }
 
-async fn call_mcp_tool(state: DaemonState, params: Value) -> std::result::Result<Value, String> {
+async fn call_mcp_tool(
+    state: DaemonState,
+    params: Value,
+    started_at_ms: u64,
+) -> std::result::Result<Value, String> {
+    let started = Instant::now();
     if params.get("name").and_then(Value::as_str) != Some("taskdeck_control") {
-        return Err("unknown tool; expected taskdeck_control".to_string());
+        let response = Response::error("unknown tool; expected taskdeck_control");
+        record_mcp_direct_audit(
+            &state,
+            &params,
+            "unknown",
+            &response,
+            started_at_ms,
+            started.elapsed().as_millis() as u64,
+            None,
+            None,
+            None,
+        );
+        return Err(response.message);
     }
     let arguments = params
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let operation = arguments
-        .get("action")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "action is required".to_string())?;
+    let Some(operation) = arguments.get("action").and_then(Value::as_str) else {
+        let response = Response::error("action is required");
+        record_mcp_direct_audit(
+            &state,
+            &params,
+            "missing_action",
+            &response,
+            started_at_ms,
+            started.elapsed().as_millis() as u64,
+            arguments.get("node").and_then(Value::as_str),
+            arguments.get("session").and_then(Value::as_str),
+            arguments.get("task").and_then(Value::as_str),
+        );
+        return Err(response.message);
+    };
     let is_leader = state.public_settings().role == crate::state::NodeRole::Leader;
     if !is_leader && arguments.get("node").is_some() {
-        return Err("worker MCP is local-only and does not accept node".to_string());
+        let response = Response::error("worker MCP is local-only and does not accept node");
+        record_mcp_direct_audit(
+            &state,
+            &params,
+            operation,
+            &response,
+            started_at_ms,
+            started.elapsed().as_millis() as u64,
+            arguments.get("node").and_then(Value::as_str),
+            None,
+            None,
+        );
+        return Err(response.message);
     }
     let node = arguments.get("node").and_then(Value::as_str);
     let session = arguments
@@ -850,7 +973,21 @@ async fn call_mcp_tool(state: DaemonState, params: Value) -> std::result::Result
         .and_then(Value::as_u64)
         .map(|v| v as usize);
     let response = match operation {
-        "nodes" if is_leader => Response::ok("nodes", state.node_summaries()),
+        "nodes" if is_leader => {
+            let response = Response::ok("nodes", state.node_summaries());
+            record_mcp_direct_audit(
+                &state,
+                &params,
+                operation,
+                &response,
+                started_at_ms,
+                started.elapsed().as_millis() as u64,
+                node,
+                session.as_deref(),
+                task.as_deref(),
+            );
+            response
+        }
         "sessions" if is_leader && node.is_none() => {
             let rows = state
                 .node_summaries()
@@ -861,12 +998,43 @@ async fn call_mcp_tool(state: DaemonState, params: Value) -> std::result::Result
                     })
                 })
                 .collect::<Vec<_>>();
-            Response::ok("cluster sessions", rows)
+            let response = Response::ok("cluster sessions", rows);
+            record_mcp_direct_audit(
+                &state,
+                &params,
+                operation,
+                &response,
+                started_at_ms,
+                started.elapsed().as_millis() as u64,
+                node,
+                session.as_deref(),
+                task.as_deref(),
+            );
+            response
         }
-        "services" if is_leader => Response::ok("services", state.service_rows(node)),
+        "services" if is_leader => {
+            let response = Response::ok("services", state.service_rows(node));
+            record_mcp_direct_audit(
+                &state,
+                &params,
+                operation,
+                &response,
+                started_at_ms,
+                started.elapsed().as_millis() as u64,
+                node,
+                session.as_deref(),
+                task.as_deref(),
+            );
+            response
+        }
         "sessions" => {
+            let request = RemoteRequest::ListSessions;
             state
-                .dispatch_node(node.unwrap_or("self"), RemoteRequest::ListSessions)
+                .dispatch_node_with_audit(
+                    node.unwrap_or("self"),
+                    request.clone(),
+                    mcp_audit_context(&state, &request),
+                )
                 .await
         }
         "runs" => {
@@ -875,19 +1043,21 @@ async fn call_mcp_tool(state: DaemonState, params: Value) -> std::result::Result
             } else {
                 "self"
             };
+            let request = RemoteRequest::ListTaskRuns {
+                filter: crate::protocol::TaskRunFilter {
+                    session: session.clone(),
+                    task,
+                    status: None,
+                    trigger: None,
+                    page: tail.unwrap_or(1),
+                    page_size: 50,
+                },
+            };
             state
-                .dispatch_node(
+                .dispatch_node_with_audit(
                     node,
-                    RemoteRequest::ListTaskRuns {
-                        filter: crate::protocol::TaskRunFilter {
-                            session: session.clone(),
-                            task,
-                            status: None,
-                            trigger: None,
-                            page: tail.unwrap_or(1),
-                            page_size: 50,
-                        },
-                    },
+                    request.clone(),
+                    mcp_audit_context(&state, &request),
                 )
                 .await
         }
@@ -897,17 +1067,19 @@ async fn call_mcp_tool(state: DaemonState, params: Value) -> std::result::Result
             } else {
                 "self"
             };
+            let request = RemoteRequest::Snapshot {
+                session: session.ok_or_else(|| "session is required".to_string())?,
+                tail: Some(if operation == "status" {
+                    20
+                } else {
+                    tail.unwrap_or(200)
+                }),
+            };
             state
-                .dispatch_node(
+                .dispatch_node_with_audit(
                     node,
-                    RemoteRequest::Snapshot {
-                        session: session.ok_or_else(|| "session is required".to_string())?,
-                        tail: Some(if operation == "status" {
-                            20
-                        } else {
-                            tail.unwrap_or(200)
-                        }),
-                    },
+                    request.clone(),
+                    mcp_audit_context(&state, &request),
                 )
                 .await
         }
@@ -917,25 +1089,41 @@ async fn call_mcp_tool(state: DaemonState, params: Value) -> std::result::Result
             } else {
                 "self"
             };
+            let request = RemoteRequest::Action {
+                session: session.ok_or_else(|| "session is required".to_string())?,
+                task,
+                action: match operation {
+                    "start" => Action::Start,
+                    "stop" => Action::Stop,
+                    "restart" => Action::Restart,
+                    "pause" => Action::Pause,
+                    "resume" => Action::Resume,
+                    _ => unreachable!(),
+                },
+            };
             state
-                .dispatch_node(
+                .dispatch_node_with_audit(
                     node,
-                    RemoteRequest::Action {
-                        session: session.ok_or_else(|| "session is required".to_string())?,
-                        task,
-                        action: match operation {
-                            "start" => Action::Start,
-                            "stop" => Action::Stop,
-                            "restart" => Action::Restart,
-                            "pause" => Action::Pause,
-                            "resume" => Action::Resume,
-                            _ => unreachable!(),
-                        },
-                    },
+                    request.clone(),
+                    mcp_audit_context(&state, &request),
                 )
                 .await
         }
-        _ => return Err(format!("unsupported action: {operation}")),
+        _ => {
+            let response = Response::error(format!("unsupported action: {operation}"));
+            record_mcp_direct_audit(
+                &state,
+                &params,
+                operation,
+                &response,
+                started_at_ms,
+                started.elapsed().as_millis() as u64,
+                node,
+                session.as_deref(),
+                task.as_deref(),
+            );
+            return Err(response.message);
+        }
     };
     let text = serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?;
     Ok(json!({
@@ -1012,6 +1200,9 @@ mod tests {
         assert!(INDEX_HTML.contains("/assets/app.js"));
         assert!(INDEX_HTML.contains("data-view=\"docs\""));
         assert!(INDEX_HTML.contains("data-view=\"calls\""));
+        assert!(INDEX_HTML.contains("data-view=\"audit\""));
+        assert!(INDEX_HTML.contains("id=\"audit-view\""));
+        assert!(INDEX_HTML.contains("id=\"audit-dialog\""));
         assert!(INDEX_HTML.contains("id=\"config-dialog\""));
         assert!(!INDEX_HTML.contains("<style>"));
         assert!(!INDEX_HTML.contains("<script>const"));
@@ -1019,6 +1210,11 @@ mod tests {
         assert!(STYLES_CSS.contains("prefers-reduced-motion: reduce"));
         assert!(STYLES_CSS.contains("sidebar-collapsed"));
         assert!(APP_JS.contains("/api/mcp-calls"));
+        assert!(APP_JS.contains("/api/audit"));
+        assert!(APP_JS.contains("loadAudit"));
+        assert!(APP_JS.contains("Loading audit records"));
+        assert!(APP_JS.contains("error-row"));
+        assert!(APP_JS.contains("auditSyncLabel"));
         assert!(APP_JS.contains("/config"));
         assert!(APP_JS.contains("/logs?"));
         assert!(INDEX_HTML.contains("id=\"nodes\""));
@@ -1303,6 +1499,208 @@ mod tests {
         let response: Response = serde_json::from_slice(&body).unwrap();
         assert!(!response.ok);
         assert_eq!(response.data.as_ref().unwrap()["status"], 400);
+    }
+
+    fn audit_test_state() -> DaemonState {
+        let state = DaemonState::new();
+        for record in [
+            test_audit_record(
+                "audit-cli",
+                AuditSource::Cli,
+                AuditTransport::Ipc,
+                AuditStatus::Success,
+                10,
+                "worker-1",
+                "start",
+                Some("alpha"),
+                Some("api"),
+                json!({"type":"action","note":"Needle Straße","authorization":"Bearer secret"}),
+            ),
+            test_audit_record(
+                "audit-web",
+                AuditSource::Web,
+                AuditTransport::Http,
+                AuditStatus::Error,
+                20,
+                "leader-1",
+                "restart",
+                Some("beta"),
+                Some("web"),
+                json!({"type":"action","body":{"token":"secret"}}),
+            ),
+            test_audit_record(
+                "audit-scheduler",
+                AuditSource::Scheduler,
+                AuditTransport::Internal,
+                AuditStatus::Success,
+                30,
+                "worker-2",
+                "start",
+                Some("gamma"),
+                Some("etl"),
+                json!({"type":"scheduler"}),
+            ),
+        ] {
+            state.store.record_audit(record).unwrap();
+        }
+        state
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn test_audit_record(
+        audit_id: &str,
+        source: AuditSource,
+        transport: AuditTransport,
+        status: AuditStatus,
+        timestamp_ms: u64,
+        node_id: &str,
+        operation: &str,
+        session: Option<&str>,
+        task: Option<&str>,
+        request: Value,
+    ) -> crate::protocol::AuditRecord {
+        let success = matches!(status, AuditStatus::Success | AuditStatus::Started);
+        crate::protocol::AuditRecord {
+            audit_id: audit_id.to_string(),
+            correlation_id: format!("corr-{audit_id}"),
+            timestamp_ms,
+            duration_ms: 7,
+            source,
+            transport,
+            origin_node_id: Some(node_id.to_string()),
+            executor_node_id: Some(node_id.to_string()),
+            request_kind: if source == AuditSource::Scheduler {
+                "scheduler"
+            } else {
+                "action"
+            }
+            .to_string(),
+            operation: operation.to_string(),
+            session: session.map(str::to_string),
+            task: task.map(str::to_string),
+            status,
+            success,
+            error: (!success).then(|| "boom".to_string()),
+            request,
+            response: json!({"ok": success, "message": if success { "ok" } else { "boom" }}),
+            details: json!({"test": true}),
+            replicated_at_ms: Some(timestamp_ms + 100),
+        }
+    }
+
+    async fn list_audit_response(
+        uri: &str,
+        state: DaemonState,
+    ) -> (Response, Option<crate::protocol::AuditListPage>) {
+        let response = app(state)
+            .oneshot(HttpRequest::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response: Response = serde_json::from_slice(&body).unwrap();
+        let page = response
+            .data
+            .clone()
+            .and_then(|data| serde_json::from_value(data).ok());
+        (response, page)
+    }
+
+    #[tokio::test]
+    async fn audit_route_filters_searches_paginates_and_returns_redacted_details() {
+        let (_, page) = list_audit_response("/api/audit", audit_test_state()).await;
+        let page = page.unwrap();
+        assert_eq!(page.page, 1);
+        assert_eq!(page.page_size, 20);
+        assert_eq!(page.total, 3);
+        assert_eq!(page.items[0].audit_id, "audit-scheduler");
+        assert_eq!(page.items[1].audit_id, "audit-web");
+        assert_eq!(page.items[2].audit_id, "audit-cli");
+
+        let (_, search_page) =
+            list_audit_response("/api/audit?q=STRASSE", audit_test_state()).await;
+        let search_page = search_page.unwrap();
+        assert_eq!(search_page.total, 1);
+        assert_eq!(search_page.items[0].audit_id, "audit-cli");
+
+        let (_, filtered_page) = list_audit_response(
+            "/api/audit?source=web&status=error&node=leader-1&operation=restart&session=beta&task=web",
+            audit_test_state(),
+        )
+        .await;
+        let filtered_page = filtered_page.unwrap();
+        assert_eq!(filtered_page.total, 1);
+        assert_eq!(filtered_page.items[0].audit_id, "audit-web");
+        assert!(!filtered_page.items[0].success);
+
+        let detail = app(audit_test_state())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/audit/audit-cli")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(detail.into_body(), usize::MAX).await.unwrap();
+        let detail: Response = serde_json::from_slice(&body).unwrap();
+        assert!(detail.ok);
+        let record: crate::protocol::AuditRecord =
+            serde_json::from_value(detail.data.unwrap()).unwrap();
+        assert_eq!(record.request["authorization"], "[REDACTED]");
+        assert_eq!(record.origin_node_id.as_deref(), Some("worker-1"));
+        assert_eq!(record.executor_node_id.as_deref(), Some("worker-1"));
+
+        let missing = app(audit_test_state())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/audit/not-found")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(missing.into_body(), usize::MAX).await.unwrap();
+        let missing: Response = serde_json::from_slice(&body).unwrap();
+        assert!(!missing.ok);
+        assert_eq!(missing.data.as_ref().unwrap()["status"], 404);
+
+        let (invalid, _) = list_audit_response("/api/audit?source=nope", audit_test_state()).await;
+        assert!(!invalid.ok);
+        assert_eq!(invalid.data.as_ref().unwrap()["status"], 400);
+    }
+
+    #[tokio::test]
+    async fn mcp_missing_action_is_recorded_in_unified_audit() {
+        let state = DaemonState::new();
+        let response = app(state.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": 7,
+                            "method": "tools/call",
+                            "params": {"name": "taskdeck_control", "arguments": {}}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let (_, page) = list_audit_response(
+            "/api/audit?source=mcp&status=error&operation=missing_action",
+            state.clone(),
+        )
+        .await;
+        let page = page.unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].request_kind, "mcp_tools_call");
+        assert!(!state.store.mcp_call_detail(1).unwrap().unwrap().success);
     }
 
     fn mcp_call_test_state() -> DaemonState {
