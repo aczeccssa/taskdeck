@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -20,8 +20,12 @@ use crate::platform_service::{ServiceAction, service_control, service_status};
 use crate::protocol::McpCallListPage;
 use crate::protocol::{
     Action, AuditContext, AuditFilter, AuditSource, AuditStatus, AuditTransport, EditableTaskInput,
-    EventFilter, McpCallRecord, Response, ServiceScope, TaskRunFilter, casefold_search_text,
+    EventFilter, McpCallRecord, NodeSummary, Response, ServiceScope, SessionSnapshot,
+    TaskRunFilter, WorkflowGroup, WorkflowGroupActionItem, WorkflowGroupActionItemStatus,
+    WorkflowGroupActionSummary, WorkflowGroupInput, WorkflowGroupMemberView, WorkflowGroupView,
+    WorkflowGroupsView, WorkflowTargetView, casefold_search_text,
 };
+use crate::state::NodeRole;
 
 pub async fn serve(state: DaemonState, listener: tokio::net::TcpListener) -> Result<()> {
     axum::serve(listener, app(state))
@@ -51,6 +55,20 @@ fn app(state: DaemonState) -> Router {
         .route(
             "/api/workspaces/{session}/alias",
             put(update_workspace_alias),
+        )
+        .route(
+            "/api/workflow-groups",
+            get(list_workflow_groups).post(create_workflow_group),
+        )
+        .route(
+            "/api/workflow-groups/{group}",
+            get(get_workflow_group)
+                .put(update_workflow_group)
+                .delete(delete_workflow_group),
+        )
+        .route(
+            "/api/workflow-groups/{group}/actions",
+            post(workflow_group_action),
         )
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/{session}", get(session_snapshot))
@@ -444,6 +462,460 @@ async fn update_workspace_alias(
             .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
             .await,
     )
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowGroupActionBody {
+    action: Action,
+}
+
+async fn list_workflow_groups(State(state): State<DaemonState>) -> Json<Response> {
+    if let Err(response) = require_workflow_leader(&state) {
+        return Json(response);
+    }
+    Json(match workflow_groups_view(&state) {
+        Ok(view) => Response::ok("workflow groups", view),
+        Err(error) => Response::error(format!("{error:#}")),
+    })
+}
+
+async fn get_workflow_group(
+    State(state): State<DaemonState>,
+    Path(group): Path<String>,
+) -> Json<Response> {
+    if let Err(response) = require_workflow_leader(&state) {
+        return Json(response);
+    }
+    Json(match state.store.workflow_group(&group) {
+        Ok(Some(group)) => Response::ok("workflow group", workflow_group_view(&state, group)),
+        Ok(None) => Response::error(format!("workflow group '{group}' not found")),
+        Err(error) => Response::error(format!("{error:#}")),
+    })
+}
+
+async fn create_workflow_group(
+    State(state): State<DaemonState>,
+    Json(input): Json<WorkflowGroupInput>,
+) -> Json<Response> {
+    let started_at_ms = current_millis();
+    let started = Instant::now();
+    let request = serde_json::to_value(&input).unwrap_or_else(|_| json!({}));
+    let response = match require_workflow_leader(&state)
+        .and_then(|_| validate_workflow_group_scope(&state, &input))
+    {
+        Ok(()) => match state.store.create_workflow_group(input) {
+            Ok(group) => Response::ok("workflow group created", workflow_group_view(&state, group)),
+            Err(error) => Response::error(format!("{error:#}")),
+        },
+        Err(response) => response,
+    };
+    record_workflow_group_http_audit(
+        &state,
+        "workflow_group_create",
+        None,
+        request,
+        &response,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    );
+    Json(response)
+}
+
+async fn update_workflow_group(
+    State(state): State<DaemonState>,
+    Path(group): Path<String>,
+    Json(input): Json<WorkflowGroupInput>,
+) -> Json<Response> {
+    let started_at_ms = current_millis();
+    let started = Instant::now();
+    let request = serde_json::to_value(&input).unwrap_or_else(|_| json!({}));
+    let response = match require_workflow_leader(&state)
+        .and_then(|_| validate_workflow_group_scope(&state, &input))
+    {
+        Ok(()) => match state.store.update_workflow_group(&group, input) {
+            Ok(group) => Response::ok("workflow group updated", workflow_group_view(&state, group)),
+            Err(error) => Response::error(format!("{error:#}")),
+        },
+        Err(response) => response,
+    };
+    record_workflow_group_http_audit(
+        &state,
+        "workflow_group_update",
+        Some(&group),
+        request,
+        &response,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    );
+    Json(response)
+}
+
+async fn delete_workflow_group(
+    State(state): State<DaemonState>,
+    Path(group): Path<String>,
+) -> Json<Response> {
+    let started_at_ms = current_millis();
+    let started = Instant::now();
+    let request = json!({"id": group});
+    let response = match require_workflow_leader(&state) {
+        Ok(()) => match state.store.delete_workflow_group(&group) {
+            Ok(true) => Response::empty("workflow group deleted"),
+            Ok(false) => Response::error(format!("workflow group '{group}' not found")),
+            Err(error) => Response::error(format!("{error:#}")),
+        },
+        Err(response) => response,
+    };
+    record_workflow_group_http_audit(
+        &state,
+        "workflow_group_delete",
+        Some(&group),
+        request,
+        &response,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    );
+    Json(response)
+}
+
+async fn workflow_group_action(
+    State(state): State<DaemonState>,
+    Path(group): Path<String>,
+    Json(body): Json<WorkflowGroupActionBody>,
+) -> Json<Response> {
+    let started_at_ms = current_millis();
+    let started = Instant::now();
+    let request = json!({"id": group, "action": body.action});
+    let response = match require_workflow_leader(&state) {
+        Ok(()) => match state.store.workflow_group(&group) {
+            Ok(Some(group)) => {
+                let summary = run_workflow_group_action(state.clone(), group, body.action).await;
+                Response::ok("workflow group action completed", summary)
+            }
+            Ok(None) => Response::error(format!("workflow group '{group}' not found")),
+            Err(error) => Response::error(format!("{error:#}")),
+        },
+        Err(response) => response,
+    };
+    record_workflow_group_http_audit(
+        &state,
+        "workflow_group_action",
+        Some(&group),
+        request,
+        &response,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    );
+    Json(response)
+}
+
+fn require_workflow_leader(state: &DaemonState) -> std::result::Result<(), Response> {
+    if state.public_settings().role == NodeRole::Leader {
+        Ok(())
+    } else {
+        Err(Response::error_with_data(
+            "workflow groups are available on leader nodes only",
+            json!({"kind": "validation_error", "status": 403}),
+        ))
+    }
+}
+
+fn validate_workflow_group_scope(
+    state: &DaemonState,
+    input: &WorkflowGroupInput,
+) -> std::result::Result<(), Response> {
+    let settings = state.public_settings();
+    let known_nodes = state
+        .node_summaries()
+        .into_iter()
+        .map(|node| node.id)
+        .collect::<HashSet<_>>();
+    for member in &input.members {
+        let node_id = member.node_id.trim();
+        if node_id == "self" && !settings.execution_enabled {
+            return Err(Response::error_with_data(
+                "pure master workflow groups cannot include self executor",
+                json!({"kind": "validation_error", "status": 400}),
+            ));
+        }
+        if !known_nodes.contains(node_id) {
+            return Err(Response::error_with_data(
+                format!("workflow group member node '{node_id}' is not known"),
+                json!({"kind": "validation_error", "status": 400}),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn workflow_groups_view(state: &DaemonState) -> Result<WorkflowGroupsView> {
+    let groups = state.store.workflow_groups()?;
+    let (nodes, inventories) = workflow_context(state);
+    let targets = workflow_targets(&nodes, &inventories);
+    let grouped_workspaces = groups
+        .iter()
+        .flat_map(|group| group.members.iter())
+        .map(|member| (member.node_id.clone(), member.session.clone()))
+        .collect::<HashSet<_>>();
+    let ungrouped = targets
+        .iter()
+        .filter(|target| {
+            !grouped_workspaces.contains(&(target.node_id.clone(), target.session.clone()))
+        })
+        .cloned()
+        .collect();
+    let groups = groups
+        .iter()
+        .map(|group| resolve_workflow_group(group, &nodes, &inventories))
+        .collect();
+    Ok(WorkflowGroupsView {
+        groups,
+        targets,
+        ungrouped,
+    })
+}
+
+fn workflow_group_view(state: &DaemonState, group: WorkflowGroup) -> WorkflowGroupView {
+    let (nodes, inventories) = workflow_context(state);
+    resolve_workflow_group(&group, &nodes, &inventories)
+}
+
+fn workflow_context(
+    state: &DaemonState,
+) -> (Vec<NodeSummary>, HashMap<String, Vec<SessionSnapshot>>) {
+    let nodes = state.node_summaries();
+    let inventories = nodes
+        .iter()
+        .map(|node| {
+            let inventory = if node.id == "self" {
+                state.local_inventory()
+            } else {
+                state.cluster.cached_inventory(&node.id).unwrap_or_default()
+            };
+            (node.id.clone(), inventory)
+        })
+        .collect();
+    (nodes, inventories)
+}
+
+fn workflow_targets(
+    nodes: &[NodeSummary],
+    inventories: &HashMap<String, Vec<SessionSnapshot>>,
+) -> Vec<WorkflowTargetView> {
+    let mut targets = nodes
+        .iter()
+        .flat_map(|node| {
+            inventories
+                .get(&node.id)
+                .into_iter()
+                .flatten()
+                .map(move |session| WorkflowTargetView {
+                    node_id: node.id.clone(),
+                    node_name: node.name.clone(),
+                    node_online: node.online,
+                    session: session.name.clone(),
+                    workspace_alias: session.alias.clone(),
+                    workspace_display_name: session
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| session.name.clone()),
+                    project: Some(session.project.clone()),
+                    tasks: ordered_task_labels(session),
+                })
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by(|left, right| {
+        left.node_name
+            .cmp(&right.node_name)
+            .then_with(|| {
+                left.workspace_display_name
+                    .cmp(&right.workspace_display_name)
+            })
+            .then_with(|| left.session.cmp(&right.session))
+    });
+    targets
+}
+
+fn resolve_workflow_group(
+    group: &WorkflowGroup,
+    nodes: &[NodeSummary],
+    inventories: &HashMap<String, Vec<SessionSnapshot>>,
+) -> WorkflowGroupView {
+    let members = group
+        .members
+        .iter()
+        .map(|member| {
+            let node = nodes.iter().find(|node| node.id == member.node_id);
+            let session = inventories.get(&member.node_id).and_then(|sessions| {
+                sessions
+                    .iter()
+                    .find(|session| session.name == member.session)
+            });
+            let task_exists =
+                session.is_some_and(|session| session.tasks.contains_key(&member.task));
+            let skip_reason = if node.is_none() {
+                Some("node not known".to_string())
+            } else if node.is_some_and(|node| !node.online) {
+                Some("node offline".to_string())
+            } else if session.is_none() {
+                Some("workspace not found".to_string())
+            } else if !task_exists {
+                Some("task not found".to_string())
+            } else {
+                None
+            };
+            WorkflowGroupMemberView {
+                member: member.clone(),
+                node_name: node.map(|node| node.name.clone()),
+                node_online: node.is_some_and(|node| node.online),
+                workspace_alias: session.and_then(|session| session.alias.clone()),
+                workspace_display_name: session
+                    .and_then(|session| {
+                        session.alias.clone().or_else(|| Some(session.name.clone()))
+                    })
+                    .unwrap_or_else(|| member.session.clone()),
+                project: session.map(|session| session.project.clone()),
+                task_exists,
+                available: skip_reason.is_none(),
+                skip_reason,
+            }
+        })
+        .collect();
+    WorkflowGroupView {
+        id: group.id.clone(),
+        name: group.name.clone(),
+        created_at_ms: group.created_at_ms,
+        updated_at_ms: group.updated_at_ms,
+        members,
+    }
+}
+
+fn ordered_task_labels(session: &SessionSnapshot) -> Vec<String> {
+    let mut labels = Vec::new();
+    let mut seen = HashSet::new();
+    for label in &session.task_order {
+        if session.tasks.contains_key(label) && seen.insert(label.clone()) {
+            labels.push(label.clone());
+        }
+    }
+    let mut remaining = session
+        .tasks
+        .keys()
+        .filter(|label| !seen.contains(*label))
+        .cloned()
+        .collect::<Vec<_>>();
+    remaining.sort();
+    labels.extend(remaining);
+    labels
+}
+
+async fn run_workflow_group_action(
+    state: DaemonState,
+    group: WorkflowGroup,
+    action: Action,
+) -> WorkflowGroupActionSummary {
+    let view = workflow_group_view(&state, group.clone());
+    let mut results = Vec::new();
+    for member in view.members {
+        if !member.available {
+            results.push(WorkflowGroupActionItem {
+                node_id: member.member.node_id,
+                node_name: member.node_name,
+                session: member.member.session,
+                workspace_display_name: member.workspace_display_name,
+                task: member.member.task,
+                status: WorkflowGroupActionItemStatus::Skipped,
+                message: member.skip_reason.unwrap_or_else(|| "skipped".to_string()),
+            });
+            continue;
+        }
+
+        let request = RemoteRequest::Action {
+            session: member.member.session.clone(),
+            task: Some(member.member.task.clone()),
+            action,
+        };
+        let response = state
+            .dispatch_node_with_audit(
+                &member.member.node_id,
+                request.clone(),
+                web_audit_context(&state, &request),
+            )
+            .await;
+        results.push(WorkflowGroupActionItem {
+            node_id: member.member.node_id,
+            node_name: member.node_name,
+            session: member.member.session,
+            workspace_display_name: member.workspace_display_name,
+            task: member.member.task,
+            status: if response.ok {
+                WorkflowGroupActionItemStatus::Success
+            } else {
+                WorkflowGroupActionItemStatus::Failed
+            },
+            message: response.message,
+        });
+    }
+    let success_count = results
+        .iter()
+        .filter(|item| item.status == WorkflowGroupActionItemStatus::Success)
+        .count();
+    let failed_count = results
+        .iter()
+        .filter(|item| item.status == WorkflowGroupActionItemStatus::Failed)
+        .count();
+    let skipped_count = results
+        .iter()
+        .filter(|item| item.status == WorkflowGroupActionItemStatus::Skipped)
+        .count();
+    WorkflowGroupActionSummary {
+        group_id: group.id,
+        group_name: group.name,
+        action,
+        results,
+        success_count,
+        failed_count,
+        skipped_count,
+    }
+}
+
+fn record_workflow_group_http_audit(
+    state: &DaemonState,
+    operation: &str,
+    group_id: Option<&str>,
+    request: serde_json::Value,
+    response: &Response,
+    started_at_ms: u64,
+    duration_ms: u64,
+) {
+    let response_value = serde_json::to_value(response)
+        .unwrap_or_else(|error| json!({"ok": response.ok, "message": format!("{error}")}));
+    let failed_count = response
+        .data
+        .as_ref()
+        .and_then(|data| data.get("failed_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let status = if response.ok && failed_count == 0 {
+        AuditStatus::Success
+    } else {
+        AuditStatus::Error
+    };
+    let _ = record_audit_value(
+        state,
+        AuditContext::new(AuditSource::Web, AuditTransport::Http),
+        None,
+        "workflow_group",
+        operation,
+        None,
+        None,
+        status,
+        started_at_ms,
+        duration_ms,
+        request,
+        response_value,
+        json!({"group_id": group_id}),
+        Some(state.public_settings().node_id),
+    );
 }
 
 async fn update_node_settings(
@@ -1416,6 +1888,11 @@ mod tests {
         assert!(INDEX_HTML.contains("data-view=\"docs\""));
         assert!(INDEX_HTML.contains("data-view=\"calls\""));
         assert!(INDEX_HTML.contains("data-view=\"audit\""));
+        assert!(INDEX_HTML.contains("data-view=\"workflows\""));
+        assert!(INDEX_HTML.contains("id=\"workflows-view\""));
+        assert!(INDEX_HTML.contains("id=\"workflow-groups\""));
+        assert!(INDEX_HTML.contains("id=\"workflow-members\""));
+        assert!(INDEX_HTML.contains("id=\"ungrouped-workspaces\""));
         assert!(INDEX_HTML.contains("id=\"audit-view\""));
         assert!(INDEX_HTML.contains("id=\"audit-dialog\""));
         assert!(INDEX_HTML.contains("id=\"config-dialog\""));
@@ -1425,12 +1902,17 @@ mod tests {
         assert!(INDEX_HTML.contains("id=\"service-form\""));
         assert!(APP_JS.contains("loadNodeSettings"));
         assert!(APP_JS.contains("/api/workspaces"));
+        assert!(APP_JS.contains("/api/workflow-groups"));
+        assert!(APP_JS.contains("loadWorkflowGroups"));
+        assert!(APP_JS.contains("data-workflow-action"));
         assert!(APP_JS.contains("/api/nodes/self/service"));
         assert!(!INDEX_HTML.contains("<style>"));
         assert!(!INDEX_HTML.contains("<script>const"));
         assert!(STYLES_CSS.contains("prefers-color-scheme: dark"));
         assert!(STYLES_CSS.contains("prefers-reduced-motion: reduce"));
         assert!(STYLES_CSS.contains("sidebar-collapsed"));
+        assert!(STYLES_CSS.contains("workflow-layout"));
+        assert!(STYLES_CSS.contains("workflow-result"));
         assert!(APP_JS.contains("/api/mcp-calls"));
         assert!(APP_JS.contains("/api/audit"));
         assert!(APP_JS.contains("loadAudit"));
@@ -2292,6 +2774,285 @@ mod tests {
         }
         let body = Body::from(body.unwrap_or_default().to_owned());
         app.oneshot(builder.body(body).unwrap()).await.unwrap()
+    }
+
+    fn workflow_task_spec(label: &str) -> TaskSpec {
+        TaskSpec {
+            label: label.to_string(),
+            program: "true".to_string(),
+            args: Vec::new(),
+            cwd: PathBuf::from("/tmp"),
+            env: BTreeMap::new(),
+            shell: false,
+            auto_start: false,
+            stop_timeout_ms: 500,
+            clear_logs_on_restart: false,
+            schedule: None,
+        }
+    }
+
+    fn workflow_definition(session: &str, project: &str, tasks: &[&str]) -> ProjectDefinition {
+        ProjectDefinition {
+            session: session.to_string(),
+            project: PathBuf::from(project),
+            source: "taskdeck.yaml".to_string(),
+            tasks: tasks
+                .iter()
+                .map(|label| ((*label).to_string(), workflow_task_spec(label)))
+                .collect(),
+            task_order: tasks.iter().map(|label| (*label).to_string()).collect(),
+        }
+    }
+
+    fn insert_workflow_session(
+        state: &DaemonState,
+        session: &str,
+        alias: Option<&str>,
+        project: &str,
+        tasks: &[&str],
+    ) {
+        state
+            .store
+            .upsert_registration(session, &PathBuf::from(project))
+            .unwrap();
+        if let Some(alias) = alias {
+            state
+                .store
+                .set_registration_alias(session, Some(alias))
+                .unwrap();
+        }
+        state.sessions.lock().expect("sessions lock").insert(
+            session.to_string(),
+            SessionRuntime::new(workflow_definition(session, project, tasks)),
+        );
+    }
+
+    fn workflow_leader_state() -> DaemonState {
+        let mut state = DaemonState::new();
+        let settings = state
+            .store
+            .configure(crate::state::NodeSettingsUpdate {
+                role: Some(crate::state::NodeRole::Leader),
+                ..Default::default()
+            })
+            .unwrap();
+        *state.settings.lock().expect("node settings lock") = settings;
+        insert_workflow_session(&state, "api", Some("Backend API"), "/tmp/api", &["dev"]);
+        insert_workflow_session(&state, "web", None, "/tmp/web", &["dev"]);
+
+        let mut remote = SessionRuntime::new(workflow_definition(
+            "worker-api",
+            "/tmp/worker-api",
+            &["deploy"],
+        ));
+        let remote_snapshot = remote.snapshot(0).unwrap();
+        state
+            .store
+            .upsert_worker(
+                "worker-7",
+                "Worker 7",
+                current_millis(),
+                &serde_json::to_string(&vec![remote_snapshot]).unwrap(),
+            )
+            .unwrap();
+        state.cluster = crate::cluster::LeaderCluster::new(state.store.clone(), None).unwrap();
+        state
+    }
+
+    #[tokio::test]
+    async fn workflow_groups_api_crud_resolves_targets_and_ungrouped() {
+        let state = workflow_leader_state();
+        let list = http_route(state.clone(), "GET", "/api/workflow-groups", &[], None).await;
+        assert_eq!(list.status(), StatusCode::OK);
+        let body = to_bytes(list.into_body(), usize::MAX).await.unwrap();
+        let parsed: Response = serde_json::from_slice(&body).unwrap();
+        let data = parsed.data.unwrap();
+        assert_eq!(data["groups"].as_array().unwrap().len(), 0);
+        assert_eq!(data["targets"].as_array().unwrap().len(), 3);
+        assert_eq!(data["ungrouped"].as_array().unwrap().len(), 3);
+
+        let body = json!({
+            "name": "Release train",
+            "members": [
+                {"node_id":"self", "session":"api", "task":"dev"},
+                {"node_id":"worker-7", "session":"worker-api", "task":"deploy"}
+            ]
+        })
+        .to_string();
+        let created = http_route(
+            state.clone(),
+            "POST",
+            "/api/workflow-groups",
+            &[(header::CONTENT_TYPE, "application/json")],
+            Some(&body),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+        let body = to_bytes(created.into_body(), usize::MAX).await.unwrap();
+        let parsed: Response = serde_json::from_slice(&body).unwrap();
+        assert!(parsed.ok);
+        let group = parsed.data.unwrap();
+        let group_id = group["id"].as_str().unwrap().to_string();
+        assert_eq!(group["members"][0]["workspace_display_name"], "Backend API");
+        assert_eq!(group["members"][0]["available"], true);
+        assert_eq!(group["members"][1]["node_online"], false);
+        assert_eq!(group["members"][1]["skip_reason"], "node offline");
+
+        let list = http_route(state.clone(), "GET", "/api/workflow-groups", &[], None).await;
+        let body = to_bytes(list.into_body(), usize::MAX).await.unwrap();
+        let parsed: Response = serde_json::from_slice(&body).unwrap();
+        let data = parsed.data.unwrap();
+        assert_eq!(data["groups"].as_array().unwrap().len(), 1);
+        assert_eq!(data["ungrouped"].as_array().unwrap().len(), 1);
+        assert_eq!(data["ungrouped"][0]["session"], "web");
+
+        let update = json!({
+            "name": "Frontend train",
+            "members": [{"node_id":"self", "session":"web", "task":"dev"}]
+        })
+        .to_string();
+        let updated = http_route(
+            state.clone(),
+            "PUT",
+            &format!("/api/workflow-groups/{group_id}"),
+            &[(header::CONTENT_TYPE, "application/json")],
+            Some(&update),
+        )
+        .await;
+        let body = to_bytes(updated.into_body(), usize::MAX).await.unwrap();
+        let parsed: Response = serde_json::from_slice(&body).unwrap();
+        assert!(parsed.ok);
+        assert_eq!(parsed.data.unwrap()["name"], "Frontend train");
+
+        let deleted = http_route(
+            state,
+            "DELETE",
+            &format!("/api/workflow-groups/{group_id}"),
+            &[],
+            None,
+        )
+        .await;
+        let body = to_bytes(deleted.into_body(), usize::MAX).await.unwrap();
+        let parsed: Response = serde_json::from_slice(&body).unwrap();
+        assert!(parsed.ok);
+    }
+
+    #[tokio::test]
+    async fn workflow_groups_api_enforces_leader_scope_and_pure_master_self_rule() {
+        let worker = DaemonState::new();
+        let response = http_route(worker, "GET", "/api/workflow-groups", &[], None).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Response = serde_json::from_slice(&body).unwrap();
+        assert!(!parsed.ok);
+        assert_eq!(parsed.data.as_ref().unwrap()["status"], 403);
+
+        let mut state = DaemonState::new();
+        let settings = state
+            .store
+            .configure(crate::state::NodeSettingsUpdate {
+                role: Some(crate::state::NodeRole::Leader),
+                leader_mode: Some(crate::state::LeaderMode::PureMaster),
+                ..Default::default()
+            })
+            .unwrap();
+        *state.settings.lock().expect("node settings lock") = settings;
+        state.cluster = crate::cluster::LeaderCluster::new(state.store.clone(), None).unwrap();
+        let body = json!({
+            "name": "Invalid",
+            "members": [{"node_id":"self", "session":"api", "task":"dev"}]
+        })
+        .to_string();
+        let response = http_route(
+            state,
+            "POST",
+            "/api/workflow-groups",
+            &[(header::CONTENT_TYPE, "application/json")],
+            Some(&body),
+        )
+        .await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Response = serde_json::from_slice(&body).unwrap();
+        assert!(!parsed.ok);
+        assert!(parsed.message.contains("pure master"));
+    }
+
+    #[tokio::test]
+    async fn workflow_group_action_is_best_effort_and_audited() {
+        let state = workflow_leader_state();
+        let group = state
+            .store
+            .create_workflow_group(crate::protocol::WorkflowGroupInput {
+                name: "Deploy".to_string(),
+                members: vec![
+                    crate::protocol::WorkflowGroupMember {
+                        node_id: "self".to_string(),
+                        session: "api".to_string(),
+                        task: "dev".to_string(),
+                    },
+                    crate::protocol::WorkflowGroupMember {
+                        node_id: "worker-7".to_string(),
+                        session: "worker-api".to_string(),
+                        task: "deploy".to_string(),
+                    },
+                    crate::protocol::WorkflowGroupMember {
+                        node_id: "self".to_string(),
+                        session: "api".to_string(),
+                        task: "missing".to_string(),
+                    },
+                ],
+            })
+            .unwrap();
+        let body = json!({"action":"stop"}).to_string();
+        let response = http_route(
+            state.clone(),
+            "POST",
+            &format!("/api/workflow-groups/{}/actions", group.id),
+            &[(header::CONTENT_TYPE, "application/json")],
+            Some(&body),
+        )
+        .await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Response = serde_json::from_slice(&body).unwrap();
+        assert!(parsed.ok);
+        let data = parsed.data.unwrap();
+        assert_eq!(data["success_count"], 1);
+        assert_eq!(data["failed_count"], 0);
+        assert_eq!(data["skipped_count"], 2);
+        assert_eq!(data["results"][0]["status"], "success");
+        assert_eq!(data["results"][1]["message"], "node offline");
+        assert_eq!(data["results"][2]["message"], "task not found");
+
+        let body = json!({"action":"pause"}).to_string();
+        let response = http_route(
+            state.clone(),
+            "POST",
+            &format!("/api/workflow-groups/{}/actions", group.id),
+            &[(header::CONTENT_TYPE, "application/json")],
+            Some(&body),
+        )
+        .await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Response = serde_json::from_slice(&body).unwrap();
+        assert!(parsed.ok);
+        let data = parsed.data.unwrap();
+        assert_eq!(data["failed_count"], 1);
+        assert_eq!(data["results"][0]["status"], "failed");
+
+        let page = state
+            .store
+            .list_audit(&crate::protocol::AuditFilter {
+                q: None,
+                source: Some("web".to_string()),
+                status: None,
+                node: None,
+                session: None,
+                task: None,
+                operation: Some("workflow_group_action".to_string()),
+                page: 1,
+                page_size: 20,
+            })
+            .unwrap();
+        assert_eq!(page.total, 2);
     }
 
     #[tokio::test]

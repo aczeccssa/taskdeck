@@ -26,6 +26,9 @@
           <button class="nav-button active" type="button" data-view="tasks" aria-label="Tasks" title="Tasks">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h9M5 17h6"/></svg><span>Tasks</span>
           </button>
+          <button class="nav-button" type="button" data-view="workflows" aria-label="Workflows" title="Workflows">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6h5v5H6zM13 13h5v5h-5zM11 8h3a2 2 0 0 1 2 2v3M13 16h-3a2 2 0 0 1-2-2v-3"/></svg><span>Workflows</span>
+          </button>
           <button class="nav-button" type="button" data-view="calls" aria-label="MCP Calls" title="MCP Calls">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 4h8v4H8zM5 14h4m6 0h4M7 8v3h10V8M7 11v3m10-3v3"/></svg><span>MCP Calls</span>
           </button>
@@ -58,6 +61,31 @@
           <div class="task-tabs" id="tabs" role="tablist" aria-label="Tasks"></div>
           <div class="task-pane" id="task-pane">
             <div class="empty-state"><div><h1>No active workspace</h1><p>Register a project from the CLI or TUI.</p></div></div>
+          </div>
+        </section>
+
+        <section class="view workflows-view" id="workflows-view" hidden>
+          <div class="workflow-layout">
+            <div class="workflow-main">
+              <header class="section-heading">
+                <div><h1>Workflows</h1><p id="workflows-summary">0 groups</p></div>
+                <div class="settings-actions"><button class="button" id="refresh-workflows" type="button">Refresh</button><button class="button primary" id="new-workflow" type="button">New workflow</button></div>
+              </header>
+              <div class="workflow-groups" id="workflow-groups"><div class="empty-state compact"><div><h1>No workflow groups</h1><p>Create a group to organize tasks across workspaces and nodes.</p></div></div></div>
+              <section class="workflow-ungrouped" aria-labelledby="ungrouped-title">
+                <header><h2 id="ungrouped-title">Ungrouped workspaces</h2><p>Visible workspaces not assigned to any workflow group.</p></header>
+                <div class="workflow-targets" id="ungrouped-workspaces"></div>
+              </section>
+            </div>
+            <aside class="workflow-editor" aria-labelledby="workflow-editor-title">
+              <header><h2 id="workflow-editor-title">New workflow</h2><p>Bind each member to a node, workspace, and task.</p></header>
+              <label class="field"><span>Name</span><input id="workflow-name" type="text" placeholder="Release train" autocomplete="off"></label>
+              <div class="workflow-member-list" id="workflow-members"><div class="muted">Select a workflow to edit, or create a new one.</div></div>
+              <button class="button" id="add-workflow-member" type="button" disabled>Add member</button>
+              <div class="settings-message" id="workflow-message" role="status"></div>
+              <footer class="settings-footer"><button class="button" id="cancel-workflow" type="button" disabled>Cancel</button><button class="button primary" id="save-workflow" type="button" disabled>Save workflow</button></footer>
+              <div class="workflow-results" id="workflow-results"></div>
+            </aside>
           </div>
         </section>
 

@@ -155,6 +155,10 @@ while [ "$i" -lt 180 ]; do
             if [ -n "$cid" ]; then
                 running=$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null || printf false)
                 if [ "$running" = false ]; then
+                    copy_report
+                    if [ -f "$report_host_dir/report.json" ] && python3 -c 'import json,sys; report=json.load(open(sys.argv[1],encoding="utf-8")); raise SystemExit(0 if report.get("ok") else 1)' "$report_host_dir/report.json"; then
+                        middleman_status=0
+                    fi
                     break
                 fi
             fi
@@ -164,6 +168,10 @@ while [ "$i" -lt 180 ]; do
         if [ -n "$cid" ]; then
             running=$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null || printf false)
             if [ "$running" = false ] && [ "$mode" = self-check ]; then
+                copy_report
+                if [ -f "$report_host_dir/report.json" ] && python3 -c 'import json,sys; report=json.load(open(sys.argv[1],encoding="utf-8")); raise SystemExit(0 if report.get("ok") else 1)' "$report_host_dir/report.json"; then
+                    middleman_status=0
+                fi
                 break
             fi
         fi
