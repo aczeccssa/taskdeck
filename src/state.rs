@@ -18,10 +18,13 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::protocol::{
-    AuditFilter, AuditListItem, AuditListPage, AuditRecord, AuditSource, AuditStatus,
-    AuditTransport, Board, BoardCard, BoardCardInput, BoardCardMode, BoardInput, EventFilter,
-    EventListPage, EventRecord, McpCallListItem, McpCallListPage, McpCallRecord, TaskRunFilter,
-    TaskRunListPage, TaskRunRecord, WorkflowGroup, WorkflowGroupInput, WorkflowGroupMember,
+    ApiToken, ApiTokenCreated, AuditFilter, AuditListItem, AuditListPage, AuditRecord, AuditSource,
+    AuditStatus, AuditTransport, Board, BoardCard, BoardCardInput, BoardCardMode, BoardInput,
+    BoardTemplate, BoardTemplateInput, EventFilter, EventListPage, EventRecord, McpCallListItem,
+    McpCallListPage, McpCallRecord, Notification, NotificationRule, NotificationRuleInput,
+    ScalingMetric, ScalingPolicy, ScalingPolicyInput, TaskDependency, TaskDependencyInput,
+    TaskRunFilter, TaskRunListPage, TaskRunRecord, WorkflowGraph, WorkflowGroup,
+    WorkflowGroupInput, WorkflowGroupMember, WorkflowRevision, WorkspaceQuota, WorkspaceQuotaInput,
     casefold_search_text, sanitize_audit_value,
 };
 
@@ -29,8 +32,10 @@ pub const DEFAULT_BIND_HOST: &str = "0.0.0.0";
 pub const DEFAULT_WEB_PORT: u16 = 9837;
 const DATABASE_FILE: &str = "state.db";
 pub const AUTH_SESSION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
-const SCHEMA_VERSION: &str = "7";
+const SCHEMA_VERSION: &str = "8";
 pub const AUDIT_RETENTION_LIMIT: usize = 10_000;
+pub const WORKFLOW_REVISION_RETENTION_LIMIT: usize = 50;
+pub const NOTIFICATION_RETENTION_LIMIT: usize = 1_000;
 
 #[cfg(test)]
 use crate::protocol::TaskStatus;
@@ -363,7 +368,103 @@ impl StateStore {
                  expires_at_ms INTEGER NOT NULL,
                  last_seen_at_ms INTEGER NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry ON auth_sessions(expires_at_ms);",
+             CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry ON auth_sessions(expires_at_ms);
+             CREATE TABLE IF NOT EXISTS workflow_revisions (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 group_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL,
+                 snapshot_json TEXT NOT NULL,
+                 note TEXT,
+                 created_at_ms INTEGER NOT NULL,
+                 UNIQUE(group_id, revision)
+             );
+             CREATE INDEX IF NOT EXISTS idx_workflow_revisions_group
+                 ON workflow_revisions(group_id, revision DESC);
+             CREATE TABLE IF NOT EXISTS workspace_quotas (
+                 id TEXT PRIMARY KEY,
+                 node_id TEXT NOT NULL,
+                 session TEXT,
+                 max_running_tasks INTEGER NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS notification_rules (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 event_types_json TEXT NOT NULL,
+                 scope_session TEXT,
+                 scope_task TEXT,
+                 webhook_url TEXT,
+                 enabled INTEGER NOT NULL DEFAULT 1,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS notifications (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 rule_id TEXT,
+                 rule_name TEXT,
+                 event_type TEXT NOT NULL,
+                 severity TEXT NOT NULL,
+                 node_id TEXT NOT NULL,
+                 session TEXT,
+                 task TEXT,
+                 title TEXT NOT NULL,
+                 message TEXT NOT NULL,
+                 details_json TEXT NOT NULL DEFAULT '{}',
+                 read INTEGER NOT NULL DEFAULT 0,
+                 created_at_ms INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_notifications_recent ON notifications(created_at_ms DESC);
+             CREATE TABLE IF NOT EXISTS api_tokens (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 token_hash TEXT NOT NULL UNIQUE,
+                 token_prefix TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 last_used_at_ms INTEGER,
+                 revoked INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS board_templates (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL UNIQUE,
+                 description TEXT,
+                 cards_json TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS task_dependencies (
+                 id TEXT PRIMARY KEY,
+                 node_id TEXT NOT NULL,
+                 session TEXT NOT NULL,
+                 task TEXT NOT NULL,
+                 depends_node_id TEXT NOT NULL,
+                 depends_session TEXT NOT NULL,
+                 depends_task TEXT NOT NULL,
+                 required_state TEXT NOT NULL DEFAULT 'running',
+                 created_at_ms INTEGER NOT NULL,
+                 UNIQUE(node_id, session, task, depends_node_id, depends_session, depends_task)
+             );
+             CREATE INDEX IF NOT EXISTS idx_task_dependencies_target
+                 ON task_dependencies(depends_node_id, depends_session, depends_task);
+             CREATE TABLE IF NOT EXISTS scaling_policies (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 enabled INTEGER NOT NULL DEFAULT 1,
+                 watch_node_id TEXT NOT NULL,
+                 watch_session TEXT NOT NULL,
+                 watch_task TEXT NOT NULL,
+                 metric TEXT NOT NULL,
+                 scale_out_threshold REAL NOT NULL,
+                 scale_in_threshold REAL NOT NULL,
+                 scale_out_node_id TEXT NOT NULL,
+                 scale_out_session TEXT NOT NULL,
+                 scale_out_task TEXT NOT NULL,
+                 cooldown_seconds INTEGER NOT NULL DEFAULT 300,
+                 last_action TEXT,
+                 last_action_ms INTEGER,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );",
         )?;
         let store = Self {
             connection: Mutex::new(connection),
@@ -520,7 +621,103 @@ impl StateStore {
                  expires_at_ms INTEGER NOT NULL,
                  last_seen_at_ms INTEGER NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry ON auth_sessions(expires_at_ms);",
+             CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry ON auth_sessions(expires_at_ms);
+             CREATE TABLE IF NOT EXISTS workflow_revisions (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 group_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL,
+                 snapshot_json TEXT NOT NULL,
+                 note TEXT,
+                 created_at_ms INTEGER NOT NULL,
+                 UNIQUE(group_id, revision)
+             );
+             CREATE INDEX IF NOT EXISTS idx_workflow_revisions_group
+                 ON workflow_revisions(group_id, revision DESC);
+             CREATE TABLE IF NOT EXISTS workspace_quotas (
+                 id TEXT PRIMARY KEY,
+                 node_id TEXT NOT NULL,
+                 session TEXT,
+                 max_running_tasks INTEGER NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS notification_rules (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 event_types_json TEXT NOT NULL,
+                 scope_session TEXT,
+                 scope_task TEXT,
+                 webhook_url TEXT,
+                 enabled INTEGER NOT NULL DEFAULT 1,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS notifications (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 rule_id TEXT,
+                 rule_name TEXT,
+                 event_type TEXT NOT NULL,
+                 severity TEXT NOT NULL,
+                 node_id TEXT NOT NULL,
+                 session TEXT,
+                 task TEXT,
+                 title TEXT NOT NULL,
+                 message TEXT NOT NULL,
+                 details_json TEXT NOT NULL DEFAULT '{}',
+                 read INTEGER NOT NULL DEFAULT 0,
+                 created_at_ms INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_notifications_recent ON notifications(created_at_ms DESC);
+             CREATE TABLE IF NOT EXISTS api_tokens (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 token_hash TEXT NOT NULL UNIQUE,
+                 token_prefix TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 last_used_at_ms INTEGER,
+                 revoked INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS board_templates (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL UNIQUE,
+                 description TEXT,
+                 cards_json TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS task_dependencies (
+                 id TEXT PRIMARY KEY,
+                 node_id TEXT NOT NULL,
+                 session TEXT NOT NULL,
+                 task TEXT NOT NULL,
+                 depends_node_id TEXT NOT NULL,
+                 depends_session TEXT NOT NULL,
+                 depends_task TEXT NOT NULL,
+                 required_state TEXT NOT NULL DEFAULT 'running',
+                 created_at_ms INTEGER NOT NULL,
+                 UNIQUE(node_id, session, task, depends_node_id, depends_session, depends_task)
+             );
+             CREATE INDEX IF NOT EXISTS idx_task_dependencies_target
+                 ON task_dependencies(depends_node_id, depends_session, depends_task);
+             CREATE TABLE IF NOT EXISTS scaling_policies (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 enabled INTEGER NOT NULL DEFAULT 1,
+                 watch_node_id TEXT NOT NULL,
+                 watch_session TEXT NOT NULL,
+                 watch_task TEXT NOT NULL,
+                 metric TEXT NOT NULL,
+                 scale_out_threshold REAL NOT NULL,
+                 scale_in_threshold REAL NOT NULL,
+                 scale_out_node_id TEXT NOT NULL,
+                 scale_out_session TEXT NOT NULL,
+                 scale_out_task TEXT NOT NULL,
+                 cooldown_seconds INTEGER NOT NULL DEFAULT 300,
+                 last_action TEXT,
+                 last_action_ms INTEGER,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );",
         )?;
         let store = Self {
             connection: Mutex::new(connection),
@@ -532,10 +729,11 @@ impl StateStore {
     fn initialize(&self) -> Result<()> {
         let connection = self.connection.lock().expect("state store lock");
         ensure_registration_alias_column(&connection)?;
+        ensure_workflow_graph_column(&connection)?;
         let version = get_metadata(&connection, "schema_version")?;
         match version.as_deref() {
             None => set_metadata(&connection, "schema_version", SCHEMA_VERSION)?,
-            Some("1" | "2" | "3" | "4" | "5" | "6") => {
+            Some("1" | "2" | "3" | "4" | "5" | "6" | "7") => {
                 if get_metadata(&connection, "bind_host")?.as_deref() == Some("127.0.0.1") {
                     set_metadata(&connection, "bind_host", DEFAULT_BIND_HOST)?;
                 }
@@ -728,7 +926,7 @@ impl StateStore {
     pub fn workflow_groups(&self) -> Result<Vec<WorkflowGroup>> {
         let connection = self.connection.lock().expect("state store lock");
         let mut statement = connection.prepare(
-            "SELECT id, name, created_at_ms, updated_at_ms
+            "SELECT id, name, created_at_ms, updated_at_ms, graph_json
              FROM workflow_groups
              ORDER BY name COLLATE NOCASE, created_at_ms, id",
         )?;
@@ -740,6 +938,10 @@ impl StateStore {
                     created_at_ms: row.get::<_, i64>(2)? as u64,
                     updated_at_ms: row.get::<_, i64>(3)? as u64,
                     members: Vec::new(),
+                    graph: row
+                        .get::<_, Option<String>>(4)?
+                        .and_then(|json| serde_json::from_str(&json).ok())
+                        .unwrap_or_default(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -780,11 +982,27 @@ impl StateStore {
             let transaction = connection.transaction()?;
             transaction
                 .execute(
-                    "INSERT INTO workflow_groups(id, name, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4)",
-                    params![id, input.name, now as i64, now as i64],
+                    "INSERT INTO workflow_groups(id, name, created_at_ms, updated_at_ms, graph_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        id,
+                        input.name,
+                        now as i64,
+                        now as i64,
+                        serde_json::to_string(&input.graph)?
+                    ],
                 )
                 .with_context(|| format!("failed to create workflow group '{}'", input.name))?;
             write_workflow_members(&transaction, &id, &input.members)?;
+            record_workflow_revision_in_tx(
+                &transaction,
+                &id,
+                1,
+                &input.name,
+                &input.members,
+                &input.graph,
+                None,
+                now,
+            )?;
             transaction.commit()?;
         }
         self.workflow_group(&id)?
@@ -795,6 +1013,7 @@ impl StateStore {
         &self,
         id: &str,
         input: WorkflowGroupInput,
+        note: Option<&str>,
     ) -> Result<WorkflowGroup> {
         let input = normalize_workflow_group_input(input)?;
         let now = current_timestamp_ms();
@@ -803,8 +1022,8 @@ impl StateStore {
             let transaction = connection.transaction()?;
             let changed = transaction
                 .execute(
-                    "UPDATE workflow_groups SET name=?2, updated_at_ms=?3 WHERE id=?1",
-                    params![id, input.name, now as i64],
+                    "UPDATE workflow_groups SET name=?2, updated_at_ms=?3, graph_json=?4 WHERE id=?1",
+                    params![id, input.name, now as i64, serde_json::to_string(&input.graph)?],
                 )
                 .with_context(|| format!("failed to update workflow group '{id}'"))?;
             if changed == 0 {
@@ -815,6 +1034,17 @@ impl StateStore {
                 params![id],
             )?;
             write_workflow_members(&transaction, id, &input.members)?;
+            let revision = next_workflow_revision(&transaction, id)?;
+            record_workflow_revision_in_tx(
+                &transaction,
+                id,
+                revision,
+                &input.name,
+                &input.members,
+                &input.graph,
+                note,
+                now,
+            )?;
             transaction.commit()?;
         }
         self.workflow_group(id)?
@@ -918,6 +1148,753 @@ impl StateStore {
     pub fn delete_board(&self, id: &str) -> Result<bool> {
         let connection = self.connection.lock().expect("state store lock");
         Ok(connection.execute("DELETE FROM boards WHERE id=?1", params![id])? > 0)
+    }
+
+    pub fn workflow_revisions(&self, group_id: &str) -> Result<Vec<WorkflowRevision>> {
+        let connection = self.connection.lock().expect("state store lock");
+        let mut statement = connection.prepare(
+            "SELECT revision, snapshot_json, note, created_at_ms
+             FROM workflow_revisions
+             WHERE group_id=?1
+             ORDER BY revision DESC",
+        )?;
+        let rows = statement
+            .query_map(params![group_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)? as u64,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut revisions = Vec::new();
+        for (revision, snapshot_json, note, created_at_ms) in rows {
+            let snapshot: WorkflowRevisionSnapshot = serde_json::from_str(&snapshot_json)
+                .with_context(|| {
+                    format!("failed to parse revision {revision} of workflow group '{group_id}'")
+                })?;
+            revisions.push(WorkflowRevision {
+                group_id: group_id.to_string(),
+                revision,
+                name: snapshot.name,
+                members: snapshot.members,
+                graph: snapshot.graph,
+                note,
+                created_at_ms,
+            });
+        }
+        Ok(revisions)
+    }
+
+    pub fn quotas(&self) -> Result<Vec<WorkspaceQuota>> {
+        let connection = self.connection.lock().expect("state store lock");
+        let mut statement = connection.prepare(
+            "SELECT id, node_id, session, max_running_tasks, created_at_ms, updated_at_ms
+             FROM workspace_quotas
+             ORDER BY session IS NOT NULL, session COLLATE NOCASE, created_at_ms, id",
+        )?;
+        let quotas = statement
+            .query_map([], |row| {
+                Ok(WorkspaceQuota {
+                    id: row.get(0)?,
+                    node_id: row.get(1)?,
+                    session: row.get(2)?,
+                    max_running_tasks: row.get::<_, i64>(3)? as u32,
+                    created_at_ms: row.get::<_, i64>(4)? as u64,
+                    updated_at_ms: row.get::<_, i64>(5)? as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(quotas)
+    }
+
+    pub fn create_quota(
+        &self,
+        node_id: &str,
+        input: WorkspaceQuotaInput,
+    ) -> Result<WorkspaceQuota> {
+        let session = normalize_quota_session(input.session)?;
+        if input.max_running_tasks == 0 {
+            bail!("quota must allow at least one running task");
+        }
+        if self
+            .quotas()?
+            .iter()
+            .any(|quota| quota.node_id == node_id && quota.session == session)
+        {
+            bail!("a quota already exists for this scope");
+        }
+        let now = current_timestamp_ms();
+        let id = Uuid::new_v4().to_string();
+        let connection = self.connection.lock().expect("state store lock");
+        connection
+            .execute(
+                "INSERT INTO workspace_quotas(id, node_id, session, max_running_tasks, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, node_id, session, input.max_running_tasks as i64, now as i64, now as i64],
+            )
+            .with_context(|| format!("failed to create quota '{id}'"))?;
+        Ok(WorkspaceQuota {
+            id,
+            node_id: node_id.to_string(),
+            session,
+            max_running_tasks: input.max_running_tasks,
+            created_at_ms: now,
+            updated_at_ms: now,
+        })
+    }
+
+    pub fn update_quota(&self, id: &str, input: WorkspaceQuotaInput) -> Result<WorkspaceQuota> {
+        let session = normalize_quota_session(input.session)?;
+        if input.max_running_tasks == 0 {
+            bail!("quota must allow at least one running task");
+        }
+        let now = current_timestamp_ms();
+        {
+            let connection = self.connection.lock().expect("state store lock");
+            let changed = connection.execute(
+                "UPDATE workspace_quotas SET session=?2, max_running_tasks=?3, updated_at_ms=?4 WHERE id=?1",
+                params![id, session, input.max_running_tasks as i64, now as i64],
+            )?;
+            if changed == 0 {
+                bail!("quota '{id}' not found");
+            }
+            let duplicate = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM workspace_quotas WHERE node_id=(SELECT node_id FROM workspace_quotas WHERE id=?1) AND session IS ?2 AND id != ?1",
+                    params![id, session],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0);
+            if duplicate > 0 {
+                bail!("a quota already exists for this scope");
+            }
+        }
+        self.quotas()?
+            .into_iter()
+            .find(|quota| quota.id == id)
+            .with_context(|| format!("quota '{id}' disappeared after update"))
+    }
+
+    pub fn delete_quota(&self, id: &str) -> Result<bool> {
+        let connection = self.connection.lock().expect("state store lock");
+        Ok(connection.execute("DELETE FROM workspace_quotas WHERE id=?1", params![id])? > 0)
+    }
+
+    pub fn notification_rules(&self) -> Result<Vec<NotificationRule>> {
+        let connection = self.connection.lock().expect("state store lock");
+        let mut statement = connection.prepare(
+            "SELECT id, name, event_types_json, scope_session, scope_task, webhook_url, enabled, created_at_ms, updated_at_ms
+             FROM notification_rules
+             ORDER BY name COLLATE NOCASE, created_at_ms, id",
+        )?;
+        let rules = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(6)? != 0,
+                    row.get::<_, i64>(7)? as u64,
+                    row.get::<_, i64>(8)? as u64,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut parsed = Vec::new();
+        for (
+            id,
+            name,
+            event_types_json,
+            scope_session,
+            scope_task,
+            webhook_url,
+            enabled,
+            created_at_ms,
+            updated_at_ms,
+        ) in rules
+        {
+            let event_types = serde_json::from_str(&event_types_json).unwrap_or_default();
+            parsed.push(NotificationRule {
+                id,
+                name,
+                event_types,
+                scope_session,
+                scope_task,
+                webhook_url,
+                enabled,
+                created_at_ms,
+                updated_at_ms,
+            });
+        }
+        Ok(parsed)
+    }
+
+    pub fn create_notification_rule(
+        &self,
+        input: NotificationRuleInput,
+    ) -> Result<NotificationRule> {
+        let input = normalize_notification_rule_input(input)?;
+        let now = current_timestamp_ms();
+        let id = Uuid::new_v4().to_string();
+        let connection = self.connection.lock().expect("state store lock");
+        connection
+            .execute(
+                "INSERT INTO notification_rules(id, name, event_types_json, scope_session, scope_task, webhook_url, enabled, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    id,
+                    input.name,
+                    serde_json::to_string(&input.event_types)?,
+                    input.scope_session,
+                    input.scope_task,
+                    input.webhook_url,
+                    input.enabled as i64,
+                    now as i64,
+                    now as i64
+                ],
+            )
+            .with_context(|| format!("failed to create notification rule '{}'", input.name))?;
+        Ok(NotificationRule {
+            id,
+            name: input.name,
+            event_types: input.event_types,
+            scope_session: input.scope_session,
+            scope_task: input.scope_task,
+            webhook_url: input.webhook_url,
+            enabled: input.enabled,
+            created_at_ms: now,
+            updated_at_ms: now,
+        })
+    }
+
+    pub fn update_notification_rule(
+        &self,
+        id: &str,
+        input: NotificationRuleInput,
+    ) -> Result<NotificationRule> {
+        let input = normalize_notification_rule_input(input)?;
+        let now = current_timestamp_ms();
+        {
+            let connection = self.connection.lock().expect("state store lock");
+            let changed = connection.execute(
+                "UPDATE notification_rules SET name=?2, event_types_json=?3, scope_session=?4, scope_task=?5, webhook_url=?6, enabled=?7, updated_at_ms=?8 WHERE id=?1",
+                params![
+                    id,
+                    input.name,
+                    serde_json::to_string(&input.event_types)?,
+                    input.scope_session,
+                    input.scope_task,
+                    input.webhook_url,
+                    input.enabled as i64,
+                    now as i64
+                ],
+            )?;
+            if changed == 0 {
+                bail!("notification rule '{id}' not found");
+            }
+        }
+        let mut rules = self.notification_rules()?;
+        rules
+            .drain(..)
+            .find(|rule| rule.id == id)
+            .with_context(|| format!("notification rule '{id}' disappeared after update"))
+    }
+
+    pub fn delete_notification_rule(&self, id: &str) -> Result<bool> {
+        let connection = self.connection.lock().expect("state store lock");
+        Ok(connection.execute("DELETE FROM notification_rules WHERE id=?1", params![id])? > 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_notification(
+        &self,
+        node_id: &str,
+        rule_id: Option<&str>,
+        rule_name: Option<&str>,
+        event_type: &str,
+        severity: &str,
+        session: Option<&str>,
+        task: Option<&str>,
+        title: &str,
+        message: &str,
+        details: &serde_json::Value,
+    ) -> Result<Notification> {
+        let now = current_timestamp_ms();
+        let connection = self.connection.lock().expect("state store lock");
+        connection
+            .execute(
+                "INSERT INTO notifications(rule_id, rule_name, event_type, severity, node_id, session, task, title, message, details_json, read, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11)",
+                params![
+                    rule_id,
+                    rule_name,
+                    event_type,
+                    severity,
+                    node_id,
+                    session,
+                    task,
+                    title,
+                    message,
+                    serde_json::to_string(details)?,
+                    now as i64
+                ],
+            )
+            .with_context(|| format!("failed to insert notification '{title}'"))?;
+        let id = connection.last_insert_rowid() as u64;
+        let _ = connection.execute(
+            "DELETE FROM notifications WHERE id IN (
+                 SELECT id FROM notifications ORDER BY created_at_ms DESC, id DESC LIMIT -1 OFFSET ?1
+             )",
+            params![NOTIFICATION_RETENTION_LIMIT as i64],
+        );
+        Ok(Notification {
+            id,
+            node_id: node_id.to_string(),
+            rule_id: rule_id.map(str::to_string),
+            rule_name: rule_name.map(str::to_string),
+            event_type: event_type.to_string(),
+            severity: severity.to_string(),
+            session: session.map(str::to_string),
+            task: task.map(str::to_string),
+            title: title.to_string(),
+            message: message.to_string(),
+            read: false,
+            created_at_ms: now,
+        })
+    }
+
+    pub fn notifications(&self, limit: usize) -> Result<Vec<Notification>> {
+        let connection = self.connection.lock().expect("state store lock");
+        let mut statement = connection.prepare(
+            "SELECT id, rule_id, rule_name, event_type, severity, node_id, session, task, title, message, read, created_at_ms
+             FROM notifications
+             ORDER BY created_at_ms DESC, id DESC
+             LIMIT ?1",
+        )?;
+        let notifications = statement
+            .query_map(params![limit as i64], |row| {
+                Ok(Notification {
+                    id: row.get::<_, i64>(0)? as u64,
+                    rule_id: row.get(1)?,
+                    rule_name: row.get(2)?,
+                    event_type: row.get(3)?,
+                    severity: row.get(4)?,
+                    node_id: row.get(5)?,
+                    session: row.get(6)?,
+                    task: row.get(7)?,
+                    title: row.get(8)?,
+                    message: row.get(9)?,
+                    read: row.get::<_, i64>(10)? != 0,
+                    created_at_ms: row.get::<_, i64>(11)? as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(notifications)
+    }
+
+    pub fn unread_notification_count(&self) -> Result<u64> {
+        let connection = self.connection.lock().expect("state store lock");
+        let count = connection.query_row(
+            "SELECT COUNT(*) FROM notifications WHERE read = 0",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    pub fn mark_notifications_read(&self, id: Option<u64>) -> Result<u64> {
+        let connection = self.connection.lock().expect("state store lock");
+        let changed = match id {
+            Some(id) => connection.execute(
+                "UPDATE notifications SET read = 1 WHERE id = ?1",
+                params![id as i64],
+            )?,
+            None => connection.execute("UPDATE notifications SET read = 1 WHERE read = 0", [])?,
+        };
+        Ok(changed as u64)
+    }
+
+    pub fn create_api_token(&self, name: &str) -> Result<ApiTokenCreated> {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("token name cannot be empty");
+        }
+        let secret = format!("tdk_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let now = current_timestamp_ms();
+        let id = Uuid::new_v4().to_string();
+        let token_prefix: String = secret.chars().take(12).collect();
+        let connection = self.connection.lock().expect("state store lock");
+        connection
+            .execute(
+                "INSERT INTO api_tokens(id, name, token_hash, token_prefix, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, name, sha256_hex(secret.as_bytes()), token_prefix, now as i64],
+            )
+            .with_context(|| format!("failed to create API token '{name}'"))?;
+        Ok(ApiTokenCreated {
+            token: ApiToken {
+                id,
+                name: name.to_string(),
+                token_prefix,
+                created_at_ms: now,
+                last_used_at_ms: None,
+                revoked: false,
+            },
+            secret,
+        })
+    }
+
+    pub fn api_tokens(&self) -> Result<Vec<ApiToken>> {
+        let connection = self.connection.lock().expect("state store lock");
+        let mut statement = connection.prepare(
+            "SELECT id, name, token_prefix, created_at_ms, last_used_at_ms, revoked
+             FROM api_tokens
+             ORDER BY created_at_ms DESC, id",
+        )?;
+        let tokens = statement
+            .query_map([], |row| {
+                Ok(ApiToken {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    token_prefix: row.get(2)?,
+                    created_at_ms: row.get::<_, i64>(3)? as u64,
+                    last_used_at_ms: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                    revoked: row.get::<_, i64>(5)? != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(tokens)
+    }
+
+    pub fn revoke_api_token(&self, id: &str) -> Result<bool> {
+        let connection = self.connection.lock().expect("state store lock");
+        Ok(connection.execute(
+            "UPDATE api_tokens SET revoked = 1 WHERE id = ?1",
+            params![id],
+        )? > 0)
+    }
+
+    pub fn verify_api_token(&self, secret: &str) -> Result<bool> {
+        let connection = self.connection.lock().expect("state store lock");
+        let revoked = connection
+            .query_row(
+                "SELECT revoked FROM api_tokens WHERE token_hash = ?1",
+                params![sha256_hex(secret.as_bytes())],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        match revoked {
+            Some(0) => {
+                let _ = connection.execute(
+                    "UPDATE api_tokens SET last_used_at_ms = ?1 WHERE token_hash = ?2",
+                    params![current_timestamp_ms() as i64, sha256_hex(secret.as_bytes())],
+                );
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub fn board_templates(&self) -> Result<Vec<BoardTemplate>> {
+        let connection = self.connection.lock().expect("state store lock");
+        let mut statement = connection.prepare(
+            "SELECT id, name, description, cards_json, created_at_ms, updated_at_ms
+             FROM board_templates
+             ORDER BY name COLLATE NOCASE, created_at_ms, id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)? as u64,
+                    row.get::<_, i64>(5)? as u64,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut templates = Vec::new();
+        for (id, name, description, cards_json, created_at_ms, updated_at_ms) in rows {
+            let cards: Vec<BoardCardInput> = serde_json::from_str(&cards_json).unwrap_or_default();
+            templates.push(BoardTemplate {
+                id,
+                name,
+                description,
+                cards,
+                created_at_ms,
+                updated_at_ms,
+            });
+        }
+        Ok(templates)
+    }
+
+    pub fn board_template(&self, id: &str) -> Result<Option<BoardTemplate>> {
+        Ok(self
+            .board_templates()?
+            .into_iter()
+            .find(|template| template.id == id))
+    }
+
+    pub fn create_board_template(&self, input: BoardTemplateInput) -> Result<BoardTemplate> {
+        let input = normalize_board_template_input(input)?;
+        let now = current_timestamp_ms();
+        let id = Uuid::new_v4().to_string();
+        let connection = self.connection.lock().expect("state store lock");
+        connection
+            .execute(
+                "INSERT INTO board_templates(id, name, description, cards_json, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id,
+                    input.name,
+                    input.description,
+                    serde_json::to_string(&input.cards)?,
+                    now as i64,
+                    now as i64
+                ],
+            )
+            .with_context(|| format!("failed to create board template '{}'", input.name))?;
+        Ok(BoardTemplate {
+            id,
+            name: input.name,
+            description: input.description,
+            cards: input.cards,
+            created_at_ms: now,
+            updated_at_ms: now,
+        })
+    }
+
+    pub fn delete_board_template(&self, id: &str) -> Result<bool> {
+        let connection = self.connection.lock().expect("state store lock");
+        Ok(connection.execute("DELETE FROM board_templates WHERE id=?1", params![id])? > 0)
+    }
+
+    pub fn task_dependencies(&self) -> Result<Vec<TaskDependency>> {
+        let connection = self.connection.lock().expect("state store lock");
+        let mut statement = connection.prepare(
+            "SELECT id, node_id, session, task, depends_node_id, depends_session, depends_task, required_state, created_at_ms
+             FROM task_dependencies
+             ORDER BY session COLLATE NOCASE, task COLLATE NOCASE, created_at_ms, id",
+        )?;
+        let dependencies = statement
+            .query_map([], |row| {
+                Ok(TaskDependency {
+                    id: row.get(0)?,
+                    node_id: row.get(1)?,
+                    session: row.get(2)?,
+                    task: row.get(3)?,
+                    depends_node_id: row.get(4)?,
+                    depends_session: row.get(5)?,
+                    depends_task: row.get(6)?,
+                    required_state: row.get(7)?,
+                    created_at_ms: row.get::<_, i64>(8)? as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(dependencies)
+    }
+
+    pub fn create_task_dependency(&self, input: TaskDependencyInput) -> Result<TaskDependency> {
+        let input = normalize_task_dependency_input(input)?;
+        let now = current_timestamp_ms();
+        let id = Uuid::new_v4().to_string();
+        let connection = self.connection.lock().expect("state store lock");
+        connection
+            .execute(
+                "INSERT INTO task_dependencies(id, node_id, session, task, depends_node_id, depends_session, depends_task, required_state, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    id,
+                    input.node_id,
+                    input.session,
+                    input.task,
+                    input.depends_node_id,
+                    input.depends_session,
+                    input.depends_task,
+                    input.required_state,
+                    now as i64
+                ],
+            )
+            .map_err(|error| {
+                if format!("{error}").contains("UNIQUE") {
+                    anyhow::Error::msg("this dependency already exists")
+                } else {
+                    anyhow::Error::new(error).context("failed to create task dependency")
+                }
+            })?;
+        Ok(TaskDependency {
+            id,
+            node_id: input.node_id,
+            session: input.session,
+            task: input.task,
+            depends_node_id: input.depends_node_id,
+            depends_session: input.depends_session,
+            depends_task: input.depends_task,
+            required_state: input
+                .required_state
+                .unwrap_or_else(|| "running".to_string()),
+            created_at_ms: now,
+        })
+    }
+
+    pub fn delete_task_dependency(&self, id: &str) -> Result<bool> {
+        let connection = self.connection.lock().expect("state store lock");
+        Ok(connection.execute("DELETE FROM task_dependencies WHERE id=?1", params![id])? > 0)
+    }
+
+    pub fn dependencies_for_task(
+        &self,
+        node_id: &str,
+        session: &str,
+        task: &str,
+    ) -> Result<Vec<TaskDependency>> {
+        Ok(self
+            .task_dependencies()?
+            .into_iter()
+            .filter(|dependency| {
+                dependency.node_id == node_id
+                    && dependency.session == session
+                    && dependency.task == task
+            })
+            .collect())
+    }
+
+    pub fn scaling_policies(&self) -> Result<Vec<ScalingPolicy>> {
+        let connection = self.connection.lock().expect("state store lock");
+        let mut statement = connection.prepare(
+            "SELECT id, name, enabled, watch_node_id, watch_session, watch_task, metric, scale_out_threshold, scale_in_threshold, scale_out_node_id, scale_out_session, scale_out_task, cooldown_seconds, last_action, last_action_ms, created_at_ms, updated_at_ms
+             FROM scaling_policies
+             ORDER BY name COLLATE NOCASE, created_at_ms, id",
+        )?;
+        let policies = statement
+            .query_map([], |row| {
+                Ok(ScalingPolicy {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    enabled: row.get::<_, i64>(2)? != 0,
+                    watch_node_id: row.get(3)?,
+                    watch_session: row.get(4)?,
+                    watch_task: row.get(5)?,
+                    metric: normalize_scaling_metric(&row.get::<_, String>(6)?),
+                    scale_out_threshold: row.get(7)?,
+                    scale_in_threshold: row.get(8)?,
+                    scale_out_node_id: row.get(9)?,
+                    scale_out_session: row.get(10)?,
+                    scale_out_task: row.get(11)?,
+                    cooldown_seconds: row.get::<_, i64>(12)? as u64,
+                    last_action: row.get(13)?,
+                    last_action_ms: row.get::<_, Option<i64>>(14)?.map(|v| v as u64),
+                    created_at_ms: row.get::<_, i64>(15)? as u64,
+                    updated_at_ms: row.get::<_, i64>(16)? as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(policies)
+    }
+
+    pub fn create_scaling_policy(&self, input: ScalingPolicyInput) -> Result<ScalingPolicy> {
+        let input = normalize_scaling_policy_input(input)?;
+        let now = current_timestamp_ms();
+        let id = Uuid::new_v4().to_string();
+        let connection = self.connection.lock().expect("state store lock");
+        connection
+            .execute(
+                "INSERT INTO scaling_policies(id, name, enabled, watch_node_id, watch_session, watch_task, metric, scale_out_threshold, scale_in_threshold, scale_out_node_id, scale_out_session, scale_out_task, cooldown_seconds, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    id,
+                    input.name,
+                    input.enabled as i64,
+                    input.watch_node_id,
+                    input.watch_session,
+                    input.watch_task,
+                    input.metric.as_str(),
+                    input.scale_out_threshold,
+                    input.scale_in_threshold,
+                    input.scale_out_node_id,
+                    input.scale_out_session,
+                    input.scale_out_task,
+                    input.cooldown_seconds as i64,
+                    now as i64,
+                    now as i64
+                ],
+            )
+            .with_context(|| format!("failed to create scaling policy '{}'", input.name))?;
+        Ok(ScalingPolicy {
+            id,
+            name: input.name,
+            enabled: input.enabled,
+            watch_node_id: input.watch_node_id,
+            watch_session: input.watch_session,
+            watch_task: input.watch_task,
+            metric: input.metric,
+            scale_out_threshold: input.scale_out_threshold,
+            scale_in_threshold: input.scale_in_threshold,
+            scale_out_node_id: input.scale_out_node_id,
+            scale_out_session: input.scale_out_session,
+            scale_out_task: input.scale_out_task,
+            cooldown_seconds: input.cooldown_seconds,
+            last_action: None,
+            last_action_ms: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        })
+    }
+
+    pub fn update_scaling_policy(
+        &self,
+        id: &str,
+        input: ScalingPolicyInput,
+    ) -> Result<ScalingPolicy> {
+        let input = normalize_scaling_policy_input(input)?;
+        let now = current_timestamp_ms();
+        {
+            let connection = self.connection.lock().expect("state store lock");
+            let changed = connection.execute(
+                "UPDATE scaling_policies SET name=?2, enabled=?3, watch_node_id=?4, watch_session=?5, watch_task=?6, metric=?7, scale_out_threshold=?8, scale_in_threshold=?9, scale_out_node_id=?10, scale_out_session=?11, scale_out_task=?12, cooldown_seconds=?13, updated_at_ms=?14 WHERE id=?1",
+                params![
+                    id,
+                    input.name,
+                    input.enabled as i64,
+                    input.watch_node_id,
+                    input.watch_session,
+                    input.watch_task,
+                    input.metric.as_str(),
+                    input.scale_out_threshold,
+                    input.scale_in_threshold,
+                    input.scale_out_node_id,
+                    input.scale_out_session,
+                    input.scale_out_task,
+                    input.cooldown_seconds as i64,
+                    now as i64
+                ],
+            )?;
+            if changed == 0 {
+                bail!("scaling policy '{id}' not found");
+            }
+        }
+        self.scaling_policies()?
+            .into_iter()
+            .find(|policy| policy.id == id)
+            .with_context(|| format!("scaling policy '{id}' disappeared after update"))
+    }
+
+    pub fn delete_scaling_policy(&self, id: &str) -> Result<bool> {
+        let connection = self.connection.lock().expect("state store lock");
+        Ok(connection.execute("DELETE FROM scaling_policies WHERE id=?1", params![id])? > 0)
+    }
+
+    pub fn record_scaling_action(&self, id: &str, action: &str, at_ms: u64) -> Result<()> {
+        let connection = self.connection.lock().expect("state store lock");
+        connection.execute(
+            "UPDATE scaling_policies SET last_action=?2, last_action_ms=?3 WHERE id=?1",
+            params![id, action, at_ms as i64],
+        )?;
+        Ok(())
     }
 
     pub fn remove_registration(&self, session: &str) -> Result<bool> {
@@ -1588,6 +2565,25 @@ fn normalize_workflow_group_input(mut input: WorkflowGroupInput) -> Result<Workf
         }
     }
 
+    let mut seen_edges = HashSet::new();
+    for edge in &input.graph.edges {
+        if edge.from >= input.members.len() || edge.to >= input.members.len() {
+            bail!("workflow graph edge references a member that does not exist");
+        }
+        if edge.from == edge.to {
+            bail!("workflow graph edges cannot connect a member to itself");
+        }
+        if !seen_edges.insert((edge.from, edge.to)) {
+            bail!("duplicate workflow graph edge");
+        }
+    }
+    if workflow_graph_has_cycle(&input.graph.edges, input.members.len()) {
+        bail!("workflow graph edges cannot contain cycles");
+    }
+    if input.graph.positions.len() > input.members.len() {
+        input.graph.positions.truncate(input.members.len());
+    }
+
     Ok(input)
 }
 
@@ -1660,6 +2656,216 @@ fn write_board_cards(
         )?;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkflowRevisionSnapshot {
+    name: String,
+    members: Vec<WorkflowGroupMember>,
+    graph: WorkflowGraph,
+}
+
+fn next_workflow_revision(transaction: &rusqlite::Transaction<'_>, group_id: &str) -> Result<u64> {
+    let current = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(revision), 0) FROM workflow_revisions WHERE group_id=?1",
+            params![group_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .context("failed to read workflow revision counter")?;
+    Ok(current as u64 + 1)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_workflow_revision_in_tx(
+    transaction: &rusqlite::Transaction<'_>,
+    group_id: &str,
+    revision: u64,
+    name: &str,
+    members: &[WorkflowGroupMember],
+    graph: &WorkflowGraph,
+    note: Option<&str>,
+    at_ms: u64,
+) -> Result<()> {
+    let snapshot = WorkflowRevisionSnapshot {
+        name: name.to_string(),
+        members: members.to_vec(),
+        graph: graph.clone(),
+    };
+    transaction.execute(
+        "INSERT INTO workflow_revisions(group_id, revision, snapshot_json, note, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            group_id,
+            revision as i64,
+            serde_json::to_string(&snapshot)?,
+            note,
+            at_ms as i64
+        ],
+    )?;
+    transaction.execute(
+        "DELETE FROM workflow_revisions WHERE group_id=?1 AND revision <= (
+             SELECT MAX(revision) - ?2 FROM workflow_revisions WHERE group_id=?1
+         )",
+        params![group_id, WORKFLOW_REVISION_RETENTION_LIMIT as i64],
+    )?;
+    Ok(())
+}
+
+fn normalize_quota_session(session: Option<String>) -> Result<Option<String>> {
+    match session {
+        Some(session) => {
+            let session = session.trim();
+            if session.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(session.to_string()))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+fn normalize_notification_rule_input(
+    mut input: NotificationRuleInput,
+) -> Result<NotificationRuleInput> {
+    input.name = input.name.trim().to_string();
+    if input.name.is_empty() {
+        bail!("notification rule name cannot be empty");
+    }
+    let allowed: HashSet<&str> =
+        HashSet::from(["task_started", "task_exited", "task_failed", "task_stopped"]);
+    let mut event_types = Vec::new();
+    for event_type in &input.event_types {
+        let event_type = event_type.trim();
+        if !allowed.contains(event_type) {
+            bail!(
+                "unsupported notification event type '{event_type}' (expected one of task_started, task_exited, task_failed, task_stopped)"
+            );
+        }
+        if !event_types
+            .iter()
+            .any(|existing: &String| existing == event_type)
+        {
+            event_types.push(event_type.to_string());
+        }
+    }
+    if event_types.is_empty() {
+        bail!("notification rules require at least one event type");
+    }
+    input.event_types = event_types;
+    if let Some(webhook_url) = &input.webhook_url {
+        let webhook_url = webhook_url.trim();
+        if !webhook_url.is_empty()
+            && !webhook_url.starts_with("http://")
+            && !webhook_url.starts_with("https://")
+        {
+            bail!("webhook URL must start with http:// or https://");
+        }
+        input.webhook_url = if webhook_url.is_empty() {
+            None
+        } else {
+            Some(webhook_url.to_string())
+        };
+    } else {
+        input.webhook_url = None;
+    }
+    input.scope_session = normalize_quota_session(input.scope_session)?;
+    input.scope_task = normalize_quota_session(input.scope_task)?;
+    Ok(input)
+}
+
+fn normalize_board_template_input(mut input: BoardTemplateInput) -> Result<BoardTemplateInput> {
+    input.name = input.name.trim().to_string();
+    if input.name.is_empty() {
+        bail!("board template name cannot be empty");
+    }
+    if let Some(description) = &input.description {
+        let description = description.trim();
+        input.description = if description.is_empty() {
+            None
+        } else {
+            Some(description.to_string())
+        };
+    }
+    for card in &mut input.cards {
+        card.node_id = card.node_id.trim().to_string();
+        card.session = card.session.trim().to_string();
+        card.task = card.task.trim().to_string();
+        if card.node_id.is_empty() || card.session.is_empty() || card.task.is_empty() {
+            bail!("board template cards require node_id, session, and task");
+        }
+    }
+    Ok(input)
+}
+
+fn normalize_task_dependency_input(mut input: TaskDependencyInput) -> Result<TaskDependencyInput> {
+    input.node_id = input.node_id.trim().to_string();
+    input.session = input.session.trim().to_string();
+    input.task = input.task.trim().to_string();
+    input.depends_node_id = input.depends_node_id.trim().to_string();
+    input.depends_session = input.depends_session.trim().to_string();
+    input.depends_task = input.depends_task.trim().to_string();
+    if input.node_id.is_empty()
+        || input.session.is_empty()
+        || input.task.is_empty()
+        || input.depends_node_id.is_empty()
+        || input.depends_session.is_empty()
+        || input.depends_task.is_empty()
+    {
+        bail!("task dependencies require node_id, session, and task on both sides");
+    }
+    if input.node_id == input.depends_node_id
+        && input.session == input.depends_session
+        && input.task == input.depends_task
+    {
+        bail!("a task cannot depend on itself");
+    }
+    match input.required_state.as_deref().map(str::trim) {
+        None | Some("") => input.required_state = Some("running".to_string()),
+        Some("running") => input.required_state = Some("running".to_string()),
+        Some(other) => bail!("unsupported dependency required state '{other}'"),
+    }
+    Ok(input)
+}
+
+fn normalize_scaling_metric(value: &str) -> ScalingMetric {
+    match value {
+        "memory_bytes" => ScalingMetric::MemoryBytes,
+        _ => ScalingMetric::CpuPercent,
+    }
+}
+
+fn normalize_scaling_policy_input(mut input: ScalingPolicyInput) -> Result<ScalingPolicyInput> {
+    input.name = input.name.trim().to_string();
+    if input.name.is_empty() {
+        bail!("scaling policy name cannot be empty");
+    }
+    input.watch_node_id = input.watch_node_id.trim().to_string();
+    input.watch_session = input.watch_session.trim().to_string();
+    input.watch_task = input.watch_task.trim().to_string();
+    input.scale_out_node_id = input.scale_out_node_id.trim().to_string();
+    input.scale_out_session = input.scale_out_session.trim().to_string();
+    input.scale_out_task = input.scale_out_task.trim().to_string();
+    if input.watch_node_id.is_empty()
+        || input.watch_session.is_empty()
+        || input.watch_task.is_empty()
+        || input.scale_out_node_id.is_empty()
+        || input.scale_out_session.is_empty()
+        || input.scale_out_task.is_empty()
+    {
+        bail!("scaling policies require a watch target and a scale-out target");
+    }
+    if !input.scale_out_threshold.is_finite()
+        || !input.scale_in_threshold.is_finite()
+        || input.scale_out_threshold <= 0.0
+    {
+        bail!("scaling thresholds must be positive numbers");
+    }
+    if input.scale_in_threshold >= input.scale_out_threshold {
+        bail!("scale-in threshold must be lower than scale-out threshold");
+    }
+    Ok(input)
 }
 
 fn paginated_mcp_calls(
@@ -2157,6 +3363,57 @@ fn ensure_registration_alias_column(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_workflow_graph_column(connection: &Connection) -> Result<()> {
+    let exists: bool = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('workflow_groups') WHERE name='graph_json'",
+            [],
+            |row| row.get::<_, i64>(0).map(|count| count > 0),
+        )
+        .context("failed to inspect workflow_groups schema")?;
+    if !exists {
+        connection
+            .execute("ALTER TABLE workflow_groups ADD COLUMN graph_json TEXT", [])
+            .context("failed to add workflow graph column")?;
+    }
+    Ok(())
+}
+
+fn workflow_graph_has_cycle(
+    edges: &[crate::protocol::WorkflowGraphEdge],
+    member_count: usize,
+) -> bool {
+    let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); member_count];
+    for edge in edges {
+        adjacency[edge.from].push(edge.to);
+    }
+    // 0 = unvisited, 1 = in progress, 2 = done
+    let mut colors = vec![0u8; member_count];
+    for start in 0..member_count {
+        let mut stack = vec![(start, 0usize)];
+        while let Some((node, cursor)) = stack.pop() {
+            if cursor == 0 {
+                if colors[node] == 1 {
+                    return true;
+                }
+                if colors[node] == 2 {
+                    continue;
+                }
+                colors[node] = 1;
+            }
+            if let Some(&next) = adjacency[node].get(cursor) {
+                stack.push((node, cursor + 1));
+                if colors[next] != 2 {
+                    stack.push((next, 0));
+                }
+            } else {
+                colors[node] = 2;
+            }
+        }
+    }
+    false
+}
+
 pub fn environment_overrides() -> Vec<crate::protocol::EnvironmentOverride> {
     [
         ("role", "TASKDECK_ROLE"),
@@ -2335,6 +3592,7 @@ mod tests {
                         task: "dev".to_string(),
                     },
                 ],
+                graph: crate::protocol::WorkflowGraph::default(),
             })
             .unwrap();
         assert_eq!(group.name, "Release train");
@@ -2349,6 +3607,7 @@ mod tests {
                 .create_workflow_group(crate::protocol::WorkflowGroupInput {
                     name: "Release train".to_string(),
                     members: Vec::new(),
+                    graph: crate::protocol::WorkflowGraph::default(),
                 })
                 .is_err()
         );
@@ -2357,6 +3616,7 @@ mod tests {
                 .create_workflow_group(crate::protocol::WorkflowGroupInput {
                     name: " ".to_string(),
                     members: Vec::new(),
+                    graph: crate::protocol::WorkflowGraph::default(),
                 })
                 .is_err()
         );
@@ -2378,7 +3638,9 @@ mod tests {
                                 task: "dev".to_string(),
                             },
                         ],
+                        graph: crate::protocol::WorkflowGraph::default(),
                     },
+                    None,
                 )
                 .is_err()
         );
@@ -2388,7 +3650,9 @@ mod tests {
                 crate::protocol::WorkflowGroupInput {
                     name: "Updated".to_string(),
                     members: group.members.iter().cloned().rev().collect(),
+                    graph: crate::protocol::WorkflowGraph::default(),
                 },
+                None,
             )
             .unwrap();
         assert_eq!(updated.name, "Updated");
@@ -2491,6 +3755,519 @@ mod tests {
     }
 
     #[test]
+    fn workflow_groups_persist_graph_and_record_revisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(dir.path()).unwrap();
+        let graph = crate::protocol::WorkflowGraph {
+            positions: vec![
+                crate::protocol::WorkflowGraphNodePosition { x: 10.0, y: 20.0 },
+                crate::protocol::WorkflowGraphNodePosition { x: 30.0, y: 40.0 },
+            ],
+            edges: vec![crate::protocol::WorkflowGraphEdge { from: 0, to: 1 }],
+        };
+        let group = store
+            .create_workflow_group(WorkflowGroupInput {
+                name: " Release pipeline ".to_string(),
+                members: vec![
+                    WorkflowGroupMember {
+                        node_id: "self".to_string(),
+                        session: "api".to_string(),
+                        task: "build".to_string(),
+                    },
+                    WorkflowGroupMember {
+                        node_id: "self".to_string(),
+                        session: "api".to_string(),
+                        task: "deploy".to_string(),
+                    },
+                ],
+                graph: graph.clone(),
+            })
+            .unwrap();
+        assert_eq!(group.name, "Release pipeline");
+        assert_eq!(group.graph, graph);
+
+        let reopened = StateStore::open(dir.path()).unwrap();
+        let restored = reopened.workflow_group(&group.id).unwrap().unwrap();
+        assert_eq!(restored.graph, graph);
+
+        let revisions = reopened.workflow_revisions(&group.id).unwrap();
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(revisions[0].revision, 1);
+        assert_eq!(revisions[0].members.len(), 2);
+
+        reopened
+            .update_workflow_group(
+                &group.id,
+                WorkflowGroupInput {
+                    name: "Release pipeline".to_string(),
+                    members: restored.members.clone(),
+                    graph: graph.clone(),
+                },
+                Some("renamed".to_string().as_str()),
+            )
+            .unwrap();
+        let revisions = reopened.workflow_revisions(&group.id).unwrap();
+        assert_eq!(revisions.len(), 2);
+        assert_eq!(revisions[0].revision, 2);
+        assert_eq!(revisions[0].note.as_deref(), Some("renamed"));
+
+        // invalid edges are rejected
+        let bad_edge = reopened
+            .update_workflow_group(
+                &group.id,
+                WorkflowGroupInput {
+                    name: "Release pipeline".to_string(),
+                    members: restored.members.clone(),
+                    graph: crate::protocol::WorkflowGraph {
+                        positions: Vec::new(),
+                        edges: vec![crate::protocol::WorkflowGraphEdge { from: 0, to: 5 }],
+                    },
+                },
+                None,
+            )
+            .unwrap_err();
+        assert!(format!("{bad_edge:#}").contains("does not exist"));
+
+        // cycles are rejected
+        let cycle = reopened
+            .update_workflow_group(
+                &group.id,
+                WorkflowGroupInput {
+                    name: "Release pipeline".to_string(),
+                    members: restored.members.clone(),
+                    graph: crate::protocol::WorkflowGraph {
+                        positions: Vec::new(),
+                        edges: vec![
+                            crate::protocol::WorkflowGraphEdge { from: 0, to: 1 },
+                            crate::protocol::WorkflowGraphEdge { from: 1, to: 0 },
+                        ],
+                    },
+                },
+                None,
+            )
+            .unwrap_err();
+        assert!(format!("{cycle:#}").contains("cycles"));
+
+        // revision retention keeps only the newest snapshots
+        for index in 0..(WORKFLOW_REVISION_RETENTION_LIMIT as u64 + 2) {
+            reopened
+                .update_workflow_group(
+                    &group.id,
+                    WorkflowGroupInput {
+                        name: format!("Release pipeline {index}"),
+                        members: restored.members.clone(),
+                        graph: graph.clone(),
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+        let revisions = reopened.workflow_revisions(&group.id).unwrap();
+        assert_eq!(revisions.len(), WORKFLOW_REVISION_RETENTION_LIMIT);
+        assert_eq!(
+            revisions[0].revision,
+            WORKFLOW_REVISION_RETENTION_LIMIT as u64 + 4
+        );
+    }
+
+    #[test]
+    fn quotas_are_persisted_and_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(dir.path()).unwrap();
+        let node_quota = store
+            .create_quota(
+                "node-1",
+                WorkspaceQuotaInput {
+                    session: None,
+                    max_running_tasks: 4,
+                },
+            )
+            .unwrap();
+        assert_eq!(node_quota.session, None);
+        let session_quota = store
+            .create_quota(
+                "node-1",
+                WorkspaceQuotaInput {
+                    session: Some(" api ".to_string()),
+                    max_running_tasks: 2,
+                },
+            )
+            .unwrap();
+        assert_eq!(session_quota.session.as_deref(), Some("api"));
+
+        assert!(
+            store
+                .create_quota(
+                    "node-1",
+                    WorkspaceQuotaInput {
+                        session: Some("api".to_string()),
+                        max_running_tasks: 3,
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .create_quota(
+                    "node-1",
+                    WorkspaceQuotaInput {
+                        session: None,
+                        max_running_tasks: 0,
+                    }
+                )
+                .is_err()
+        );
+
+        let updated = store
+            .update_quota(
+                &session_quota.id,
+                WorkspaceQuotaInput {
+                    session: Some("web".to_string()),
+                    max_running_tasks: 6,
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.session.as_deref(), Some("web"));
+        assert_eq!(updated.max_running_tasks, 6);
+        assert!(store.delete_quota(&session_quota.id).unwrap());
+        assert_eq!(store.quotas().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn notifications_rules_and_records_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(dir.path()).unwrap();
+        let rule = store
+            .create_notification_rule(NotificationRuleInput {
+                name: " failures ".to_string(),
+                event_types: vec!["task_failed".to_string()],
+                scope_session: Some("api".to_string()),
+                scope_task: None,
+                webhook_url: Some("https://example.com/hook".to_string()),
+                enabled: true,
+            })
+            .unwrap();
+        assert_eq!(rule.name, "failures");
+
+        assert!(
+            store
+                .create_notification_rule(NotificationRuleInput {
+                    name: "bad".to_string(),
+                    event_types: vec!["explosion".to_string()],
+                    scope_session: None,
+                    scope_task: None,
+                    webhook_url: None,
+                    enabled: true,
+                })
+                .is_err()
+        );
+        assert!(
+            store
+                .create_notification_rule(NotificationRuleInput {
+                    name: "bad".to_string(),
+                    event_types: vec![],
+                    scope_session: None,
+                    scope_task: None,
+                    webhook_url: None,
+                    enabled: true,
+                })
+                .is_err()
+        );
+        assert!(
+            store
+                .create_notification_rule(NotificationRuleInput {
+                    name: "bad".to_string(),
+                    event_types: vec!["task_failed".to_string()],
+                    scope_session: None,
+                    scope_task: None,
+                    webhook_url: Some("ftp://example.com".to_string()),
+                    enabled: true,
+                })
+                .is_err()
+        );
+
+        let first = store
+            .insert_notification(
+                "node-1",
+                Some(&rule.id),
+                Some(&rule.name),
+                "task_failed",
+                "critical",
+                Some("api"),
+                Some("build"),
+                "task failed",
+                "build exited with code 1",
+                &serde_json::json!({"exit_code": 1}),
+            )
+            .unwrap();
+        store
+            .insert_notification(
+                "node-1",
+                None,
+                None,
+                "scale_out",
+                "info",
+                None,
+                None,
+                "scaled out",
+                "replica started",
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        assert_eq!(store.unread_notification_count().unwrap(), 2);
+        assert_eq!(store.mark_notifications_read(Some(first.id)).unwrap(), 1);
+        assert_eq!(store.unread_notification_count().unwrap(), 1);
+        assert_eq!(store.mark_notifications_read(None).unwrap(), 1);
+        assert_eq!(store.unread_notification_count().unwrap(), 0);
+        assert_eq!(store.notifications(10).unwrap().len(), 2);
+
+        for index in 0..(NOTIFICATION_RETENTION_LIMIT + 5) {
+            store
+                .insert_notification(
+                    "node-1",
+                    None,
+                    None,
+                    "task_started",
+                    "info",
+                    Some("api"),
+                    Some("dev"),
+                    "started",
+                    "dev",
+                    &serde_json::json!({}),
+                )
+                .unwrap();
+        }
+        let (total, _) = store
+            .connection
+            .lock()
+            .expect("state store lock")
+            .query_row("SELECT COUNT(*) FROM notifications", [], |row| {
+                row.get::<_, i64>(0).map(|count| (count, ()))
+            })
+            .unwrap();
+        assert_eq!(total as usize, NOTIFICATION_RETENTION_LIMIT);
+
+        let updated = store
+            .update_notification_rule(
+                &rule.id,
+                NotificationRuleInput {
+                    name: "failures".to_string(),
+                    event_types: vec!["task_failed".to_string(), "task_stopped".to_string()],
+                    scope_session: None,
+                    scope_task: None,
+                    webhook_url: None,
+                    enabled: false,
+                },
+            )
+            .unwrap();
+        assert!(!updated.enabled);
+        assert_eq!(updated.event_types.len(), 2);
+        assert!(store.delete_notification_rule(&rule.id).unwrap());
+    }
+
+    #[test]
+    fn api_tokens_are_created_verified_and_revoked() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(dir.path()).unwrap();
+        let created = store.create_api_token(" ci pipeline ").unwrap();
+        assert_eq!(created.token.name, "ci pipeline");
+        assert!(created.secret.starts_with("tdk_"));
+        assert!(created.token.token_prefix.len() < created.secret.len());
+        assert!(store.verify_api_token(&created.secret).unwrap());
+        assert!(!store.verify_api_token("tdk_wrong").unwrap());
+        let tokens = store.api_tokens().unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert!(tokens[0].last_used_at_ms.is_some());
+        assert!(store.revoke_api_token(&created.token.id).unwrap());
+        assert!(!store.verify_api_token(&created.secret).unwrap());
+        assert!(store.create_api_token(" ").is_err());
+    }
+
+    #[test]
+    fn board_templates_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(dir.path()).unwrap();
+        let template = store
+            .create_board_template(BoardTemplateInput {
+                name: " Ops template ".to_string(),
+                description: Some(" shared ".to_string()),
+                cards: vec![BoardCardInput {
+                    node_id: "self".to_string(),
+                    session: "api".to_string(),
+                    task: "dev".to_string(),
+                    mode: BoardCardMode::Status,
+                    pinned: false,
+                }],
+                source_board_id: None,
+            })
+            .unwrap();
+        assert_eq!(template.name, "Ops template");
+        assert_eq!(template.description.as_deref(), Some("shared"));
+        let restored = StateStore::open(dir.path())
+            .unwrap()
+            .board_template(&template.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.cards.len(), 1);
+        assert!(
+            store
+                .create_board_template(BoardTemplateInput {
+                    name: "Ops template".to_string(),
+                    description: None,
+                    cards: Vec::new(),
+                    source_board_id: None,
+                })
+                .is_err()
+        );
+        assert!(store.delete_board_template(&template.id).unwrap());
+        assert!(store.board_template(&template.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn task_dependencies_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(dir.path()).unwrap();
+        let dependency = store
+            .create_task_dependency(TaskDependencyInput {
+                node_id: "self".to_string(),
+                session: "api".to_string(),
+                task: "deploy".to_string(),
+                depends_node_id: "self".to_string(),
+                depends_session: "api".to_string(),
+                depends_task: "build".to_string(),
+                required_state: None,
+            })
+            .unwrap();
+        assert_eq!(dependency.required_state, "running");
+
+        assert!(
+            store
+                .create_task_dependency(TaskDependencyInput {
+                    node_id: "self".to_string(),
+                    session: "api".to_string(),
+                    task: "build".to_string(),
+                    depends_node_id: "self".to_string(),
+                    depends_session: "api".to_string(),
+                    depends_task: "build".to_string(),
+                    required_state: None,
+                })
+                .is_err()
+        );
+        assert!(
+            store
+                .create_task_dependency(TaskDependencyInput {
+                    node_id: "self".to_string(),
+                    session: "api".to_string(),
+                    task: "deploy".to_string(),
+                    depends_node_id: "self".to_string(),
+                    depends_session: "api".to_string(),
+                    depends_task: "build".to_string(),
+                    required_state: None,
+                })
+                .is_err()
+        );
+        assert!(
+            store
+                .create_task_dependency(TaskDependencyInput {
+                    node_id: "self".to_string(),
+                    session: "api".to_string(),
+                    task: "deploy".to_string(),
+                    depends_node_id: "self".to_string(),
+                    depends_session: "api".to_string(),
+                    depends_task: "build".to_string(),
+                    required_state: Some("exited".to_string()),
+                })
+                .is_err()
+        );
+
+        let deps = store
+            .dependencies_for_task("self", "api", "deploy")
+            .unwrap();
+        assert_eq!(deps.len(), 1);
+        assert!(
+            store
+                .dependencies_for_task("self", "api", "build")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.delete_task_dependency(&dependency.id).unwrap());
+        assert!(store.task_dependencies().unwrap().is_empty());
+    }
+
+    #[test]
+    fn scaling_policies_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(dir.path()).unwrap();
+        let policy = store
+            .create_scaling_policy(ScalingPolicyInput {
+                name: " api autoscale ".to_string(),
+                enabled: true,
+                watch_node_id: "self".to_string(),
+                watch_session: "api".to_string(),
+                watch_task: "worker".to_string(),
+                metric: ScalingMetric::CpuPercent,
+                scale_out_threshold: 80.0,
+                scale_in_threshold: 20.0,
+                scale_out_node_id: "self".to_string(),
+                scale_out_session: "api".to_string(),
+                scale_out_task: "worker-replica".to_string(),
+                cooldown_seconds: 60,
+            })
+            .unwrap();
+        assert_eq!(policy.name, "api autoscale");
+
+        assert!(
+            store
+                .create_scaling_policy(ScalingPolicyInput {
+                    name: "bad".to_string(),
+                    enabled: true,
+                    watch_node_id: "self".to_string(),
+                    watch_session: "api".to_string(),
+                    watch_task: "worker".to_string(),
+                    metric: ScalingMetric::CpuPercent,
+                    scale_out_threshold: 20.0,
+                    scale_in_threshold: 80.0,
+                    scale_out_node_id: "self".to_string(),
+                    scale_out_session: "api".to_string(),
+                    scale_out_task: "worker-replica".to_string(),
+                    cooldown_seconds: 60,
+                })
+                .is_err()
+        );
+
+        let updated = store
+            .update_scaling_policy(
+                &policy.id,
+                ScalingPolicyInput {
+                    name: "api autoscale".to_string(),
+                    enabled: false,
+                    watch_node_id: "self".to_string(),
+                    watch_session: "api".to_string(),
+                    watch_task: "worker".to_string(),
+                    metric: ScalingMetric::MemoryBytes,
+                    scale_out_threshold: 1_000_000_000.0,
+                    scale_in_threshold: 100_000_000.0,
+                    scale_out_node_id: "self".to_string(),
+                    scale_out_session: "api".to_string(),
+                    scale_out_task: "worker-replica".to_string(),
+                    cooldown_seconds: 30,
+                },
+            )
+            .unwrap();
+        assert!(!updated.enabled);
+        assert_eq!(updated.metric, ScalingMetric::MemoryBytes);
+
+        store
+            .record_scaling_action(&policy.id, "scale_out", 12345)
+            .unwrap();
+        let policy = store.scaling_policies().unwrap().remove(0);
+        assert_eq!(policy.last_action.as_deref(), Some("scale_out"));
+        assert_eq!(policy.last_action_ms, Some(12345));
+        assert!(store.delete_scaling_policy(&policy.id).unwrap());
+        assert!(store.scaling_policies().unwrap().is_empty());
+    }
+
+    #[test]
     fn schema_five_migrates_workflow_group_tables_without_losing_workspaces() {
         let dir = tempfile::tempdir().unwrap();
         let database = dir.path().join("state.db");
@@ -2524,6 +4301,7 @@ mod tests {
                     session: "api".to_string(),
                     task: "dev".to_string(),
                 }],
+                graph: crate::protocol::WorkflowGraph::default(),
             })
             .unwrap();
         assert_eq!(

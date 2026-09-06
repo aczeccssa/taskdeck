@@ -20,9 +20,9 @@ use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 use crate::cluster::{LeaderCluster, RemoteRequest, spawn_worker_client};
 use crate::config;
 use crate::protocol::{
-    AuditContext, AuditRecord, AuditSource, AuditStatus, AuditTransport, Envelope, Request,
-    Response, TaskMetricsAggregate, TaskMetricsSample, TaskMetricsSnapshot, TaskProcessSnapshot,
-    TaskStatus,
+    AuditContext, AuditRecord, AuditSource, AuditStatus, AuditTransport, Envelope,
+    NodeMetricsSample, NotificationRule, Request, Response, ScalingMetric, ScalingPolicy,
+    TaskMetricsAggregate, TaskMetricsSample, TaskMetricsSnapshot, TaskProcessSnapshot, TaskStatus,
 };
 use crate::runtime::{SessionRuntime, Sessions};
 use crate::service;
@@ -40,6 +40,7 @@ pub struct DaemonState {
     pub sessions: Arc<Mutex<Sessions>>,
     pub unavailable_sessions: Arc<Mutex<BTreeMap<String, UnavailableSession>>>,
     pub task_metrics: Arc<Mutex<TaskMetricsStore>>,
+    pub node_metrics: Arc<NodeMetricsStore>,
     run_triggers: Arc<Mutex<HashMap<ScheduleKey, String>>>,
     pub config_mutations: Arc<Mutex<()>>,
     pub shutdown: Arc<AtomicBool>,
@@ -65,6 +66,7 @@ impl DaemonState {
         let settings = store.node_settings().expect("default node settings");
         let cluster = LeaderCluster::new(store.clone(), settings.enrollment_token.clone())
             .expect("test leader cluster");
+        let node_metrics = cluster.node_metrics();
         Self {
             store,
             settings: Arc::new(Mutex::new(settings)),
@@ -72,6 +74,7 @@ impl DaemonState {
             sessions: Arc::new(Mutex::new(Sessions::new())),
             unavailable_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             task_metrics: Arc::new(Mutex::new(TaskMetricsStore::default())),
+            node_metrics,
             run_triggers: Arc::new(Mutex::new(HashMap::new())),
             config_mutations: Arc::new(Mutex::new(())),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -88,6 +91,7 @@ impl DaemonState {
         let store = Arc::new(StateStore::open(&paths.root)?);
         let settings = store.node_settings()?;
         let cluster = LeaderCluster::new(store.clone(), settings.enrollment_token.clone())?;
+        let node_metrics = cluster.node_metrics();
         let mut sessions = Sessions::new();
         let mut unavailable_sessions = BTreeMap::new();
         if settings.execution_enabled() {
@@ -127,6 +131,7 @@ impl DaemonState {
             sessions: Arc::new(Mutex::new(sessions)),
             unavailable_sessions: Arc::new(Mutex::new(unavailable_sessions)),
             task_metrics: Arc::new(Mutex::new(TaskMetricsStore::default())),
+            node_metrics,
             run_triggers: Arc::new(Mutex::new(HashMap::new())),
             config_mutations: Arc::new(Mutex::new(())),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -557,6 +562,598 @@ impl TaskMetricsStore {
     }
 }
 
+pub const MAX_NODE_METRIC_SAMPLES: usize = 300;
+pub const SCALING_EVALUATION_INTERVAL_MS: u64 = 5_000;
+const SCALING_STREAK_THRESHOLD: u32 = 3;
+const SCALING_REMOTE_FETCH_INTERVAL_MS: u64 = 10_000;
+
+/// Ring buffers of node-level CPU/memory samples keyed by node id. The local
+/// sampler pushes self samples; worker samples arrive embedded in inventory
+/// pushes on the leader.
+#[derive(Debug, Default)]
+pub struct NodeMetricsStore {
+    samples: Mutex<HashMap<String, std::collections::VecDeque<NodeMetricsSample>>>,
+}
+
+impl NodeMetricsStore {
+    pub fn push(&self, node_id: &str, sample: NodeMetricsSample) {
+        let mut samples = self.samples.lock().expect("node metrics lock");
+        let window = samples.entry(node_id.to_string()).or_default();
+        if window
+            .back()
+            .is_some_and(|last| last.timestamp_ms >= sample.timestamp_ms)
+        {
+            return;
+        }
+        window.push_back(sample);
+        while window.len() > MAX_NODE_METRIC_SAMPLES {
+            window.pop_front();
+        }
+    }
+
+    pub fn window(&self, node_id: &str, limit: usize) -> Vec<NodeMetricsSample> {
+        let samples = self.samples.lock().expect("node metrics lock");
+        match samples.get(node_id) {
+            Some(window) => window.iter().rev().take(limit).rev().cloned().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    pub fn latest(&self, node_id: &str) -> Option<NodeMetricsSample> {
+        let samples = self.samples.lock().expect("node metrics lock");
+        samples
+            .get(node_id)
+            .and_then(|window| window.back().cloned())
+    }
+}
+
+fn count_running_tasks(state: &DaemonState) -> u32 {
+    let mut sessions = state.sessions.lock().expect("sessions lock");
+    let mut running = 0;
+    for runtime in sessions.values_mut() {
+        if let Ok(snapshot) = runtime.snapshot(0) {
+            running += snapshot
+                .tasks
+                .values()
+                .filter(|task| matches!(task.status, TaskStatus::Running | TaskStatus::Paused))
+                .count();
+        }
+    }
+    running as u32
+}
+
+fn sample_node_metrics(state: &DaemonState, system: &mut System) {
+    system.refresh_cpu_all();
+    system.refresh_memory();
+    let sample = NodeMetricsSample {
+        timestamp_ms: current_timestamp_ms(),
+        cpu_percent: system.global_cpu_usage(),
+        memory_bytes: system.used_memory(),
+        memory_total_bytes: system.total_memory(),
+        running_tasks: count_running_tasks(state),
+    };
+    let node_id = state.public_settings().node_id;
+    state.node_metrics.push(&node_id, sample);
+}
+
+impl DaemonState {
+    /// Count running/paused tasks per scope to evaluate quotas.
+    fn running_task_counts(&self) -> (usize, HashMap<String, usize>) {
+        let mut sessions = self.sessions.lock().expect("sessions lock");
+        let mut per_session = HashMap::new();
+        let mut node_total = 0;
+        for (name, runtime) in sessions.iter_mut() {
+            if let Ok(snapshot) = runtime.snapshot(0) {
+                for task in snapshot.tasks.values() {
+                    if matches!(task.status, TaskStatus::Running | TaskStatus::Paused) {
+                        node_total += 1;
+                        *per_session.entry(name.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        (node_total, per_session)
+    }
+
+    /// Enforce workspace/node running-task quotas before local starts.
+    pub fn check_quotas(&self, session: &str) -> std::result::Result<(), String> {
+        let quotas = match self.store.quotas() {
+            Ok(quotas) => quotas,
+            Err(_) => return Ok(()),
+        };
+        let quotas: Vec<_> = quotas
+            .into_iter()
+            .filter(|quota| quota.node_id == self.public_settings().node_id)
+            .collect();
+        if quotas.is_empty() {
+            return Ok(());
+        }
+        let (node_total, per_session) = self.running_task_counts();
+        for quota in quotas {
+            match &quota.session {
+                Some(scope) if scope == session => {
+                    let running = per_session.get(session).copied().unwrap_or(0);
+                    if running >= quota.max_running_tasks as usize {
+                        return Err(format!(
+                            "workspace '{session}' quota reached ({running}/{} running tasks)",
+                            quota.max_running_tasks
+                        ));
+                    }
+                }
+                None => {
+                    if node_total >= quota.max_running_tasks as usize {
+                        return Err(format!(
+                            "node quota reached ({node_total}/{} running tasks)",
+                            quota.max_running_tasks
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn task_status_on(&self, node: &str, session: &str, task: &str) -> Option<TaskStatus> {
+        let settings = self.public_settings();
+        if node == "self" || node == settings.node_id {
+            let mut sessions = self.sessions.lock().expect("sessions lock");
+            let snapshot = sessions.get_mut(session)?.snapshot(0).ok()?;
+            return snapshot.tasks.get(task).map(|task| task.status.clone());
+        }
+        if settings.role != NodeRole::Leader {
+            return None;
+        }
+        let inventory = self.cluster.cached_inventory(node)?;
+        let session_snapshot = inventory
+            .iter()
+            .find(|session_view| session_view.name == session)?;
+        session_snapshot
+            .tasks
+            .get(task)
+            .map(|task| task.status.clone())
+    }
+
+    /// Enforce cross-workspace task dependencies before local starts.
+    pub fn check_dependencies(&self, session: &str, task: &str) -> std::result::Result<(), String> {
+        let node_id = self.public_settings().node_id;
+        let dependencies = match self.store.dependencies_for_task(&node_id, session, task) {
+            Ok(dependencies) => dependencies,
+            Err(_) => return Ok(()),
+        };
+        if dependencies.is_empty() {
+            return Ok(());
+        }
+        for dependency in dependencies {
+            let reason_target = format!(
+                "{}:{}:{}",
+                dependency.depends_node_id, dependency.depends_session, dependency.depends_task
+            );
+            match self.task_status_on(
+                &dependency.depends_node_id,
+                &dependency.depends_session,
+                &dependency.depends_task,
+            ) {
+                Some(status) if matches!(status, TaskStatus::Running) => {}
+                Some(status) => {
+                    return Err(format!(
+                        "dependency {reason_target} is not running (status: {})",
+                        status_label(status)
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "dependency {reason_target} is not visible from this node"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn check_start_gates(&self, session: &str, task: &str) -> std::result::Result<(), String> {
+        self.check_quotas(session)?;
+        self.check_dependencies(session, task)
+    }
+}
+
+fn emit_transition_notifications(state: &DaemonState, transitions: &[RunTransition]) {
+    let rules: Vec<NotificationRule> = match state.store.notification_rules() {
+        Ok(rules) => rules.into_iter().filter(|rule| rule.enabled).collect(),
+        Err(_) => return,
+    };
+    if rules.is_empty() {
+        return;
+    }
+    let node_id = state.public_settings().node_id;
+    for transition in transitions {
+        let (event_type, severity, session, task, title, message, details) = match transition {
+            RunTransition::Started(session, snapshot, trigger) => (
+                "task_started",
+                "info",
+                session.clone(),
+                snapshot.label.clone(),
+                format!("task started: {}", snapshot.label),
+                format!(
+                    "workspace '{session}' task '{}' started (trigger: {trigger})",
+                    snapshot.label
+                ),
+                serde_json::json!({"trigger": trigger}),
+            ),
+            RunTransition::Finished {
+                session,
+                task,
+                status,
+                exit_code,
+                error_message,
+                ..
+            } => {
+                let (event_type, severity) = match status.as_str() {
+                    "failed" => ("task_failed", "critical"),
+                    "stopped" => ("task_stopped", "warning"),
+                    _ => ("task_exited", "info"),
+                };
+                (
+                    event_type,
+                    severity,
+                    session.clone(),
+                    task.clone(),
+                    format!("task {status}: {task}"),
+                    format!(
+                        "workspace '{session}' task '{task}' finished with status '{status}'{}",
+                        error_message
+                            .as_deref()
+                            .map(|error| format!(": {error}"))
+                            .unwrap_or_default()
+                    ),
+                    serde_json::json!({"status": status, "exit_code": exit_code}),
+                )
+            }
+        };
+        for rule in &rules {
+            if !rule
+                .event_types
+                .iter()
+                .any(|candidate| candidate == event_type)
+            {
+                continue;
+            }
+            if rule
+                .scope_session
+                .as_deref()
+                .is_some_and(|scope| scope != session)
+            {
+                continue;
+            }
+            if rule
+                .scope_task
+                .as_deref()
+                .is_some_and(|scope| scope != task)
+            {
+                continue;
+            }
+            match state.store.insert_notification(
+                &node_id,
+                Some(&rule.id),
+                Some(&rule.name),
+                event_type,
+                severity,
+                Some(&session),
+                Some(&task),
+                &title,
+                &message,
+                &details,
+            ) {
+                Ok(_) => {}
+                Err(error) => eprintln!("failed to record notification: {error:#}"),
+            }
+            if let Some(webhook_url) = &rule.webhook_url {
+                spawn_webhook_delivery(
+                    state,
+                    webhook_url.clone(),
+                    event_type,
+                    severity,
+                    &session,
+                    &task,
+                    &title,
+                    &message,
+                    &details,
+                );
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_webhook_delivery(
+    state: &DaemonState,
+    url: String,
+    event_type: &str,
+    severity: &str,
+    session: &str,
+    task: &str,
+    title: &str,
+    message: &str,
+    details: &serde_json::Value,
+) {
+    let payload = serde_json::json!({
+        "kind": "taskdeck.notification",
+        "event_type": event_type,
+        "severity": severity,
+        "node_id": state.public_settings().node_id,
+        "session": session,
+        "task": task,
+        "title": title,
+        "message": message,
+        "details": details,
+        "timestamp_ms": current_timestamp_ms(),
+    });
+    let store = state.store.clone();
+    let event_type = event_type.to_string();
+    thread::spawn(move || {
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(5))
+            .build();
+        if let Err(error) = agent.post(&url).send_json(payload) {
+            let _ = store.record_event(
+                "notification",
+                &format!("webhook delivery failed: {error}"),
+                serde_json::json!({"url": url, "event_type": event_type}),
+            );
+        }
+    });
+}
+
+pub fn spawn_scaling_evaluator(state: DaemonState) -> Option<thread::JoinHandle<()>> {
+    // Capture the tokio runtime handle before leaving the async context so the
+    // evaluator thread can block on node dispatches.
+    let runtime = tokio::runtime::Handle::try_current().ok();
+    Some(thread::spawn(move || {
+        let mut above_streaks: HashMap<String, u32> = HashMap::new();
+        let mut below_streaks: HashMap<String, u32> = HashMap::new();
+        let mut remote_cache: HashMap<String, (u64, Option<TaskMetricsSnapshot>)> = HashMap::new();
+        while !state.shutdown.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(SCALING_EVALUATION_INTERVAL_MS));
+            if state.shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            evaluate_scaling_policies(
+                &state,
+                runtime.as_ref(),
+                &mut above_streaks,
+                &mut below_streaks,
+                &mut remote_cache,
+            );
+        }
+    }))
+}
+
+fn evaluate_scaling_policies(
+    state: &DaemonState,
+    runtime: Option<&tokio::runtime::Handle>,
+    above_streaks: &mut HashMap<String, u32>,
+    below_streaks: &mut HashMap<String, u32>,
+    remote_cache: &mut HashMap<String, (u64, Option<TaskMetricsSnapshot>)>,
+) {
+    let policies = match state.store.scaling_policies() {
+        Ok(policies) => policies,
+        Err(_) => return,
+    };
+    let now = current_timestamp_ms();
+    for policy in policies.iter().filter(|policy| policy.enabled) {
+        let value = match policy.watch_node_id.as_str() {
+            "self" => {
+                let snapshot = state
+                    .task_metrics
+                    .lock()
+                    .expect("task metrics lock")
+                    .snapshot(&policy.watch_session, &policy.watch_task, 5);
+                if !snapshot.running {
+                    0.0
+                } else {
+                    match policy.metric {
+                        ScalingMetric::CpuPercent => snapshot.current.cpu_percent as f64,
+                        ScalingMetric::MemoryBytes => snapshot.current.memory_bytes as f64,
+                    }
+                }
+            }
+            node => {
+                if state.public_settings().role != NodeRole::Leader {
+                    continue;
+                }
+                let cache_key = format!("{node}:{}:{}", policy.watch_session, policy.watch_task);
+                let cached = remote_cache.get(&cache_key);
+                let fresh = cached.is_some_and(|(fetched, _)| {
+                    now.saturating_sub(*fetched) < SCALING_REMOTE_FETCH_INTERVAL_MS
+                });
+                if !fresh {
+                    let snapshot = runtime.and_then(|runtime| {
+                        let response = runtime.block_on(state.dispatch_node(
+                            node,
+                            RemoteRequest::TaskMetrics {
+                                session: policy.watch_session.clone(),
+                                task: policy.watch_task.clone(),
+                                window_seconds: 5,
+                            },
+                        ));
+                        serde_json::from_value::<TaskMetricsSnapshot>(
+                            response.data.unwrap_or(serde_json::Value::Null),
+                        )
+                        .ok()
+                    });
+                    remote_cache.insert(cache_key.clone(), (now, snapshot));
+                }
+                match remote_cache
+                    .get(&cache_key)
+                    .and_then(|(_, snapshot)| snapshot.as_ref())
+                {
+                    Some(snapshot) if snapshot.running => match policy.metric {
+                        ScalingMetric::CpuPercent => snapshot.current.cpu_percent as f64,
+                        ScalingMetric::MemoryBytes => snapshot.current.memory_bytes as f64,
+                    },
+                    _ => 0.0,
+                }
+            }
+        };
+
+        let cooldown_elapsed = policy
+            .last_action_ms
+            .map(|last| now.saturating_sub(last) >= policy.cooldown_seconds * 1000)
+            .unwrap_or(true);
+        if value > policy.scale_out_threshold {
+            *above_streaks.entry(policy.id.clone()).or_insert(0) += 1;
+            below_streaks.remove(&policy.id);
+        } else {
+            above_streaks.remove(&policy.id);
+        }
+        if value < policy.scale_in_threshold {
+            *below_streaks.entry(policy.id.clone()).or_insert(0) += 1;
+            above_streaks.remove(&policy.id);
+        } else {
+            below_streaks.remove(&policy.id);
+        }
+
+        if !cooldown_elapsed {
+            continue;
+        }
+        let above = above_streaks.get(&policy.id).copied().unwrap_or(0);
+        let below = below_streaks.get(&policy.id).copied().unwrap_or(0);
+        if above >= SCALING_STREAK_THRESHOLD {
+            above_streaks.remove(&policy.id);
+            below_streaks.remove(&policy.id);
+            scale_policy_task(
+                state,
+                runtime,
+                policy,
+                "scale_out",
+                crate::protocol::Action::Start,
+                now,
+            );
+        } else if below >= SCALING_STREAK_THRESHOLD {
+            above_streaks.remove(&policy.id);
+            below_streaks.remove(&policy.id);
+            scale_policy_task(
+                state,
+                runtime,
+                policy,
+                "scale_in",
+                crate::protocol::Action::Stop,
+                now,
+            );
+        }
+    }
+}
+
+fn scale_policy_task(
+    state: &DaemonState,
+    runtime: Option<&tokio::runtime::Handle>,
+    policy: &ScalingPolicy,
+    action_label: &str,
+    action: crate::protocol::Action,
+    now: u64,
+) {
+    let Some(runtime) = runtime else {
+        return;
+    };
+    let running = task_running_on_node(
+        state,
+        &policy.scale_out_node_id,
+        &policy.scale_out_session,
+        &policy.scale_out_task,
+    );
+    let should_fire = match (action_label, running) {
+        ("scale_out", Some(false)) => true,
+        ("scale_in", Some(true)) => true,
+        _ => false,
+    };
+    if !should_fire {
+        return;
+    }
+    let request = RemoteRequest::Action {
+        session: policy.scale_out_session.clone(),
+        task: Some(policy.scale_out_task.clone()),
+        action,
+    };
+    let response = runtime.block_on(state.dispatch_node_with_audit(
+        &policy.scale_out_node_id,
+        request,
+        AuditContext::new(AuditSource::Internal, AuditTransport::Internal),
+    ));
+    let node_id = state.public_settings().node_id;
+    let success = response.ok;
+    let _ = state
+        .store
+        .record_scaling_action(&policy.id, action_label, now);
+    let _ = state.store.record_event(
+        "autoscale",
+        &format!(
+            "policy '{}' {} action {}: {}",
+            policy.name, action_label, policy.scale_out_task, response.message
+        ),
+        serde_json::json!({
+            "policy": policy.name,
+            "action": action_label,
+            "success": success,
+        }),
+    );
+    let title = format!(
+        "auto-scaling {}: {}",
+        action_label.trim_start_matches("scale_"),
+        policy.scale_out_task
+    );
+    let message = format!(
+        "policy '{}' {} task '{}:{}' (metric {}: {:.1}): {}",
+        policy.name,
+        action_label,
+        policy.scale_out_session,
+        policy.scale_out_task,
+        policy.metric.as_str(),
+        match policy.metric {
+            ScalingMetric::CpuPercent => policy.scale_out_threshold,
+            ScalingMetric::MemoryBytes => policy.scale_out_threshold,
+        },
+        response.message
+    );
+    let _ = state.store.insert_notification(
+        &node_id,
+        None,
+        None,
+        action_label,
+        if success { "info" } else { "warning" },
+        Some(&policy.scale_out_session),
+        Some(&policy.scale_out_task),
+        &title,
+        &message,
+        &serde_json::json!({"policy_id": policy.id, "success": success}),
+    );
+}
+
+fn task_running_on_node(
+    state: &DaemonState,
+    node: &str,
+    session: &str,
+    task: &str,
+) -> Option<bool> {
+    let settings = state.public_settings();
+    if node == "self" || node == settings.node_id {
+        let mut sessions = state.sessions.lock().expect("sessions lock");
+        let snapshot = sessions.get_mut(session)?.snapshot(0).ok()?;
+        return snapshot
+            .tasks
+            .get(task)
+            .map(|task| matches!(task.status, TaskStatus::Running | TaskStatus::Paused));
+    }
+    if settings.role != NodeRole::Leader {
+        return None;
+    }
+    let inventory = state.cluster.cached_inventory(node)?;
+    let session_snapshot = inventory.iter().find(|view| view.name == session)?;
+    session_snapshot
+        .tasks
+        .get(task)
+        .map(|task| matches!(task.status, TaskStatus::Running | TaskStatus::Paused))
+}
+
 fn current_timestamp_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -709,6 +1306,7 @@ fn spawn_task_history_sampler(state: DaemonState) -> thread::JoinHandle<()> {
             if transitions.is_empty() {
                 continue;
             }
+            emit_transition_notifications(&state, &transitions);
             let node_id = match state.store.node_settings() {
                 Ok(v) => v.node_id,
                 Err(_) => continue,
@@ -812,6 +1410,18 @@ fn spawn_task_scheduler(state: DaemonState) -> thread::JoinHandle<()> {
             }
             last_processed_second = now_second;
             for key in due_actions {
+                if let Err(reason) = state.check_start_gates(&key.session, &key.task) {
+                    let _ = state.store.record_event(
+                        "scheduler",
+                        "scheduled start blocked by start gates",
+                        serde_json::json!({
+                            "session": key.session,
+                            "task": key.task,
+                            "reason": reason,
+                        }),
+                    );
+                    continue;
+                }
                 state
                     .run_triggers
                     .lock()
@@ -1199,6 +1809,7 @@ fn spawn_task_metrics_sampler(state: DaemonState) -> thread::JoinHandle<()> {
                 break;
             }
             sample_task_metrics(&state, &mut system);
+            sample_node_metrics(&state, &mut system);
         }
     })
 }
@@ -1293,6 +1904,7 @@ pub async fn run(web_port_override: Option<u16>) -> Result<()> {
     let metrics_sampler = spawn_task_metrics_sampler(state.clone());
     let history_sampler = spawn_task_history_sampler(state.clone());
     let task_scheduler = spawn_task_scheduler(state.clone());
+    let scaling_evaluator = spawn_scaling_evaluator(state.clone());
     let worker_client =
         if worker_settings.role == NodeRole::Worker && worker_settings.leader_url.is_some() {
             Some(spawn_worker_client(state.clone(), worker_settings))
@@ -1355,6 +1967,9 @@ pub async fn run(web_port_override: Option<u16>) -> Result<()> {
         worker_client.abort();
     }
     let metrics_panic = metrics_sampler.join().err();
+    if let Some(handle) = scaling_evaluator {
+        let _ = handle.join();
+    }
     for (name, handle) in [("history", history_sampler), ("scheduler", task_scheduler)] {
         if let Err(payload) = handle.join() {
             eprintln!("{name} worker panicked: {}", panic_message(payload));
@@ -1927,6 +2542,24 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
         } => {
             require_local_execution(state)?;
             reject_unavailable_session(state, &session)?;
+            if matches!(
+                action,
+                crate::protocol::Action::Start | crate::protocol::Action::Restart
+            ) {
+                let gate = match task.as_deref() {
+                    Some(task_label) => {
+                        if matches!(action, crate::protocol::Action::Start) {
+                            state.check_start_gates(&session, task_label)
+                        } else {
+                            state.check_dependencies(&session, task_label)
+                        }
+                    }
+                    None => state.check_quotas(&session).and_then(|_| Ok(())),
+                };
+                if let Err(reason) = gate {
+                    bail!("start blocked: {reason}");
+                }
+            }
             let mut sessions = state.sessions.lock().expect("sessions lock");
             let mut pre_stop_runs: Vec<(String, u64)> = Vec::new();
             if matches!(

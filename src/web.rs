@@ -19,12 +19,16 @@ use crate::platform_service::{ServiceAction, service_control, service_status};
 #[cfg(test)]
 use crate::protocol::McpCallListPage;
 use crate::protocol::{
-    Action, AuditContext, AuditFilter, AuditSource, AuditStatus, AuditTransport, Board,
-    BoardCardView, BoardInput, BoardView, BoardsView, EditableTaskInput, EventFilter,
-    McpCallRecord, NodeSummary, Response, ServiceScope, SessionSnapshot, TaskRunFilter,
-    WorkflowGroup, WorkflowGroupActionItem, WorkflowGroupActionItemStatus,
-    WorkflowGroupActionSummary, WorkflowGroupInput, WorkflowGroupMemberView, WorkflowGroupView,
-    WorkflowGroupsView, WorkflowTargetView, casefold_search_text,
+    Action, ApiTokenInput, ApiTokensView, AuditContext, AuditFilter, AuditSource, AuditStatus,
+    AuditTransport, Board, BoardCardInput, BoardCardView, BoardInput, BoardTemplateApplyInput,
+    BoardTemplateExport, BoardTemplateInput, BoardTemplatesView, BoardView, BoardsView,
+    EditableTaskInput, EventFilter, McpCallRecord, NodeMetricsView, NodeSummary,
+    NotificationMarkReadInput, NotificationRuleInput, NotificationsView, Response,
+    ScalingPoliciesView, ScalingPolicyInput, ServiceScope, SessionSnapshot, TaskDependenciesView,
+    TaskDependencyInput, TaskRunFilter, WorkflowGroup, WorkflowGroupActionItem,
+    WorkflowGroupActionItemStatus, WorkflowGroupActionSummary, WorkflowGroupInput,
+    WorkflowGroupMemberView, WorkflowGroupView, WorkflowGroupsView, WorkflowRevisionsView,
+    WorkflowTargetView, WorkspaceQuotaInput, WorkspaceQuotasView, casefold_search_text,
 };
 use crate::state::NodeRole;
 
@@ -70,6 +74,63 @@ fn app(state: DaemonState) -> Router {
         .route(
             "/api/workflow-groups/{group}/actions",
             post(workflow_group_action),
+        )
+        .route(
+            "/api/workflow-groups/{group}/revisions",
+            get(list_workflow_revisions),
+        )
+        .route(
+            "/api/workflow-groups/{group}/revisions/{revision}/restore",
+            post(restore_workflow_revision),
+        )
+        .route("/api/workflow-groups/{group}/run", post(run_workflow_group))
+        .route("/api/quotas", get(list_quotas).post(create_quota))
+        .route(
+            "/api/quotas/{quota}",
+            put(update_quota).delete(delete_quota),
+        )
+        .route("/api/notifications", get(list_notifications))
+        .route("/api/notifications/read", post(mark_notifications_read))
+        .route(
+            "/api/notification-rules",
+            get(list_notification_rules).post(create_notification_rule),
+        )
+        .route(
+            "/api/notification-rules/{rule}",
+            put(update_notification_rule).delete(delete_notification_rule),
+        )
+        .route("/api/tokens", get(list_api_tokens).post(create_api_token))
+        .route("/api/tokens/{token}", delete(revoke_api_token))
+        .route(
+            "/api/board-templates",
+            get(list_board_templates).post(create_board_template),
+        )
+        .route("/api/board-templates/import", post(import_board_template))
+        .route(
+            "/api/board-templates/{template}",
+            delete(delete_board_template),
+        )
+        .route(
+            "/api/board-templates/{template}/apply",
+            post(apply_board_template),
+        )
+        .route(
+            "/api/board-templates/{template}/export",
+            get(export_board_template),
+        )
+        .route(
+            "/api/dependencies",
+            get(list_dependencies).post(create_dependency),
+        )
+        .route("/api/dependencies/{dependency}", delete(delete_dependency))
+        .route("/api/node-metrics", get(node_metrics))
+        .route(
+            "/api/scaling-policies",
+            get(list_scaling_policies).post(create_scaling_policy),
+        )
+        .route(
+            "/api/scaling-policies/{policy}",
+            put(update_scaling_policy).delete(delete_scaling_policy),
         )
         .route("/api/boards", get(list_boards).post(create_board))
         .route(
@@ -212,8 +273,13 @@ async fn auth_middleware(
         || path == "/api/agent/connect";
     let authenticated = session_cookie(&headers)
         .is_some_and(|token| state.store.valid_auth_session(Some(&token)))
-        || bearer_token(&headers)
-            .is_some_and(|key| state.store.verify_access_key(&key).unwrap_or(false));
+        || bearer_token(&headers).is_some_and(|key| {
+            if key.starts_with("tdk_") {
+                state.store.verify_api_token(&key).unwrap_or(false)
+            } else {
+                state.store.verify_access_key(&key).unwrap_or(false)
+            }
+        });
     if exempt || authenticated {
         return next.run(request).await;
     }
@@ -538,7 +604,7 @@ async fn update_workflow_group(
     let response = match require_workflow_leader(&state)
         .and_then(|_| validate_workflow_group_scope(&state, &input))
     {
-        Ok(()) => match state.store.update_workflow_group(&group, input) {
+        Ok(()) => match state.store.update_workflow_group(&group, input, None) {
             Ok(group) => Response::ok("workflow group updated", workflow_group_view(&state, group)),
             Err(error) => Response::error(format!("{error:#}")),
         },
@@ -792,6 +858,7 @@ fn resolve_workflow_group(
         created_at_ms: group.created_at_ms,
         updated_at_ms: group.updated_at_ms,
         members,
+        graph: group.graph.clone(),
     }
 }
 
@@ -1163,6 +1230,1183 @@ fn record_board_http_audit(
         request,
         response_value,
         json!({"board_id": board_id}),
+        Some(state.public_settings().node_id),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Workflow revisions (version history)
+// ---------------------------------------------------------------------------
+
+async fn list_workflow_revisions(
+    State(state): State<DaemonState>,
+    Path(group): Path<String>,
+) -> Json<Response> {
+    if let Err(response) = require_workflow_leader(&state) {
+        return Json(response);
+    }
+    Json(match state.store.workflow_group(&group) {
+        Ok(Some(group)) => match state.store.workflow_revisions(&group.id) {
+            Ok(revisions) => Response::ok(
+                "workflow revisions",
+                WorkflowRevisionsView {
+                    group_id: group.id,
+                    group_name: group.name,
+                    revisions,
+                },
+            ),
+            Err(error) => Response::error(format!("{error:#}")),
+        },
+        Ok(None) => Response::error(format!("workflow group '{group}' not found")),
+        Err(error) => Response::error(format!("{error:#}")),
+    })
+}
+
+async fn restore_workflow_revision(
+    State(state): State<DaemonState>,
+    Path((group, revision)): Path<(String, u64)>,
+) -> Json<Response> {
+    let started_at_ms = current_millis();
+    let started = Instant::now();
+    let request = json!({"group_id": group, "revision": revision});
+    let response = match require_workflow_leader(&state) {
+        Ok(()) => match state.store.workflow_revisions(&group) {
+            Ok(revisions) => match revisions.into_iter().find(|item| item.revision == revision) {
+                Some(snapshot) => {
+                    let input = WorkflowGroupInput {
+                        name: snapshot.name.clone(),
+                        members: snapshot.members.clone(),
+                        graph: snapshot.graph.clone(),
+                    };
+                    let scoped = match validate_workflow_group_scope(&state, &input) {
+                        Err(response) => Err(response),
+                        Ok(()) => state
+                            .store
+                            .update_workflow_group(
+                                &group,
+                                input,
+                                Some(&format!("restored from revision {revision}")),
+                            )
+                            .map_err(|error| Response::error(format!("{error:#}"))),
+                    };
+                    match scoped {
+                        Ok(updated) => Response::ok(
+                            "workflow group restored",
+                            workflow_group_view(&state, updated),
+                        ),
+                        Err(response) => response,
+                    }
+                }
+                None => Response::error(format!(
+                    "revision {revision} of workflow group '{group}' not found"
+                )),
+            },
+            Err(error) => Response::error(format!("{error:#}")),
+        },
+        Err(response) => response,
+    };
+    record_feature_http_audit(
+        &state,
+        "workflow_group",
+        "workflow_group_restore_revision",
+        "group_id",
+        Some(&group),
+        request,
+        &response,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    );
+    Json(response)
+}
+
+#[derive(Deserialize)]
+struct WorkflowRunBody {
+    #[serde(default = "default_stop_on_failure")]
+    stop_on_failure: bool,
+}
+
+fn default_stop_on_failure() -> bool {
+    true
+}
+
+async fn run_workflow_group(
+    State(state): State<DaemonState>,
+    Path(group): Path<String>,
+    body: Option<Json<WorkflowRunBody>>,
+) -> Json<Response> {
+    let started_at_ms = current_millis();
+    let started = Instant::now();
+    let stop_on_failure = body.map(|Json(body)| body.stop_on_failure).unwrap_or(true);
+    let request = json!({"group_id": group, "stop_on_failure": stop_on_failure});
+    let response = match require_workflow_leader(&state) {
+        Ok(()) => match state.store.workflow_group(&group) {
+            Ok(Some(group)) => match workflow_run_order(&group) {
+                Ok(order) => {
+                    let summary =
+                        run_workflow_group_ordered(state.clone(), group, order, stop_on_failure)
+                            .await;
+                    Response::ok("workflow run completed", summary)
+                }
+                Err(error) => Response::error(error),
+            },
+            Ok(None) => Response::error(format!("workflow group '{group}' not found")),
+            Err(error) => Response::error(format!("{error:#}")),
+        },
+        Err(response) => response,
+    };
+    record_feature_http_audit(
+        &state,
+        "workflow_group",
+        "workflow_group_run",
+        "group_id",
+        Some(&group),
+        request,
+        &response,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    );
+    Json(response)
+}
+
+/// Topological member order following graph edges; ties break by member position.
+fn workflow_run_order(group: &WorkflowGroup) -> std::result::Result<Vec<usize>, String> {
+    let member_count = group.members.len();
+    let mut indegree = vec![0usize; member_count];
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); member_count];
+    for edge in &group.graph.edges {
+        if edge.from >= member_count || edge.to >= member_count {
+            return Err("workflow graph edge references a member that does not exist".to_string());
+        }
+        indegree[edge.to] += 1;
+        children[edge.from].push(edge.to);
+    }
+    let mut ready: std::collections::BTreeSet<usize> = (0..member_count)
+        .filter(|index| indegree[*index] == 0)
+        .collect();
+    let mut order = Vec::with_capacity(member_count);
+    while let Some(index) = ready.pop_first() {
+        order.push(index);
+        for child in &children[index] {
+            indegree[*child] -= 1;
+            if indegree[*child] == 0 {
+                ready.insert(*child);
+            }
+        }
+    }
+    if order.len() != member_count {
+        return Err(
+            "workflow graph contains a cycle; fix the orchestration edges before running"
+                .to_string(),
+        );
+    }
+    Ok(order)
+}
+
+async fn run_workflow_group_ordered(
+    state: DaemonState,
+    group: WorkflowGroup,
+    order: Vec<usize>,
+    stop_on_failure: bool,
+) -> WorkflowGroupActionSummary {
+    let view = workflow_group_view(&state, group.clone());
+    let mut results = Vec::new();
+    for index in order {
+        let Some(member) = view.members.get(index) else {
+            continue;
+        };
+        if !member.available {
+            results.push(WorkflowGroupActionItem {
+                node_id: member.member.node_id.clone(),
+                node_name: member.node_name.clone(),
+                session: member.member.session.clone(),
+                workspace_display_name: member.workspace_display_name.clone(),
+                task: member.member.task.clone(),
+                status: WorkflowGroupActionItemStatus::Skipped,
+                message: member
+                    .skip_reason
+                    .clone()
+                    .unwrap_or_else(|| "skipped".to_string()),
+            });
+            if stop_on_failure {
+                break;
+            }
+            continue;
+        }
+        let request = RemoteRequest::Action {
+            session: member.member.session.clone(),
+            task: Some(member.member.task.clone()),
+            action: Action::Start,
+        };
+        let response = state
+            .dispatch_node_with_audit(
+                &member.member.node_id,
+                request.clone(),
+                web_audit_context(&state, &request),
+            )
+            .await;
+        let succeeded = response.ok;
+        results.push(WorkflowGroupActionItem {
+            node_id: member.member.node_id.clone(),
+            node_name: member.node_name.clone(),
+            session: member.member.session.clone(),
+            workspace_display_name: member.workspace_display_name.clone(),
+            task: member.member.task.clone(),
+            status: if succeeded {
+                WorkflowGroupActionItemStatus::Success
+            } else {
+                WorkflowGroupActionItemStatus::Failed
+            },
+            message: response.message,
+        });
+        if !succeeded && stop_on_failure {
+            break;
+        }
+    }
+    summarize_workflow_results(group, results)
+}
+
+fn summarize_workflow_results(
+    group: WorkflowGroup,
+    results: Vec<WorkflowGroupActionItem>,
+) -> WorkflowGroupActionSummary {
+    let success_count = results
+        .iter()
+        .filter(|item| item.status == WorkflowGroupActionItemStatus::Success)
+        .count();
+    let failed_count = results
+        .iter()
+        .filter(|item| item.status == WorkflowGroupActionItemStatus::Failed)
+        .count();
+    let skipped_count = results
+        .iter()
+        .filter(|item| item.status == WorkflowGroupActionItemStatus::Skipped)
+        .count();
+    WorkflowGroupActionSummary {
+        group_id: group.id,
+        group_name: group.name,
+        action: Action::Start,
+        results,
+        success_count,
+        failed_count,
+        skipped_count,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resource quotas
+// ---------------------------------------------------------------------------
+
+fn quota_sessions(state: &DaemonState) -> Vec<String> {
+    let mut sessions: Vec<String> = state
+        .node_summaries()
+        .into_iter()
+        .flat_map(|node| node.sessions)
+        .collect();
+    sessions.sort();
+    sessions.dedup();
+    sessions
+}
+
+async fn list_quotas(State(state): State<DaemonState>) -> Json<Response> {
+    Json(match state.store.quotas() {
+        Ok(quotas) => Response::ok(
+            "quotas",
+            WorkspaceQuotasView {
+                quotas,
+                sessions: quota_sessions(&state),
+            },
+        ),
+        Err(error) => Response::error(format!("{error:#}")),
+    })
+}
+
+async fn create_quota(
+    State(state): State<DaemonState>,
+    Json(input): Json<WorkspaceQuotaInput>,
+) -> Json<Response> {
+    let started_at_ms = current_millis();
+    let started = Instant::now();
+    let request = serde_json::to_value(&input).unwrap_or_else(|_| json!({}));
+    let node_id = state.public_settings().node_id;
+    let response = match state.store.create_quota(&node_id, input) {
+        Ok(quota) => Response::ok("quota created", quota),
+        Err(error) => Response::error(format!("{error:#}")),
+    };
+    record_feature_http_audit(
+        &state,
+        "quota",
+        "quota_create",
+        "quota_id",
+        None,
+        request,
+        &response,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    );
+    Json(response)
+}
+
+async fn update_quota(
+    State(state): State<DaemonState>,
+    Path(quota): Path<String>,
+    Json(input): Json<WorkspaceQuotaInput>,
+) -> Json<Response> {
+    let started_at_ms = current_millis();
+    let started = Instant::now();
+    let request = serde_json::to_value(&input).unwrap_or_else(|_| json!({}));
+    let response = match state.store.update_quota(&quota, input) {
+        Ok(quota) => Response::ok("quota updated", quota),
+        Err(error) => Response::error(format!("{error:#}")),
+    };
+    record_feature_http_audit(
+        &state,
+        "quota",
+        "quota_update",
+        "quota_id",
+        Some(&quota),
+        request,
+        &response,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    );
+    Json(response)
+}
+
+async fn delete_quota(
+    State(state): State<DaemonState>,
+    Path(quota): Path<String>,
+) -> Json<Response> {
+    let started_at_ms = current_millis();
+    let started = Instant::now();
+    let request = json!({"id": quota});
+    let response = match state.store.delete_quota(&quota) {
+        Ok(true) => Response::empty("quota deleted"),
+        Ok(false) => Response::error(format!("quota '{quota}' not found")),
+        Err(error) => Response::error(format!("{error:#}")),
+    };
+    record_feature_http_audit(
+        &state,
+        "quota",
+        "quota_delete",
+        "quota_id",
+        Some(&quota),
+        request,
+        &response,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    );
+    Json(response)
+}
+
+// ---------------------------------------------------------------------------
+// Notifications and alert rules
+// ---------------------------------------------------------------------------
+
+async fn list_notifications(
+    State(state): State<DaemonState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Response> {
+    let limit = parse_positive_usize(&query, "limit", 200)
+        .unwrap_or(200)
+        .min(1000);
+    Json(match state.store.notifications(limit) {
+        Ok(notifications) => {
+            let unread_count = state.store.unread_notification_count().unwrap_or(0);
+            Response::ok(
+                "notifications",
+                NotificationsView {
+                    notifications,
+                    unread_count,
+                },
+            )
+        }
+        Err(error) => Response::error(format!("{error:#}")),
+    })
+}
+
+async fn mark_notifications_read(
+    State(state): State<DaemonState>,
+    Json(input): Json<NotificationMarkReadInput>,
+) -> Json<Response> {
+    let response = match (input.all, input.id) {
+        (true, _) | (false, None) => state.store.mark_notifications_read(None).map(|changed| {
+            Response::ok(
+                format!("marked {changed} notifications read"),
+                json!({"changed": changed}),
+            )
+        }),
+        (false, Some(id)) => state
+            .store
+            .mark_notifications_read(Some(id))
+            .map(|changed| {
+                Response::ok(
+                    format!("marked {changed} notification read"),
+                    json!({"changed": changed}),
+                )
+            }),
+    };
+    Json(match response {
+        Ok(response) => response,
+        Err(error) => Response::error(format!("{error:#}")),
+    })
+}
+
+async fn list_notification_rules(State(state): State<DaemonState>) -> Json<Response> {
+    Json(match state.store.notification_rules() {
+        Ok(rules) => Response::ok("notification rules", rules),
+        Err(error) => Response::error(format!("{error:#}")),
+    })
+}
+
+async fn create_notification_rule(
+    State(state): State<DaemonState>,
+    Json(input): Json<NotificationRuleInput>,
+) -> Json<Response> {
+    let started_at_ms = current_millis();
+    let started = Instant::now();
+    let request = serde_json::to_value(&input).unwrap_or_else(|_| json!({}));
+    let response = match state.store.create_notification_rule(input) {
+        Ok(rule) => Response::ok("notification rule created", rule),
+        Err(error) => Response::error(format!("{error:#}")),
+    };
+    record_feature_http_audit(
+        &state,
+        "notification_rule",
+        "notification_rule_create",
+        "rule_id",
+        None,
+        request,
+        &response,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    );
+    Json(response)
+}
+
+async fn update_notification_rule(
+    State(state): State<DaemonState>,
+    Path(rule): Path<String>,
+    Json(input): Json<NotificationRuleInput>,
+) -> Json<Response> {
+    let started_at_ms = current_millis();
+    let started = Instant::now();
+    let request = serde_json::to_value(&input).unwrap_or_else(|_| json!({}));
+    let response = match state.store.update_notification_rule(&rule, input) {
+        Ok(rule) => Response::ok("notification rule updated", rule),
+        Err(error) => Response::error(format!("{error:#}")),
+    };
+    record_feature_http_audit(
+        &state,
+        "notification_rule",
+        "notification_rule_update",
+        "rule_id",
+        Some(&rule),
+        request,
+        &response,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    );
+    Json(response)
+}
+
+async fn delete_notification_rule(
+    State(state): State<DaemonState>,
+    Path(rule): Path<String>,
+) -> Json<Response> {
+    let started_at_ms = current_millis();
+    let started = Instant::now();
+    let request = json!({"id": rule});
+    let response = match state.store.delete_notification_rule(&rule) {
+        Ok(true) => Response::empty("notification rule deleted"),
+        Ok(false) => Response::error(format!("notification rule '{rule}' not found")),
+        Err(error) => Response::error(format!("{error:#}")),
+    };
+    record_feature_http_audit(
+        &state,
+        "notification_rule",
+        "notification_rule_delete",
+        "rule_id",
+        Some(&rule),
+        request,
+        &response,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    );
+    Json(response)
+}
+
+// ---------------------------------------------------------------------------
+// API tokens (external integrations)
+// ---------------------------------------------------------------------------
+
+async fn list_api_tokens(State(state): State<DaemonState>) -> Json<Response> {
+    Json(match state.store.api_tokens() {
+        Ok(tokens) => Response::ok("api tokens", ApiTokensView { tokens }),
+        Err(error) => Response::error(format!("{error:#}")),
+    })
+}
+
+async fn create_api_token(
+    State(state): State<DaemonState>,
+    Json(input): Json<ApiTokenInput>,
+) -> Json<Response> {
+    let started_at_ms = current_millis();
+    let started = Instant::now();
+    let request = serde_json::to_value(&input).unwrap_or_else(|_| json!({}));
+    let response = match state.store.create_api_token(&input.name) {
+        Ok(created) => Response::ok("api token created", created),
+        Err(error) => Response::error(format!("{error:#}")),
+    };
+    record_feature_http_audit(
+        &state,
+        "api_token",
+        "api_token_create",
+        "token_id",
+        None,
+        request,
+        &response,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    );
+    Json(response)
+}
+
+async fn revoke_api_token(
+    State(state): State<DaemonState>,
+    Path(token): Path<String>,
+) -> Json<Response> {
+    let started_at_ms = current_millis();
+    let started = Instant::now();
+    let request = json!({"id": token});
+    let response = match state.store.revoke_api_token(&token) {
+        Ok(true) => Response::empty("api token revoked"),
+        Ok(false) => Response::error(format!("api token '{token}' not found")),
+        Err(error) => Response::error(format!("{error:#}")),
+    };
+    record_feature_http_audit(
+        &state,
+        "api_token",
+        "api_token_revoke",
+        "token_id",
+        Some(&token),
+        request,
+        &response,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    );
+    Json(response)
+}
+
+// ---------------------------------------------------------------------------
+// Board templates
+// ---------------------------------------------------------------------------
+
+async fn list_board_templates(State(state): State<DaemonState>) -> Json<Response> {
+    Json(match state.store.board_templates() {
+        Ok(templates) => Response::ok("board templates", BoardTemplatesView { templates }),
+        Err(error) => Response::error(format!("{error:#}")),
+    })
+}
+
+async fn create_board_template(
+    State(state): State<DaemonState>,
+    Json(input): Json<BoardTemplateInput>,
+) -> Json<Response> {
+    let started_at_ms = current_millis();
+    let started = Instant::now();
+    let mut input = input;
+    if let Some(board_id) = input
+        .source_board_id
+        .clone()
+        .filter(|board_id| !board_id.trim().is_empty())
+    {
+        input.cards = match state.store.board(&board_id) {
+            Ok(Some(board)) => board
+                .cards
+                .into_iter()
+                .map(|card| BoardCardInput {
+                    node_id: card.node_id,
+                    session: card.session,
+                    task: card.task,
+                    mode: card.mode,
+                    pinned: card.pinned,
+                })
+                .collect(),
+            Ok(None) => {
+                return Json(Response::error(format!("board '{board_id}' not found")));
+            }
+            Err(error) => {
+                return Json(Response::error(format!("{error:#}")));
+            }
+        };
+    }
+    let request = serde_json::to_value(&input).unwrap_or_else(|_| json!({}));
+    let response = match state.store.create_board_template(input) {
+        Ok(template) => Response::ok("board template created", template),
+        Err(error) => Response::error(format!("{error:#}")),
+    };
+    record_feature_http_audit(
+        &state,
+        "board_template",
+        "board_template_create",
+        "template_id",
+        None,
+        request,
+        &response,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    );
+    Json(response)
+}
+
+async fn import_board_template(
+    State(state): State<DaemonState>,
+    Json(export): Json<BoardTemplateExport>,
+) -> Json<Response> {
+    let started_at_ms = current_millis();
+    let started = Instant::now();
+    let request = serde_json::to_value(&export).unwrap_or_else(|_| json!({}));
+    let response = if export.kind != "taskdeck_board_template" {
+        Response::error("not a taskdeck board template export")
+    } else {
+        let input = BoardTemplateInput {
+            name: export.name.clone(),
+            description: export.description.clone(),
+            cards: export.cards.clone(),
+            source_board_id: None,
+        };
+        match state.store.create_board_template(input) {
+            Ok(template) => Response::ok("board template imported", template),
+            Err(error) => Response::error(format!("{error:#}")),
+        }
+    };
+    record_feature_http_audit(
+        &state,
+        "board_template",
+        "board_template_import",
+        "template_id",
+        None,
+        request,
+        &response,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    );
+    Json(response)
+}
+
+async fn delete_board_template(
+    State(state): State<DaemonState>,
+    Path(template): Path<String>,
+) -> Json<Response> {
+    let started_at_ms = current_millis();
+    let started = Instant::now();
+    let request = json!({"id": template});
+    let response = match state.store.delete_board_template(&template) {
+        Ok(true) => Response::empty("board template deleted"),
+        Ok(false) => Response::error(format!("board template '{template}' not found")),
+        Err(error) => Response::error(format!("{error:#}")),
+    };
+    record_feature_http_audit(
+        &state,
+        "board_template",
+        "board_template_delete",
+        "template_id",
+        Some(&template),
+        request,
+        &response,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    );
+    Json(response)
+}
+
+async fn apply_board_template(
+    State(state): State<DaemonState>,
+    Path(template): Path<String>,
+    Json(input): Json<BoardTemplateApplyInput>,
+) -> Json<Response> {
+    let started_at_ms = current_millis();
+    let started = Instant::now();
+    let request = json!({"template_id": template, "name": input.name});
+    let response = match require_board_leader(&state) {
+        Ok(()) => match state.store.board_template(&template) {
+            Ok(Some(template)) => {
+                let board_input = BoardInput {
+                    name: input.name,
+                    cards: template.cards.clone(),
+                };
+                let scoped = match validate_board_scope(&state, &board_input) {
+                    Err(response) => Err(response),
+                    Ok(()) => state
+                        .store
+                        .create_board(board_input)
+                        .map_err(|error| Response::error(format!("{error:#}"))),
+                };
+                match scoped {
+                    Ok(board) => {
+                        Response::ok("board created from template", board_view(&state, board))
+                    }
+                    Err(response) => response,
+                }
+            }
+            Ok(None) => Response::error(format!("board template '{template}' not found")),
+            Err(error) => Response::error(format!("{error:#}")),
+        },
+        Err(response) => response,
+    };
+    record_feature_http_audit(
+        &state,
+        "board_template",
+        "board_template_apply",
+        "template_id",
+        Some(&template),
+        request,
+        &response,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    );
+    Json(response)
+}
+
+async fn export_board_template(
+    State(state): State<DaemonState>,
+    Path(template): Path<String>,
+) -> Json<Response> {
+    Json(match state.store.board_template(&template) {
+        Ok(Some(template)) => Response::ok(
+            "board template export",
+            BoardTemplateExport {
+                kind: "taskdeck_board_template".to_string(),
+                name: template.name,
+                description: template.description,
+                cards: template.cards,
+                exported_at_ms: current_millis(),
+            },
+        ),
+        Ok(None) => Response::error(format!("board template '{template}' not found")),
+        Err(error) => Response::error(format!("{error:#}")),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Cross-workspace task dependencies
+// ---------------------------------------------------------------------------
+
+fn dependencies_view(
+    state: &DaemonState,
+    dependencies: Vec<crate::protocol::TaskDependency>,
+) -> TaskDependenciesView {
+    let (nodes, inventories) = workflow_context(state);
+    let targets = workflow_targets(&nodes, &inventories);
+    let dependencies = dependencies
+        .into_iter()
+        .map(|dependency| {
+            let node = nodes
+                .iter()
+                .find(|node| node.id == dependency.depends_node_id);
+            let session = inventories
+                .get(&dependency.depends_node_id)
+                .and_then(|sessions| {
+                    sessions
+                        .iter()
+                        .find(|session| session.name == dependency.depends_session)
+                });
+            let target_exists =
+                session.is_some_and(|session| session.tasks.contains_key(&dependency.depends_task));
+            let target_available = node.is_some_and(|node| node.online) && target_exists;
+            crate::protocol::TaskDependencyView {
+                dependency,
+                target_exists,
+                target_available,
+            }
+        })
+        .collect();
+    TaskDependenciesView {
+        dependencies,
+        targets,
+    }
+}
+
+fn validate_dependency_scope(
+    state: &DaemonState,
+    input: &TaskDependencyInput,
+) -> std::result::Result<(), Response> {
+    let settings = state.public_settings();
+    let known_nodes = state
+        .node_summaries()
+        .into_iter()
+        .map(|node| node.id)
+        .collect::<HashSet<_>>();
+    for (role, node_id) in [
+        ("dependency task", &input.node_id),
+        ("dependency target", &input.depends_node_id),
+    ] {
+        if node_id == "self" && !settings.execution_enabled {
+            return Err(Response::error_with_data(
+                "pure master dependencies cannot use the self executor",
+                json!({"kind": "validation_error", "status": 400}),
+            ));
+        }
+        if !known_nodes.contains(node_id) {
+            return Err(Response::error_with_data(
+                format!("{role} node '{node_id}' is not known"),
+                json!({"kind": "validation_error", "status": 400}),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn dependency_creates_cycle(
+    existing: &[crate::protocol::TaskDependency],
+    input: &TaskDependencyInput,
+) -> bool {
+    type Target = (String, String, String);
+    let key = |node: &str, session: &str, task: &str| {
+        (node.to_string(), session.to_string(), task.to_string())
+    };
+    let mut edges: HashMap<Target, Vec<Target>> = HashMap::new();
+    for dependency in existing {
+        edges
+            .entry(key(
+                &dependency.node_id,
+                &dependency.session,
+                &dependency.task,
+            ))
+            .or_default()
+            .push(key(
+                &dependency.depends_node_id,
+                &dependency.depends_session,
+                &dependency.depends_task,
+            ));
+    }
+    edges
+        .entry(key(&input.node_id, &input.session, &input.task))
+        .or_default()
+        .push(key(
+            &input.depends_node_id,
+            &input.depends_session,
+            &input.depends_task,
+        ));
+    let mut visiting: HashSet<Target> = HashSet::new();
+    let mut visited: HashSet<Target> = HashSet::new();
+    fn visit(
+        node: &(String, String, String),
+        edges: &HashMap<(String, String, String), Vec<(String, String, String)>>,
+        visiting: &mut HashSet<(String, String, String)>,
+        visited: &mut HashSet<(String, String, String)>,
+    ) -> bool {
+        if visiting.contains(node) {
+            return true;
+        }
+        if visited.contains(node) {
+            return false;
+        }
+        visiting.insert(node.clone());
+        if let Some(children) = edges.get(node) {
+            for child in children {
+                if visit(child, edges, visiting, visited) {
+                    return true;
+                }
+            }
+        }
+        visiting.remove(node);
+        visited.insert(node.clone());
+        false
+    }
+    let roots: Vec<Target> = edges.keys().cloned().collect();
+    for root in roots {
+        if visit(&root, &edges, &mut visiting, &mut visited) {
+            return true;
+        }
+    }
+    false
+}
+
+async fn list_dependencies(State(state): State<DaemonState>) -> Json<Response> {
+    Json(match state.store.task_dependencies() {
+        Ok(dependencies) => {
+            Response::ok("task dependencies", dependencies_view(&state, dependencies))
+        }
+        Err(error) => Response::error(format!("{error:#}")),
+    })
+}
+
+async fn create_dependency(
+    State(state): State<DaemonState>,
+    Json(input): Json<TaskDependencyInput>,
+) -> Json<Response> {
+    let started_at_ms = current_millis();
+    let started = Instant::now();
+    let request = serde_json::to_value(&input).unwrap_or_else(|_| json!({}));
+    // Start gates resolve dependencies by node id; persist "self" as the real id
+    // after scope validation, which matches "self" against known nodes.
+    let mut normalized = input.clone();
+    let self_node_id = state.public_settings().node_id;
+    if normalized.node_id == "self" {
+        normalized.node_id = self_node_id.clone();
+    }
+    if normalized.depends_node_id == "self" {
+        normalized.depends_node_id = self_node_id;
+    }
+    let response = match state.store.task_dependencies() {
+        Ok(existing) => {
+            if dependency_creates_cycle(&existing, &normalized) {
+                Response::error("task dependency would create a cycle")
+            } else {
+                let scoped = match validate_dependency_scope(&state, &input) {
+                    Err(response) => Err(response),
+                    Ok(()) => state
+                        .store
+                        .create_task_dependency(normalized)
+                        .map_err(|error| Response::error(format!("{error:#}"))),
+                };
+                match scoped {
+                    Ok(dependency) => Response::ok(
+                        "task dependency created",
+                        dependencies_view(&state, vec![dependency])
+                            .dependencies
+                            .remove(0),
+                    ),
+                    Err(response) => response,
+                }
+            }
+        }
+        Err(error) => Response::error(format!("{error:#}")),
+    };
+    record_feature_http_audit(
+        &state,
+        "task_dependency",
+        "task_dependency_create",
+        "dependency_id",
+        None,
+        request,
+        &response,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    );
+    Json(response)
+}
+
+async fn delete_dependency(
+    State(state): State<DaemonState>,
+    Path(dependency): Path<String>,
+) -> Json<Response> {
+    let started_at_ms = current_millis();
+    let started = Instant::now();
+    let request = json!({"id": dependency});
+    let response = match state.store.delete_task_dependency(&dependency) {
+        Ok(true) => Response::empty("task dependency deleted"),
+        Ok(false) => Response::error(format!("task dependency '{dependency}' not found")),
+        Err(error) => Response::error(format!("{error:#}")),
+    };
+    record_feature_http_audit(
+        &state,
+        "task_dependency",
+        "task_dependency_delete",
+        "dependency_id",
+        Some(&dependency),
+        request,
+        &response,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    );
+    Json(response)
+}
+
+// ---------------------------------------------------------------------------
+// Node metrics (dashboard)
+// ---------------------------------------------------------------------------
+
+fn task_status_key(status: &crate::protocol::TaskStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{status:?}"))
+}
+
+async fn node_metrics(State(state): State<DaemonState>) -> Json<Response> {
+    let nodes = state.node_summaries();
+    let mut entries = Vec::new();
+    let mut totals: std::collections::BTreeMap<String, u32> = Default::default();
+    for node in nodes {
+        let inventory = if node.id == "self" {
+            state.local_inventory()
+        } else {
+            state.cluster.cached_inventory(&node.id).unwrap_or_default()
+        };
+        let session_count = inventory.len();
+        let mut status_counts: std::collections::BTreeMap<String, u32> = Default::default();
+        for session in &inventory {
+            for task in session.tasks.values() {
+                *status_counts
+                    .entry(task_status_key(&task.status))
+                    .or_insert(0) += 1;
+            }
+        }
+        for (status, count) in &status_counts {
+            *totals.entry(status.clone()).or_insert(0) += count;
+        }
+        let metrics_node_id = if node.id == "self" {
+            state.public_settings().node_id.clone()
+        } else {
+            node.id.clone()
+        };
+        let samples = state
+            .node_metrics
+            .window(&metrics_node_id, crate::daemon::MAX_NODE_METRIC_SAMPLES);
+        entries.push(crate::protocol::NodeMetricsEntryView {
+            node_id: node.id.clone(),
+            node_name: Some(node.name.clone()),
+            online: node.online,
+            is_self: node.is_self,
+            current: samples.last().cloned(),
+            samples,
+            session_count,
+            task_status_counts: status_counts,
+        });
+    }
+    Json(Response::ok(
+        "node metrics",
+        NodeMetricsView {
+            nodes: entries,
+            task_status_counts: totals,
+        },
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Auto-scaling policies
+// ---------------------------------------------------------------------------
+
+async fn list_scaling_policies(State(state): State<DaemonState>) -> Json<Response> {
+    Json(match state.store.scaling_policies() {
+        Ok(policies) => {
+            let (nodes, inventories) = workflow_context(&state);
+            let targets = workflow_targets(&nodes, &inventories);
+            Response::ok(
+                "scaling policies",
+                ScalingPoliciesView { policies, targets },
+            )
+        }
+        Err(error) => Response::error(format!("{error:#}")),
+    })
+}
+
+async fn create_scaling_policy(
+    State(state): State<DaemonState>,
+    Json(input): Json<ScalingPolicyInput>,
+) -> Json<Response> {
+    let started_at_ms = current_millis();
+    let started = Instant::now();
+    let request = serde_json::to_value(&input).unwrap_or_else(|_| json!({}));
+    let response = match state.store.create_scaling_policy(input) {
+        Ok(policy) => Response::ok("scaling policy created", policy),
+        Err(error) => Response::error(format!("{error:#}")),
+    };
+    record_feature_http_audit(
+        &state,
+        "scaling_policy",
+        "scaling_policy_create",
+        "policy_id",
+        None,
+        request,
+        &response,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    );
+    Json(response)
+}
+
+async fn update_scaling_policy(
+    State(state): State<DaemonState>,
+    Path(policy): Path<String>,
+    Json(input): Json<ScalingPolicyInput>,
+) -> Json<Response> {
+    let started_at_ms = current_millis();
+    let started = Instant::now();
+    let request = serde_json::to_value(&input).unwrap_or_else(|_| json!({}));
+    let response = match state.store.update_scaling_policy(&policy, input) {
+        Ok(policy) => Response::ok("scaling policy updated", policy),
+        Err(error) => Response::error(format!("{error:#}")),
+    };
+    record_feature_http_audit(
+        &state,
+        "scaling_policy",
+        "scaling_policy_update",
+        "policy_id",
+        Some(&policy),
+        request,
+        &response,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    );
+    Json(response)
+}
+
+async fn delete_scaling_policy(
+    State(state): State<DaemonState>,
+    Path(policy): Path<String>,
+) -> Json<Response> {
+    let started_at_ms = current_millis();
+    let started = Instant::now();
+    let request = json!({"id": policy});
+    let response = match state.store.delete_scaling_policy(&policy) {
+        Ok(true) => Response::empty("scaling policy deleted"),
+        Ok(false) => Response::error(format!("scaling policy '{policy}' not found")),
+        Err(error) => Response::error(format!("{error:#}")),
+    };
+    record_feature_http_audit(
+        &state,
+        "scaling_policy",
+        "scaling_policy_delete",
+        "policy_id",
+        Some(&policy),
+        request,
+        &response,
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    );
+    Json(response)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_feature_http_audit(
+    state: &DaemonState,
+    request_kind: &str,
+    operation: &str,
+    entity_key: &str,
+    entity_id: Option<&str>,
+    request: serde_json::Value,
+    response: &Response,
+    started_at_ms: u64,
+    duration_ms: u64,
+) {
+    let response_value = serde_json::to_value(response)
+        .unwrap_or_else(|error| json!({"ok": response.ok, "message": format!("{error}")}));
+    let status = if response.ok {
+        AuditStatus::Success
+    } else {
+        AuditStatus::Error
+    };
+    let mut details = json!({});
+    if let Some(entity_id) = entity_id {
+        details[entity_key] = json!(entity_id);
+    }
+    let _ = record_audit_value(
+        state,
+        AuditContext::new(AuditSource::Web, AuditTransport::Http),
+        None,
+        request_kind,
+        operation,
+        None,
+        None,
+        status,
+        started_at_ms,
+        duration_ms,
+        request,
+        response_value,
+        details,
         Some(state.public_settings().node_id),
     );
 }
@@ -3249,6 +4493,7 @@ mod tests {
                         task: "missing".to_string(),
                     },
                 ],
+                graph: crate::protocol::WorkflowGraph::default(),
             })
             .unwrap();
         let body = json!({"action":"stop"}).to_string();
@@ -3548,5 +4793,600 @@ mod tests {
             .body(body)
             .unwrap();
         app(state).oneshot(request).await.unwrap()
+    }
+
+    async fn post_json(state: DaemonState, uri: &str, body: serde_json::Value) -> Response {
+        let response = http_route(
+            state,
+            "POST",
+            uri,
+            &[(header::CONTENT_TYPE, "application/json")],
+            Some(&body.to_string()),
+        )
+        .await;
+        parse_json_response(response).await
+    }
+
+    async fn get_json(state: DaemonState, uri: &str) -> Response {
+        let response = http_route(state, "GET", uri, &[], None).await;
+        parse_json_response(response).await
+    }
+
+    async fn request_json(
+        state: DaemonState,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> Response {
+        let response = http_route(
+            state,
+            method,
+            uri,
+            &[(header::CONTENT_TYPE, "application/json")],
+            body.map(|value| value.to_string()).as_deref(),
+        )
+        .await;
+        parse_json_response(response).await
+    }
+
+    async fn parse_json_response(response: axum::response::Response) -> Response {
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn workflow_revisions_record_history_and_restore() {
+        let state = workflow_leader_state();
+        let created = post_json(
+            state.clone(),
+            "/api/workflow-groups",
+            json!({
+                "name": "Pipeline",
+                "members": [
+                    {"node_id":"self", "session":"api", "task":"dev"}
+                ],
+                "graph": {"positions": [{"x":1.0,"y":2.0}], "edges": []}
+            }),
+        )
+        .await;
+        assert!(created.ok, "{}", created.message);
+        let group_id = created.data.unwrap()["id"].as_str().unwrap().to_string();
+
+        let updated = request_json(
+            state.clone(),
+            "PUT",
+            &format!("/api/workflow-groups/{group_id}"),
+            Some(json!({
+                "name": "Pipeline v2",
+                "members": [
+                    {"node_id":"self", "session":"api", "task":"dev"}
+                ]
+            })),
+        )
+        .await;
+        assert!(updated.ok, "{}", updated.message);
+
+        let revisions = get_json(
+            state.clone(),
+            &format!("/api/workflow-groups/{group_id}/revisions"),
+        )
+        .await;
+        assert!(revisions.ok, "{}", revisions.message);
+        let data = revisions.data.unwrap();
+        assert_eq!(data["group_id"], group_id);
+        let items = data["revisions"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["revision"], 2);
+        assert_eq!(items[0]["name"], "Pipeline v2");
+        assert_eq!(items[1]["revision"], 1);
+        assert_eq!(items[1]["graph"]["positions"][0]["x"], 1.0);
+
+        let restored = post_json(
+            state.clone(),
+            &format!("/api/workflow-groups/{group_id}/revisions/1/restore"),
+            json!({}),
+        )
+        .await;
+        assert!(restored.ok, "{}", restored.message);
+        let data = restored.data.unwrap();
+        assert_eq!(data["name"], "Pipeline");
+
+        let revisions = get_json(
+            state.clone(),
+            &format!("/api/workflow-groups/{group_id}/revisions"),
+        )
+        .await;
+        let revisions_data = revisions.data.unwrap();
+        let items = revisions_data["revisions"].as_array().unwrap();
+        assert_eq!(items[0]["revision"], 3);
+        assert_eq!(
+            items[0]["note"].as_str().unwrap(),
+            "restored from revision 1"
+        );
+
+        let missing = post_json(
+            state.clone(),
+            "/api/workflow-groups/pipeline/revisions/99/restore",
+            json!({}),
+        )
+        .await;
+        assert!(!missing.ok);
+    }
+
+    #[tokio::test]
+    async fn workflow_run_follows_graph_order_and_stop_on_failure() {
+        let state = workflow_leader_state();
+        let created = post_json(
+            state.clone(),
+            "/api/workflow-groups",
+            json!({
+                "name": "Ordered",
+                "members": [
+                    {"node_id":"self", "session":"api", "task":"dev"},
+                    {"node_id":"worker-7", "session":"worker-api", "task":"deploy"},
+                    {"node_id":"self", "session":"web", "task":"dev"}
+                ],
+                "graph": {"edges": [{"from":0,"to":1},{"from":1,"to":2}]}
+            }),
+        )
+        .await;
+        assert!(created.ok, "{}", created.message);
+        let group_id = created.data.unwrap()["id"].as_str().unwrap().to_string();
+
+        let run = post_json(
+            state.clone(),
+            &format!("/api/workflow-groups/{group_id}/run"),
+            json!({}),
+        )
+        .await;
+        assert!(run.ok, "{}", run.message);
+        let summary = run.data.unwrap();
+        let results = summary["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["task"], "dev");
+        assert_eq!(results[0]["session"], "api");
+        assert_eq!(results[0]["status"], "success");
+        assert_eq!(results[1]["task"], "deploy");
+        assert_eq!(results[1]["status"], "skipped");
+
+        let run_all = post_json(
+            state.clone(),
+            &format!("/api/workflow-groups/{group_id}/run"),
+            json!({"stop_on_failure": false}),
+        )
+        .await;
+        let summary = run_all.data.unwrap();
+        let results = summary["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[2]["task"], "dev");
+        assert_eq!(results[2]["session"], "web");
+    }
+
+    #[tokio::test]
+    async fn quotas_api_crud_and_validation() {
+        let mut state = DaemonState::new();
+        insert_workflow_session(&state, "api", None, "/tmp/api", &["dev"]);
+        let created = post_json(
+            state.clone(),
+            "/api/quotas",
+            json!({"session": "api", "max_running_tasks": 2}),
+        )
+        .await;
+        assert!(created.ok, "{}", created.message);
+        assert_eq!(created.data.unwrap()["session"], "api");
+
+        let node_quota = post_json(
+            state.clone(),
+            "/api/quotas",
+            json!({"max_running_tasks": 8}),
+        )
+        .await;
+        assert!(node_quota.ok, "{}", node_quota.message);
+
+        let duplicate = post_json(
+            state.clone(),
+            "/api/quotas",
+            json!({"session": "api", "max_running_tasks": 3}),
+        )
+        .await;
+        assert!(!duplicate.ok);
+
+        let invalid = post_json(
+            state.clone(),
+            "/api/quotas",
+            json!({"max_running_tasks": 0}),
+        )
+        .await;
+        assert!(!invalid.ok);
+
+        let list = get_json(state.clone(), "/api/quotas").await;
+        let data = list.data.unwrap();
+        assert_eq!(data["quotas"].as_array().unwrap().len(), 2);
+        assert!(
+            data["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s == "api")
+        );
+
+        let quota_id = data["quotas"][0]["id"].as_str().unwrap().to_string();
+        let updated = request_json(
+            state.clone(),
+            "PUT",
+            &format!("/api/quotas/{quota_id}"),
+            Some(json!({"session": "web", "max_running_tasks": 5})),
+        )
+        .await;
+        assert!(updated.ok, "{}", updated.message);
+
+        let deleted = request_json(
+            state.clone(),
+            "DELETE",
+            &format!("/api/quotas/{quota_id}"),
+            None,
+        )
+        .await;
+        assert!(deleted.ok, "{}", deleted.message);
+        assert!(state.check_quotas("api").is_ok());
+    }
+
+    #[tokio::test]
+    async fn notification_rules_and_notifications_round_trip() {
+        let state = DaemonState::new();
+        let rule = post_json(
+            state.clone(),
+            "/api/notification-rules",
+            json!({
+                "name": "failures",
+                "event_types": ["task_failed"],
+                "scope_session": "api",
+                "webhook_url": "https://example.com/hook"
+            }),
+        )
+        .await;
+        assert!(rule.ok, "{}", rule.message);
+        let rule_id = rule.data.unwrap()["id"].as_str().unwrap().to_string();
+
+        let invalid = post_json(
+            state.clone(),
+            "/api/notification-rules",
+            json!({"name": "bad", "event_types": ["explosion"]}),
+        )
+        .await;
+        assert!(!invalid.ok);
+
+        let empty = get_json(state.clone(), "/api/notifications").await;
+        assert_eq!(empty.data.unwrap()["unread_count"], 0);
+
+        state
+            .store
+            .insert_notification(
+                "self-node",
+                Some(&rule_id),
+                Some("failures"),
+                "task_failed",
+                "critical",
+                Some("api"),
+                Some("dev"),
+                "task failed: dev",
+                "dev exited with code 1",
+                &json!({"exit_code": 1}),
+            )
+            .unwrap();
+
+        let listed = get_json(state.clone(), "/api/notifications").await;
+        let data = listed.data.unwrap();
+        assert_eq!(data["notifications"].as_array().unwrap().len(), 1);
+        assert_eq!(data["unread_count"], 1);
+
+        let read = post_json(
+            state.clone(),
+            "/api/notifications/read",
+            json!({"all": true}),
+        )
+        .await;
+        assert!(read.ok, "{}", read.message);
+        let listed = get_json(state.clone(), "/api/notifications").await;
+        assert_eq!(listed.data.unwrap()["unread_count"], 0);
+
+        let updated = request_json(
+            state.clone(),
+            "PUT",
+            &format!("/api/notification-rules/{rule_id}"),
+            Some(json!({
+                "name": "failures",
+                "event_types": ["task_failed", "task_stopped"],
+                "enabled": false
+            })),
+        )
+        .await;
+        assert!(updated.ok, "{}", updated.message);
+        assert!(!updated.data.unwrap()["enabled"].as_bool().unwrap());
+
+        let deleted = request_json(
+            state.clone(),
+            "DELETE",
+            &format!("/api/notification-rules/{rule_id}"),
+            None,
+        )
+        .await;
+        assert!(deleted.ok, "{}", deleted.message);
+    }
+
+    #[tokio::test]
+    async fn api_tokens_authenticate_external_clients() {
+        let state = DaemonState::new();
+        let created = post_json(state.clone(), "/api/tokens", json!({"name": "ci"})).await;
+        assert!(created.ok, "{}", created.message);
+        let data = created.data.unwrap();
+        let secret = data["secret"].as_str().unwrap().to_string();
+        let token_id = data["id"].as_str().unwrap().to_string();
+        assert!(secret.starts_with("tdk_"));
+
+        let listed = get_json(state.clone(), "/api/tokens").await;
+        let listed_data = listed.data.unwrap();
+        let tokens = listed_data["tokens"].as_array().unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert!(tokens[0].get("secret").is_none());
+
+        state.store.set_access_key("test-access-key").unwrap();
+        state.store.configure_auth(true).unwrap();
+
+        let unauthorized = http_route(state.clone(), "GET", "/api/quotas", &[], None).await;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = http_route(
+            state.clone(),
+            "GET",
+            "/api/quotas",
+            &[(header::AUTHORIZATION, &format!("Bearer {secret}"))],
+            None,
+        )
+        .await;
+        assert_eq!(authorized.status(), StatusCode::OK);
+
+        let revoked = http_route(
+            state.clone(),
+            "DELETE",
+            &format!("/api/tokens/{token_id}"),
+            &[(header::AUTHORIZATION, &format!("Bearer {secret}"))],
+            None,
+        )
+        .await;
+        assert_eq!(revoked.status(), StatusCode::OK);
+        let rejected = http_route(
+            state,
+            "GET",
+            "/api/quotas",
+            &[(header::AUTHORIZATION, &format!("Bearer {secret}"))],
+            None,
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn board_templates_create_apply_export_import() {
+        let state = workflow_leader_state();
+        let board = post_json(
+            state.clone(),
+            "/api/boards",
+            json!({
+                "name": "Ops",
+                "cards": [{"node_id":"self", "session":"api", "task":"dev", "mode":"logs", "pinned": true}]
+            }),
+        )
+        .await;
+        assert!(board.ok, "{}", board.message);
+        let board_id = board.data.unwrap()["id"].as_str().unwrap().to_string();
+
+        let template = post_json(
+            state.clone(),
+            "/api/board-templates",
+            json!({"name": "Ops template", "source_board_id": board_id}),
+        )
+        .await;
+        assert!(template.ok, "{}", template.message);
+        let data = template.data.unwrap();
+        let template_id = data["id"].as_str().unwrap().to_string();
+        assert_eq!(data["cards"].as_array().unwrap().len(), 1);
+
+        let applied = post_json(
+            state.clone(),
+            &format!("/api/board-templates/{template_id}/apply"),
+            json!({"name": "Ops clone"}),
+        )
+        .await;
+        assert!(applied.ok, "{}", applied.message);
+        assert_eq!(applied.data.unwrap()["name"], "Ops clone");
+
+        let export = get_json(
+            state.clone(),
+            &format!("/api/board-templates/{template_id}/export"),
+        )
+        .await;
+        let exported = export.data.unwrap();
+        assert_eq!(exported["kind"], "taskdeck_board_template");
+
+        let deleted = request_json(
+            state.clone(),
+            "DELETE",
+            &format!("/api/board-templates/{template_id}"),
+            None,
+        )
+        .await;
+        assert!(deleted.ok, "{}", deleted.message);
+
+        let imported = post_json(state.clone(), "/api/board-templates/import", exported).await;
+        assert!(imported.ok, "{}", imported.message);
+
+        let listed = get_json(state.clone(), "/api/board-templates").await;
+        let listed_data = listed.data.unwrap();
+        let templates = listed_data["templates"].as_array().unwrap();
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0]["name"], "Ops template");
+    }
+
+    #[tokio::test]
+    async fn dependencies_api_validates_scope_and_cycles() {
+        let state = workflow_leader_state();
+        let created = post_json(
+            state.clone(),
+            "/api/dependencies",
+            json!({
+                "node_id": "self", "session": "api", "task": "dev",
+                "depends_node_id": "worker-7", "depends_session": "worker-api", "depends_task": "deploy"
+            }),
+        )
+        .await;
+        assert!(created.ok, "{}", created.message);
+        let dependency = created.data.unwrap();
+        assert_eq!(dependency["required_state"], "running");
+        assert_eq!(dependency["target_exists"], true);
+        let dependency_id = dependency["id"].as_str().unwrap().to_string();
+
+        let duplicate = post_json(
+            state.clone(),
+            "/api/dependencies",
+            json!({
+                "node_id": "self", "session": "api", "task": "dev",
+                "depends_node_id": "worker-7", "depends_session": "worker-api", "depends_task": "deploy"
+            }),
+        )
+        .await;
+        assert!(!duplicate.ok);
+
+        let cycle = post_json(
+            state.clone(),
+            "/api/dependencies",
+            json!({
+                "node_id": "worker-7", "session": "worker-api", "task": "deploy",
+                "depends_node_id": "self", "depends_session": "api", "depends_task": "dev"
+            }),
+        )
+        .await;
+        assert!(!cycle.ok);
+        assert!(cycle.message.contains("cycle"));
+
+        let unknown = post_json(
+            state.clone(),
+            "/api/dependencies",
+            json!({
+                "node_id": "self", "session": "api", "task": "dev",
+                "depends_node_id": "ghost", "depends_session": "x", "depends_task": "y"
+            }),
+        )
+        .await;
+        assert!(!unknown.ok);
+
+        let list = get_json(state.clone(), "/api/dependencies").await;
+        let data = list.data.unwrap();
+        assert_eq!(data["dependencies"].as_array().unwrap().len(), 1);
+        assert!(!data["targets"].as_array().unwrap().is_empty());
+
+        let deleted = request_json(
+            state.clone(),
+            "DELETE",
+            &format!("/api/dependencies/{dependency_id}"),
+            None,
+        )
+        .await;
+        assert!(deleted.ok, "{}", deleted.message);
+    }
+
+    #[tokio::test]
+    async fn node_metrics_reports_nodes_and_status_counts() {
+        let state = workflow_leader_state();
+        let listed = get_json(state.clone(), "/api/node-metrics").await;
+        assert!(listed.ok, "{}", listed.message);
+        let data = listed.data.unwrap();
+        let nodes = data["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2);
+        let self_entry = nodes.iter().find(|node| node["node_id"] == "self").unwrap();
+        assert!(self_entry["is_self"].as_bool().unwrap());
+        assert_eq!(self_entry["task_status_counts"]["idle"], 2);
+        assert!(data["task_status_counts"]["idle"].as_u64().unwrap() >= 3);
+    }
+
+    #[tokio::test]
+    async fn scaling_policies_api_crud_and_validation() {
+        let state = workflow_leader_state();
+        let created = post_json(
+            state.clone(),
+            "/api/scaling-policies",
+            json!({
+                "name": "api autoscale",
+                "watch_node_id": "self",
+                "watch_session": "api",
+                "watch_task": "dev",
+                "metric": "cpu_percent",
+                "scale_out_threshold": 80.0,
+                "scale_in_threshold": 20.0,
+                "scale_out_node_id": "self",
+                "scale_out_session": "api",
+                "scale_out_task": "dev-replica",
+                "cooldown_seconds": 60
+            }),
+        )
+        .await;
+        assert!(created.ok, "{}", created.message);
+        let policy_id = created.data.unwrap()["id"].as_str().unwrap().to_string();
+
+        let invalid = post_json(
+            state.clone(),
+            "/api/scaling-policies",
+            json!({
+                "name": "bad",
+                "watch_node_id": "self",
+                "watch_session": "api",
+                "watch_task": "dev",
+                "metric": "cpu_percent",
+                "scale_out_threshold": 20.0,
+                "scale_in_threshold": 80.0,
+                "scale_out_node_id": "self",
+                "scale_out_session": "api",
+                "scale_out_task": "dev-replica"
+            }),
+        )
+        .await;
+        assert!(!invalid.ok);
+
+        let list = get_json(state.clone(), "/api/scaling-policies").await;
+        let data = list.data.unwrap();
+        assert_eq!(data["policies"].as_array().unwrap().len(), 1);
+        assert!(!data["targets"].as_array().unwrap().is_empty());
+
+        let updated = request_json(
+            state.clone(),
+            "PUT",
+            &format!("/api/scaling-policies/{policy_id}"),
+            Some(json!({
+                "name": "api autoscale v2",
+                "watch_node_id": "self",
+                "watch_session": "api",
+                "watch_task": "dev",
+                "metric": "memory_bytes",
+                "scale_out_threshold": 1000000000.0,
+                "scale_in_threshold": 100000000.0,
+                "scale_out_node_id": "self",
+                "scale_out_session": "api",
+                "scale_out_task": "dev-replica"
+            })),
+        )
+        .await;
+        assert!(updated.ok, "{}", updated.message);
+
+        let deleted = request_json(
+            state.clone(),
+            "DELETE",
+            &format!("/api/scaling-policies/{policy_id}"),
+            None,
+        )
+        .await;
+        assert!(deleted.ok, "{}", deleted.message);
     }
 }
