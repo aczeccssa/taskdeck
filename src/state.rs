@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,15 +20,15 @@ use uuid::Uuid;
 use crate::protocol::{
     AuditFilter, AuditListItem, AuditListPage, AuditRecord, AuditSource, AuditStatus,
     AuditTransport, EventFilter, EventListPage, EventRecord, McpCallListItem, McpCallListPage,
-    McpCallRecord, TaskRunFilter, TaskRunListPage, TaskRunRecord, casefold_search_text,
-    sanitize_audit_value,
+    McpCallRecord, TaskRunFilter, TaskRunListPage, TaskRunRecord, WorkflowGroup,
+    WorkflowGroupInput, WorkflowGroupMember, casefold_search_text, sanitize_audit_value,
 };
 
 pub const DEFAULT_BIND_HOST: &str = "0.0.0.0";
 pub const DEFAULT_WEB_PORT: u16 = 9837;
 const DATABASE_FILE: &str = "state.db";
 pub const AUTH_SESSION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
-const SCHEMA_VERSION: &str = "5";
+const SCHEMA_VERSION: &str = "6";
 pub const AUDIT_RETENTION_LIMIT: usize = 10_000;
 
 #[cfg(test)]
@@ -236,6 +237,24 @@ impl StateStore {
                  last_seen_ms INTEGER NOT NULL,
                  inventory_json TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS workflow_groups (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL UNIQUE,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS workflow_group_members (
+                 group_id TEXT NOT NULL,
+                 position INTEGER NOT NULL,
+                 node_id TEXT NOT NULL,
+                 session TEXT NOT NULL,
+                 task TEXT NOT NULL,
+                 PRIMARY KEY(group_id, position),
+                 UNIQUE(group_id, node_id, session, task),
+                 FOREIGN KEY(group_id) REFERENCES workflow_groups(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_workflow_group_members_target
+                 ON workflow_group_members(node_id, session, task);
              CREATE TABLE IF NOT EXISTS task_runs (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  node_id TEXT NOT NULL,
@@ -355,6 +374,24 @@ impl StateStore {
                  last_seen_ms INTEGER NOT NULL,
                  inventory_json TEXT NOT NULL
              );
+             CREATE TABLE workflow_groups (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL UNIQUE,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE workflow_group_members (
+                 group_id TEXT NOT NULL,
+                 position INTEGER NOT NULL,
+                 node_id TEXT NOT NULL,
+                 session TEXT NOT NULL,
+                 task TEXT NOT NULL,
+                 PRIMARY KEY(group_id, position),
+                 UNIQUE(group_id, node_id, session, task),
+                 FOREIGN KEY(group_id) REFERENCES workflow_groups(id) ON DELETE CASCADE
+             );
+             CREATE INDEX idx_workflow_group_members_target
+                 ON workflow_group_members(node_id, session, task);
              CREATE TABLE IF NOT EXISTS task_runs (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  node_id TEXT NOT NULL,
@@ -457,7 +494,7 @@ impl StateStore {
         let version = get_metadata(&connection, "schema_version")?;
         match version.as_deref() {
             None => set_metadata(&connection, "schema_version", SCHEMA_VERSION)?,
-            Some("1" | "2" | "3" | "4") => {
+            Some("1" | "2" | "3" | "4" | "5") => {
                 if get_metadata(&connection, "bind_host")?.as_deref() == Some("127.0.0.1") {
                     set_metadata(&connection, "bind_host", DEFAULT_BIND_HOST)?;
                 }
@@ -645,6 +682,107 @@ impl StateStore {
                 }
             })
             .collect())
+    }
+
+    pub fn workflow_groups(&self) -> Result<Vec<WorkflowGroup>> {
+        let connection = self.connection.lock().expect("state store lock");
+        let mut statement = connection.prepare(
+            "SELECT id, name, created_at_ms, updated_at_ms
+             FROM workflow_groups
+             ORDER BY name COLLATE NOCASE, created_at_ms, id",
+        )?;
+        let mut groups = statement
+            .query_map([], |row| {
+                Ok(WorkflowGroup {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    created_at_ms: row.get::<_, i64>(2)? as u64,
+                    updated_at_ms: row.get::<_, i64>(3)? as u64,
+                    members: Vec::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut members = connection.prepare(
+            "SELECT node_id, session, task
+             FROM workflow_group_members
+             WHERE group_id=?1
+             ORDER BY position",
+        )?;
+        for group in &mut groups {
+            group.members = members
+                .query_map(params![group.id], |row| {
+                    Ok(WorkflowGroupMember {
+                        node_id: row.get(0)?,
+                        session: row.get(1)?,
+                        task: row.get(2)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+        }
+        Ok(groups)
+    }
+
+    pub fn workflow_group(&self, id: &str) -> Result<Option<WorkflowGroup>> {
+        Ok(self
+            .workflow_groups()?
+            .into_iter()
+            .find(|group| group.id == id))
+    }
+
+    pub fn create_workflow_group(&self, input: WorkflowGroupInput) -> Result<WorkflowGroup> {
+        let input = normalize_workflow_group_input(input)?;
+        let now = current_timestamp_ms();
+        let id = Uuid::new_v4().to_string();
+        {
+            let mut connection = self.connection.lock().expect("state store lock");
+            let transaction = connection.transaction()?;
+            transaction
+                .execute(
+                    "INSERT INTO workflow_groups(id, name, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4)",
+                    params![id, input.name, now as i64, now as i64],
+                )
+                .with_context(|| format!("failed to create workflow group '{}'", input.name))?;
+            write_workflow_members(&transaction, &id, &input.members)?;
+            transaction.commit()?;
+        }
+        self.workflow_group(&id)?
+            .with_context(|| format!("workflow group '{id}' disappeared after create"))
+    }
+
+    pub fn update_workflow_group(
+        &self,
+        id: &str,
+        input: WorkflowGroupInput,
+    ) -> Result<WorkflowGroup> {
+        let input = normalize_workflow_group_input(input)?;
+        let now = current_timestamp_ms();
+        {
+            let mut connection = self.connection.lock().expect("state store lock");
+            let transaction = connection.transaction()?;
+            let changed = transaction
+                .execute(
+                    "UPDATE workflow_groups SET name=?2, updated_at_ms=?3 WHERE id=?1",
+                    params![id, input.name, now as i64],
+                )
+                .with_context(|| format!("failed to update workflow group '{id}'"))?;
+            if changed == 0 {
+                bail!("workflow group '{id}' not found");
+            }
+            transaction.execute(
+                "DELETE FROM workflow_group_members WHERE group_id=?1",
+                params![id],
+            )?;
+            write_workflow_members(&transaction, id, &input.members)?;
+            transaction.commit()?;
+        }
+        self.workflow_group(id)?
+            .with_context(|| format!("workflow group '{id}' disappeared after update"))
+    }
+
+    pub fn delete_workflow_group(&self, id: &str) -> Result<bool> {
+        let connection = self.connection.lock().expect("state store lock");
+        Ok(connection.execute("DELETE FROM workflow_groups WHERE id=?1", params![id])? > 0)
     }
 
     pub fn remove_registration(&self, session: &str) -> Result<bool> {
@@ -1284,6 +1422,59 @@ pub struct KnownWorker {
     pub name: String,
     pub last_seen_ms: u64,
     pub inventory_json: String,
+}
+
+fn normalize_workflow_group_input(mut input: WorkflowGroupInput) -> Result<WorkflowGroupInput> {
+    input.name = input.name.trim().to_string();
+    if input.name.is_empty() {
+        bail!("workflow group name cannot be empty");
+    }
+
+    let mut seen = HashSet::new();
+    for member in &mut input.members {
+        member.node_id = member.node_id.trim().to_string();
+        member.session = member.session.trim().to_string();
+        member.task = member.task.trim().to_string();
+        if member.node_id.is_empty() || member.session.is_empty() || member.task.is_empty() {
+            bail!("workflow group members require node_id, session, and task");
+        }
+        let key = (
+            member.node_id.clone(),
+            member.session.clone(),
+            member.task.clone(),
+        );
+        if !seen.insert(key) {
+            bail!(
+                "duplicate workflow group member '{}:{}:{}'",
+                member.node_id,
+                member.session,
+                member.task
+            );
+        }
+    }
+
+    Ok(input)
+}
+
+fn write_workflow_members(
+    transaction: &rusqlite::Transaction<'_>,
+    group_id: &str,
+    members: &[WorkflowGroupMember],
+) -> Result<()> {
+    for (position, member) in members.iter().enumerate() {
+        transaction.execute(
+            "INSERT INTO workflow_group_members(group_id, position, node_id, session, task)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                group_id,
+                position as i64,
+                &member.node_id,
+                &member.session,
+                &member.task
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn paginated_mcp_calls(
@@ -1937,6 +2128,141 @@ mod tests {
                 .alias
                 .as_deref(),
             Some("Backend")
+        );
+    }
+
+    #[test]
+    fn workflow_groups_are_persisted_ordered_and_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(dir.path()).unwrap();
+        let group = store
+            .create_workflow_group(crate::protocol::WorkflowGroupInput {
+                name: " Release train ".to_string(),
+                members: vec![
+                    crate::protocol::WorkflowGroupMember {
+                        node_id: "worker-1".to_string(),
+                        session: "api".to_string(),
+                        task: "migrate".to_string(),
+                    },
+                    crate::protocol::WorkflowGroupMember {
+                        node_id: "self".to_string(),
+                        session: "web".to_string(),
+                        task: "dev".to_string(),
+                    },
+                ],
+            })
+            .unwrap();
+        assert_eq!(group.name, "Release train");
+        assert_eq!(group.members[0].task, "migrate");
+        assert_eq!(group.members[1].node_id, "self");
+
+        let reopened = StateStore::open(dir.path()).unwrap();
+        let restored = reopened.workflow_group(&group.id).unwrap().unwrap();
+        assert_eq!(restored.members, group.members);
+        assert!(
+            reopened
+                .create_workflow_group(crate::protocol::WorkflowGroupInput {
+                    name: "Release train".to_string(),
+                    members: Vec::new(),
+                })
+                .is_err()
+        );
+        assert!(
+            reopened
+                .create_workflow_group(crate::protocol::WorkflowGroupInput {
+                    name: " ".to_string(),
+                    members: Vec::new(),
+                })
+                .is_err()
+        );
+        assert!(
+            reopened
+                .update_workflow_group(
+                    &group.id,
+                    crate::protocol::WorkflowGroupInput {
+                        name: "Updated".to_string(),
+                        members: vec![
+                            crate::protocol::WorkflowGroupMember {
+                                node_id: "self".to_string(),
+                                session: "web".to_string(),
+                                task: "dev".to_string(),
+                            },
+                            crate::protocol::WorkflowGroupMember {
+                                node_id: "self".to_string(),
+                                session: "web".to_string(),
+                                task: "dev".to_string(),
+                            },
+                        ],
+                    },
+                )
+                .is_err()
+        );
+        let updated = reopened
+            .update_workflow_group(
+                &group.id,
+                crate::protocol::WorkflowGroupInput {
+                    name: "Updated".to_string(),
+                    members: group.members.iter().cloned().rev().collect(),
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.name, "Updated");
+        assert_eq!(updated.members[0].session, "web");
+        assert!(reopened.delete_workflow_group(&group.id).unwrap());
+        assert!(!reopened.delete_workflow_group(&group.id).unwrap());
+    }
+
+    #[test]
+    fn schema_five_migrates_workflow_group_tables_without_losing_workspaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("state.db");
+        {
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA journal_mode=WAL;
+                     CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+                     CREATE TABLE registrations(session TEXT PRIMARY KEY,alias TEXT,project TEXT NOT NULL,registered_at_ms INTEGER NOT NULL);
+                     INSERT INTO metadata VALUES ('schema_version','5');
+                     INSERT INTO metadata VALUES ('node_id','legacy-id');
+                     INSERT INTO metadata VALUES ('node_name','legacy');
+                     INSERT INTO metadata VALUES ('role','leader');
+                     INSERT INTO metadata VALUES ('leader_mode','standard');
+                     INSERT INTO metadata VALUES ('bind_host','0.0.0.0');
+                     INSERT INTO metadata VALUES ('web_port','9837');
+                     INSERT INTO registrations VALUES ('api','Backend API','/tmp/api',7);",
+                )
+                .unwrap();
+        }
+
+        let store = StateStore::open(dir.path()).unwrap();
+        let workspaces = store.workspace_summaries().unwrap();
+        assert_eq!(workspaces[0].display_name, "Backend API");
+        let group = store
+            .create_workflow_group(crate::protocol::WorkflowGroupInput {
+                name: "Backend".to_string(),
+                members: vec![crate::protocol::WorkflowGroupMember {
+                    node_id: "self".to_string(),
+                    session: "api".to_string(),
+                    task: "dev".to_string(),
+                }],
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .workflow_group(&group.id)
+                .unwrap()
+                .unwrap()
+                .members
+                .len(),
+            1
+        );
+        let connection = store.connection.lock().unwrap();
+        assert_eq!(
+            get_metadata(&connection, "schema_version")
+                .unwrap()
+                .as_deref(),
+            Some(SCHEMA_VERSION)
         );
     }
 

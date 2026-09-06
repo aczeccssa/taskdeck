@@ -19,6 +19,14 @@ const state = {
   sessionsRequest: 0,
   workspaces: [],
   workspacesRequest: 0,
+  workflowGroups: [],
+  workflowTargets: [],
+  workflowUngrouped: [],
+  workflowRequest: 0,
+  workflowEditingId: null,
+  workflowEditorActive: false,
+  workflowDraftMembers: [],
+  workflowLastResults: null,
   nodeSettings: null,
   nodeSettingsRequest: 0,
   serviceStatus: null,
@@ -177,10 +185,11 @@ function setView(view) {
   });
   $("#sessions").hidden = view !== "tasks";
   $("#nodes").hidden = false;
-  $("#page-title").textContent = view === "calls" ? "MCP Calls" : view === "audit" ? "Audit Log" : view === "runs" ? "Task Runs" : view === "docs" ? "MCP Guide" : view === "settings" ? "Settings" : "Task workspace";
+  $("#page-title").textContent = view === "calls" ? "MCP Calls" : view === "audit" ? "Audit Log" : view === "runs" ? "Task Runs" : view === "docs" ? "MCP Guide" : view === "settings" ? "Settings" : view === "workflows" ? "Workflows" : "Task workspace";
   if (view === "calls") loadMcpCalls();
   if (view === "audit") loadAudit();
   if (view === "runs") loadRuns().catch((error) => showToast(error.message || "Unable to load runs"));
+  if (view === "workflows") loadWorkflowGroups().catch((error) => showToast(error.message || "Unable to load workflows"));
   if (view === "settings") {
     loadNodeSettings().catch((error) => showToast(error.message || "Unable to load settings"));
     loadServiceStatus();
@@ -235,6 +244,259 @@ async function loadWorkspaces() {
     setConnection(true);
   } catch (error) {
     if (requestId === state.workspacesRequest) console.warn("Unable to load workspace aliases", error);
+  }
+}
+
+async function loadWorkflowGroups() {
+  const requestId = ++state.workflowRequest;
+  try {
+    const response = await requestJson("/api/workflow-groups");
+    if (requestId !== state.workflowRequest) return;
+    if (!response.ok) throw new Error(response.message);
+    state.workflowGroups = response.data?.groups || [];
+    state.workflowTargets = response.data?.targets || [];
+    state.workflowUngrouped = response.data?.ungrouped || [];
+    renderWorkflows();
+    setConnection(true);
+    updateMeta();
+  } catch (error) {
+    if (requestId !== state.workflowRequest) return;
+    state.workflowGroups = [];
+    state.workflowTargets = [];
+    state.workflowUngrouped = [];
+    const groups = $("#workflow-groups");
+    if (groups) groups.innerHTML = `<div class="empty-state compact"><div><h1>Workflows unavailable</h1><p>${escapeHtml(error.message || "Leader workflow groups are unavailable")}</p></div></div>`;
+    const summary = $("#workflows-summary");
+    if (summary) summary.textContent = "Leader-only workflow grouping";
+    renderWorkflowEditor();
+  }
+}
+
+function renderWorkflows() {
+  const groups = $("#workflow-groups");
+  const summary = $("#workflows-summary");
+  if (!groups || !summary) return;
+  const memberCount = state.workflowGroups.reduce((total, group) => total + (group.members?.length || 0), 0);
+  summary.textContent = `${state.workflowGroups.length} groups · ${memberCount} members · ${state.workflowUngrouped.length} ungrouped workspaces`;
+  groups.innerHTML = state.workflowGroups.length
+    ? state.workflowGroups.map(renderWorkflowCard).join("")
+    : '<div class="empty-state compact"><div><h1>No workflow groups</h1><p>Create a group to organize tasks across workspaces and nodes.</p></div></div>';
+  const ungrouped = $("#ungrouped-workspaces");
+  if (ungrouped) {
+    ungrouped.innerHTML = state.workflowUngrouped.length
+      ? state.workflowUngrouped.map((target) => `<button class="workflow-target" type="button" data-workflow-open data-node="${escapeAttr(target.node_id)}" data-session="${escapeAttr(target.session)}"><strong>${escapeHtml(target.workspace_display_name)}</strong><span>${escapeHtml(target.node_name)} · ${escapeHtml(target.session)} · ${target.tasks?.length || 0} task${(target.tasks?.length || 0) === 1 ? "" : "s"}</span></button>`).join("")
+      : '<div class="muted">Every visible workspace is assigned to a workflow group.</div>';
+  }
+  renderWorkflowEditor();
+}
+
+function renderWorkflowCard(group) {
+  const members = group.members?.length
+    ? group.members.map((member) => `<button class="workflow-member ${member.available ? "" : "unavailable"}" type="button" data-workflow-open data-node="${escapeAttr(member.node_id)}" data-session="${escapeAttr(member.session)}"><span class="status-pill ${member.available ? "" : "error"}">${escapeHtml(member.available ? "ready" : member.skip_reason || "skipped")}</span><strong>${escapeHtml(member.workspace_display_name)}</strong><span>${escapeHtml(member.node_name || member.node_id)} · ${escapeHtml(member.session)} · ${escapeHtml(member.task)}</span></button>`).join("")
+    : '<div class="muted">No members yet.</div>';
+  return `<article class="workflow-card" data-workflow-id="${escapeAttr(group.id)}">
+    <header><div><h2>${escapeHtml(group.name)}</h2><p>${group.members?.length || 0} member${(group.members?.length || 0) === 1 ? "" : "s"}</p></div><div class="workflow-card-actions"><button class="button compact" type="button" data-workflow-edit="${escapeAttr(group.id)}">Edit</button><button class="button compact danger" type="button" data-workflow-delete="${escapeAttr(group.id)}">Delete</button></div></header>
+    <div class="workflow-members">${members}</div>
+    <footer class="workflow-actions">${["start", "stop", "restart", "pause", "resume"].map((action) => `<button class="button compact" type="button" data-workflow-action="${action}" data-workflow-id="${escapeAttr(group.id)}">${action}</button>`).join("")}</footer>
+  </article>`;
+}
+
+function beginWorkflowEditor(group = null) {
+  state.workflowEditorActive = true;
+  state.workflowEditingId = group?.id || null;
+  state.workflowDraftMembers = (group?.members || []).map((member) => ({
+    node_id: member.node_id,
+    session: member.session,
+    task: member.task,
+  }));
+  $("#workflow-name").value = group?.name || "";
+  $("#workflow-results").innerHTML = "";
+  renderWorkflowEditor();
+}
+
+function cancelWorkflowEditor() {
+  state.workflowEditorActive = false;
+  state.workflowEditingId = null;
+  state.workflowDraftMembers = [];
+  $("#workflow-name").value = "";
+  $("#workflow-results").innerHTML = "";
+  renderWorkflowEditor();
+}
+
+function workflowTargetForMember(member) {
+  return state.workflowTargets.find((target) => target.node_id === member.node_id && target.session === member.session) || null;
+}
+
+function renderWorkflowEditor() {
+  const members = $("#workflow-members");
+  if (!members) return;
+  $("#workflow-editor-title").textContent = state.workflowEditingId ? "Edit workflow" : "New workflow";
+  $("#save-workflow").disabled = !state.workflowEditorActive;
+  $("#add-workflow-member").disabled = !state.workflowEditorActive;
+  $("#cancel-workflow").disabled = !state.workflowEditorActive;
+  if (!state.workflowEditorActive) {
+    members.innerHTML = '<div class="muted">Select a workflow to edit, or create a new one.</div>';
+    showWorkflowMessage("", "");
+    return;
+  }
+  members.innerHTML = state.workflowDraftMembers.length
+    ? state.workflowDraftMembers.map(renderWorkflowMemberEditor).join("")
+    : '<div class="muted">Add at least one workspace task member.</div>';
+}
+
+function renderWorkflowMemberEditor(member, index) {
+  const targetIndex = state.workflowTargets.findIndex((target) => target.node_id === member.node_id && target.session === member.session);
+  const missingOption = targetIndex < 0 && member.node_id && member.session
+    ? `<option value="-1" selected>${escapeHtml(member.node_id)} / ${escapeHtml(member.session)} (cached or missing)</option>`
+    : "";
+  const targetOptions = state.workflowTargets.map((target, optionIndex) => `<option value="${optionIndex}" ${optionIndex === targetIndex ? "selected" : ""}>${escapeHtml(target.node_name)} / ${escapeHtml(target.workspace_display_name)} (${escapeHtml(target.session)})</option>`).join("");
+  const target = targetIndex >= 0 ? state.workflowTargets[targetIndex] : workflowTargetForMember(member);
+  const taskOptions = uniqueStrings([...(target?.tasks || []), member.task].filter(Boolean));
+  return `<div class="workflow-member-editor" data-workflow-member-row="${index}">
+    <select data-workflow-target="${index}" aria-label="Workflow member workspace">${missingOption}${targetOptions}</select>
+    <select data-workflow-task="${index}" aria-label="Workflow member task">${taskOptions.length ? taskOptions.map((task) => `<option value="${escapeAttr(task)}" ${task === member.task ? "selected" : ""}>${escapeHtml(task)}</option>`).join("") : '<option value="">No tasks</option>'}</select>
+    <button class="icon-button" type="button" data-workflow-up="${index}" aria-label="Move member up" title="Move up">↑</button>
+    <button class="icon-button" type="button" data-workflow-down="${index}" aria-label="Move member down" title="Move down">↓</button>
+    <button class="icon-button" type="button" data-workflow-remove="${index}" aria-label="Remove member" title="Remove">×</button>
+  </div>`;
+}
+
+function uniqueStrings(values) {
+  return [...new Set(values)];
+}
+
+function addWorkflowMember() {
+  const target = state.workflowTargets.find((candidate) => candidate.tasks?.length) || state.workflowTargets[0];
+  if (!target) {
+    showWorkflowMessage("No visible workspace targets are available.", "error");
+    return;
+  }
+  state.workflowEditorActive = true;
+  state.workflowDraftMembers.push({ node_id: target.node_id, session: target.session, task: target.tasks?.[0] || "" });
+  renderWorkflowEditor();
+}
+
+function handleWorkflowMemberChange(event) {
+  const targetSelect = event.target.closest("[data-workflow-target]");
+  const taskSelect = event.target.closest("[data-workflow-task]");
+  if (targetSelect) {
+    const index = Number(targetSelect.dataset.workflowTarget);
+    const target = state.workflowTargets[Number(targetSelect.value)];
+    if (target && state.workflowDraftMembers[index]) {
+      state.workflowDraftMembers[index].node_id = target.node_id;
+      state.workflowDraftMembers[index].session = target.session;
+      if (!target.tasks?.includes(state.workflowDraftMembers[index].task)) state.workflowDraftMembers[index].task = target.tasks?.[0] || "";
+      renderWorkflowEditor();
+    }
+  } else if (taskSelect) {
+    const index = Number(taskSelect.dataset.workflowTask);
+    if (state.workflowDraftMembers[index]) state.workflowDraftMembers[index].task = taskSelect.value;
+  }
+}
+
+function handleWorkflowMemberButton(event) {
+  const button = event.target.closest("button");
+  if (!button) return;
+  const remove = button.dataset.workflowRemove;
+  const up = button.dataset.workflowUp;
+  const down = button.dataset.workflowDown;
+  if (remove != null) state.workflowDraftMembers.splice(Number(remove), 1);
+  if (up != null && Number(up) > 0) {
+    const index = Number(up);
+    [state.workflowDraftMembers[index - 1], state.workflowDraftMembers[index]] = [state.workflowDraftMembers[index], state.workflowDraftMembers[index - 1]];
+  }
+  if (down != null && Number(down) < state.workflowDraftMembers.length - 1) {
+    const index = Number(down);
+    [state.workflowDraftMembers[index + 1], state.workflowDraftMembers[index]] = [state.workflowDraftMembers[index], state.workflowDraftMembers[index + 1]];
+  }
+  renderWorkflowEditor();
+}
+
+function showWorkflowMessage(message, type = "") {
+  const element = $("#workflow-message");
+  if (!element) return;
+  element.textContent = message || "";
+  element.classList.remove("error", "success", "warning");
+  if (type) element.classList.add(type);
+}
+
+async function saveWorkflow() {
+  if (!state.workflowEditorActive) return;
+  const name = $("#workflow-name").value.trim();
+  if (!name) {
+    showWorkflowMessage("Workflow name is required.", "error");
+    return;
+  }
+  if (state.workflowDraftMembers.some((member) => !member.node_id || !member.session || !member.task)) {
+    showWorkflowMessage("Every member needs a workspace and task.", "error");
+    return;
+  }
+  const body = { name, members: state.workflowDraftMembers };
+  const url = state.workflowEditingId ? `/api/workflow-groups/${encodeURIComponent(state.workflowEditingId)}` : "/api/workflow-groups";
+  const method = state.workflowEditingId ? "PUT" : "POST";
+  showWorkflowMessage("Saving workflow…");
+  try {
+    const response = await requestJson(url, { method, headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    if (!response.ok) throw new Error(response.message);
+    state.workflowEditorActive = false;
+    state.workflowEditingId = null;
+    state.workflowDraftMembers = [];
+    $("#workflow-name").value = "";
+    showWorkflowMessage("Workflow saved.", "success");
+    await loadWorkflowGroups();
+  } catch (error) {
+    showWorkflowMessage(error.message || "Unable to save workflow", "error");
+  }
+}
+
+async function deleteWorkflow(id) {
+  const group = state.workflowGroups.find((item) => item.id === id);
+  if (!group || !confirm(`Delete workflow '${group.name}'?`)) return;
+  try {
+    const response = await requestJson(`/api/workflow-groups/${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (!response.ok) throw new Error(response.message);
+    cancelWorkflowEditor();
+    await loadWorkflowGroups();
+    showToast("Workflow deleted");
+  } catch (error) {
+    showWorkflowMessage(error.message || "Unable to delete workflow", "error");
+  }
+}
+
+async function runWorkflowAction(id, action) {
+  const group = state.workflowGroups.find((item) => item.id === id);
+  if (!group || !confirm(`${action} ${group.members?.length || 0} workflow member${(group.members?.length || 0) === 1 ? "" : "s"}?`)) return;
+  try {
+    const response = await requestJson(`/api/workflow-groups/${encodeURIComponent(id)}/actions`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action }),
+    });
+    if (!response.ok) throw new Error(response.message);
+    state.workflowLastResults = response.data;
+    renderWorkflowResults(response.data);
+    await loadWorkflowGroups();
+  } catch (error) {
+    showWorkflowMessage(error.message || "Workflow action failed", "error");
+  }
+}
+
+function renderWorkflowResults(summary) {
+  const target = $("#workflow-results");
+  if (!target || !summary) return;
+  target.innerHTML = `<h3>${escapeHtml(summary.group_name)} · ${escapeHtml(summary.action)}</h3><p>${summary.success_count} succeeded · ${summary.failed_count} failed · ${summary.skipped_count} skipped</p><div class="workflow-result-list">${(summary.results || []).map((item) => `<div class="workflow-result ${escapeAttr(item.status)}"><strong>${escapeHtml(item.workspace_display_name)} / ${escapeHtml(item.task)}</strong><span>${escapeHtml(item.status)} · ${escapeHtml(item.message)}</span></div>`).join("")}</div>`;
+}
+
+async function openWorkflowMember(node, session) {
+  const nodeSelect = $("#nodes");
+  if ([...nodeSelect.options].some((option) => option.value === node)) nodeSelect.value = node;
+  setView("tasks");
+  await loadWorkspaces();
+  await loadSessions();
+  const sessionSelect = $("#sessions");
+  if ([...sessionSelect.options].some((option) => option.value === session)) {
+    sessionSelect.value = session;
+    state.snapshot = null;
+    state.snapshotNode = null;
+    await loadSnapshot();
   }
 }
 
@@ -382,6 +644,9 @@ function updateMeta() {
     meta.textContent = "Local Streamable HTTP endpoint";
   } else if (state.view === "settings") {
     meta.textContent = "Node, workspace, and daemon settings";
+  } else if (state.view === "workflows") {
+    const count = state.workflowGroups.length;
+    meta.textContent = `${count} workflow group${count === 1 ? "" : "s"}`;
   } else if (state.snapshot) {
     meta.textContent = `${state.snapshot.project} - ${state.snapshot.source}`;
   } else {
@@ -1909,6 +2174,37 @@ function bindEvents() {
     $("#alias-value").value = "";
     $("#alias-form").requestSubmit();
   });
+  $("#new-workflow")?.addEventListener("click", () => beginWorkflowEditor());
+  $("#refresh-workflows")?.addEventListener("click", () => loadWorkflowGroups().catch((error) => showToast(error.message || "Unable to load workflows")));
+  $("#workflow-groups")?.addEventListener("click", (event) => {
+    const open = event.target.closest("[data-workflow-open]");
+    if (open) {
+      openWorkflowMember(open.dataset.node, open.dataset.session).catch((error) => showToast(error.message || "Unable to open workspace"));
+      return;
+    }
+    const edit = event.target.closest("[data-workflow-edit]");
+    if (edit) {
+      const group = state.workflowGroups.find((item) => item.id === edit.dataset.workflowEdit);
+      if (group) beginWorkflowEditor(group);
+      return;
+    }
+    const remove = event.target.closest("[data-workflow-delete]");
+    if (remove) {
+      deleteWorkflow(remove.dataset.workflowDelete);
+      return;
+    }
+    const action = event.target.closest("[data-workflow-action]");
+    if (action) runWorkflowAction(action.dataset.workflowId, action.dataset.workflowAction);
+  });
+  $("#ungrouped-workspaces")?.addEventListener("click", (event) => {
+    const open = event.target.closest("[data-workflow-open]");
+    if (open) openWorkflowMember(open.dataset.node, open.dataset.session).catch((error) => showToast(error.message || "Unable to open workspace"));
+  });
+  $("#add-workflow-member")?.addEventListener("click", addWorkflowMember);
+  $("#workflow-members")?.addEventListener("change", handleWorkflowMemberChange);
+  $("#workflow-members")?.addEventListener("click", handleWorkflowMemberButton);
+  $("#save-workflow")?.addEventListener("click", saveWorkflow);
+  $("#cancel-workflow")?.addEventListener("click", cancelWorkflowEditor);
   $("#reload-service").addEventListener("click", loadServiceStatus);
   $("#service-scope").addEventListener("change", () => {
     $("#service-home-field").hidden = $("#service-scope").value !== "system";
@@ -2029,6 +2325,8 @@ function tick() {
     loadRuns().catch(() => {});
   } else if (state.view === "settings") {
     loadWorkspaces().catch(() => {});
+  } else if (state.view === "workflows") {
+    loadWorkflowGroups().catch(() => {});
   }
 }
 
