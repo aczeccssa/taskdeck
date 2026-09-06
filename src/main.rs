@@ -1,6 +1,7 @@
 mod cluster;
 mod config;
 mod daemon;
+mod platform_service;
 mod protocol;
 mod runtime;
 mod service;
@@ -19,7 +20,8 @@ use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
-use crate::protocol::{Action, Request, Response};
+use crate::platform_service::{ServiceAction, service_control, service_status};
+use crate::protocol::{Action, Request, Response, ServiceScope};
 use crate::state::{LeaderMode, NodeRole, NodeSettingsUpdate, StateStore};
 
 #[derive(Parser)]
@@ -102,6 +104,16 @@ enum Commands {
     Endpoints,
     /// Stop the global daemon and every managed task.
     Shutdown,
+    /// Inspect registered workspace aliases.
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommands,
+    },
+    /// Manage the native Taskdeck daemon service.
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommands,
+    },
     /// Configure single-user access-key authentication.
     Auth {
         #[command(subcommand)]
@@ -122,6 +134,55 @@ enum AuthCommands {
     Disable,
     /// Replace the configured key by reading a new value from stdin.
     SetKey,
+}
+
+#[derive(Subcommand)]
+enum WorkspaceCommands {
+    /// List registered workspaces and their aliases.
+    List,
+    /// Set the display alias for a stable session name.
+    SetAlias {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        alias: String,
+    },
+    /// Clear the display alias for a stable session name.
+    ClearAlias {
+        #[arg(long)]
+        session: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceCommands {
+    /// Print user-scope service status.
+    Status {
+        #[arg(long, value_enum, default_value_t = ServiceScope::User)]
+        scope: ServiceScope,
+    },
+    /// Install the native daemon service.
+    Install {
+        #[arg(long, value_enum, default_value_t = ServiceScope::User)]
+        scope: ServiceScope,
+        #[arg(long)]
+        home: Option<PathBuf>,
+    },
+    /// Remove the native daemon service.
+    Uninstall {
+        #[arg(long, value_enum, default_value_t = ServiceScope::User)]
+        scope: ServiceScope,
+    },
+    /// Start an installed native daemon service.
+    Start {
+        #[arg(long, value_enum, default_value_t = ServiceScope::User)]
+        scope: ServiceScope,
+    },
+    /// Stop an installed native daemon service.
+    Stop {
+        #[arg(long, value_enum, default_value_t = ServiceScope::User)]
+        scope: ServiceScope,
+    },
 }
 
 #[derive(Subcommand)]
@@ -189,8 +250,14 @@ async fn run(cli: Cli) -> Result<()> {
     if let Some(Commands::Node { command }) = cli.command {
         return run_node_command(command).await;
     }
+    if let Some(Commands::Service { command }) = cli.command {
+        return run_service_command(command).await;
+    }
 
     ensure_daemon().await?;
+    if let Some(Commands::Workspace { command }) = cli.command {
+        return run_workspace_command(command).await;
+    }
     match cli.command.unwrap_or(Commands::Tui) {
         Commands::Tui => tui::run(&cli.project, cli.session).await,
         Commands::Register => print_response(
@@ -242,8 +309,86 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Commands::Shutdown => print_response(daemon::request(&Request::Shutdown).await?),
-        Commands::Daemon { .. } | Commands::Node { .. } | Commands::Auth { .. } => unreachable!(),
+        Commands::Daemon { .. }
+        | Commands::Node { .. }
+        | Commands::Auth { .. }
+        | Commands::Workspace { .. }
+        | Commands::Service { .. } => unreachable!(),
     }
+}
+
+async fn run_workspace_command(command: WorkspaceCommands) -> Result<()> {
+    match command {
+        WorkspaceCommands::List => {
+            print_response(daemon::request(&Request::ListWorkspaces).await?)?;
+        }
+        WorkspaceCommands::SetAlias { session, alias } => {
+            print_response(
+                daemon::request(&Request::SetWorkspaceAlias {
+                    session,
+                    alias: Some(alias),
+                })
+                .await?,
+            )?;
+        }
+        WorkspaceCommands::ClearAlias { session } => {
+            print_response(
+                daemon::request(&Request::SetWorkspaceAlias {
+                    session,
+                    alias: None,
+                })
+                .await?,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn print_service(status: anyhow::Result<crate::platform_service::ServiceStatus>) -> Result<()> {
+    let status = status.map_err(|error| anyhow::anyhow!("{error:#}"))?;
+    println!("{}", serde_json::to_string_pretty(&status)?);
+    Ok(())
+}
+
+async fn run_service_command(command: ServiceCommands) -> Result<()> {
+    match command {
+        ServiceCommands::Status { scope } => {
+            print_service(tokio::task::spawn_blocking(move || service_status(scope)).await?)?;
+        }
+        ServiceCommands::Install { scope, home } => {
+            print_service(
+                tokio::task::spawn_blocking(move || {
+                    service_control(scope, ServiceAction::Install, home)
+                })
+                .await?,
+            )?;
+        }
+        ServiceCommands::Uninstall { scope } => {
+            print_service(
+                tokio::task::spawn_blocking(move || {
+                    service_control(scope, ServiceAction::Uninstall, None)
+                })
+                .await?,
+            )?;
+        }
+        ServiceCommands::Start { scope } => {
+            print_service(
+                tokio::task::spawn_blocking(move || {
+                    service_control(scope, ServiceAction::Start, None)
+                })
+                .await?,
+            )?;
+        }
+        ServiceCommands::Stop { scope } => {
+            print_service(
+                tokio::task::spawn_blocking(move || {
+                    service_control(scope, ServiceAction::Stop, None)
+                })
+                .await?,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 async fn run_auth_command(command: AuthCommands) -> Result<()> {

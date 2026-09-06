@@ -17,6 +17,11 @@ const state = {
   headerSignature: "",
   nodesRequest: 0,
   sessionsRequest: 0,
+  workspaces: [],
+  workspacesRequest: 0,
+  nodeSettings: null,
+  nodeSettingsRequest: 0,
+  serviceStatus: null,
   snapshotRequest: 0,
   metricsRequest: 0,
   logsRequest: 0,
@@ -171,11 +176,16 @@ function setView(view) {
     panel.classList.toggle("active", active);
   });
   $("#sessions").hidden = view !== "tasks";
-  $("#nodes").hidden = view !== "tasks";
-  $("#page-title").textContent = view === "calls" ? "MCP Calls" : view === "audit" ? "Audit Log" : view === "runs" ? "Task Runs" : view === "docs" ? "MCP Guide" : "Task workspace";
+  $("#nodes").hidden = false;
+  $("#page-title").textContent = view === "calls" ? "MCP Calls" : view === "audit" ? "Audit Log" : view === "runs" ? "Task Runs" : view === "docs" ? "MCP Guide" : view === "settings" ? "Settings" : "Task workspace";
   if (view === "calls") loadMcpCalls();
   if (view === "audit") loadAudit();
   if (view === "runs") loadRuns().catch((error) => showToast(error.message || "Unable to load runs"));
+  if (view === "settings") {
+    loadNodeSettings().catch((error) => showToast(error.message || "Unable to load settings"));
+    loadServiceStatus();
+    renderAliasForm();
+  }
   updateMeta();
 }
 
@@ -185,6 +195,141 @@ function selectedNode() {
 
 function selectedNodeState() {
   return state.nodes.find((node) => node.id === selectedNode()) || null;
+}
+
+function workspaceFor(session) {
+  return state.workspaces.find((workspace) => workspace.session === session) || null;
+}
+
+function sessionOptionLabel(session) {
+  const workspace = workspaceFor(session);
+  return workspace?.alias ? `${workspace.alias} · ${session}` : session;
+}
+
+function renderSessionOptions(sessions, emptyLabel = "No sessions") {
+  const select = $("#sessions");
+  return sessions.length
+    ? sessions.map((session) => `<option value="${escapeAttr(session)}">${escapeHtml(sessionOptionLabel(session))}</option>`).join("")
+    : `<option value="">${escapeHtml(emptyLabel)}</option>`;
+}
+
+async function loadWorkspaces() {
+  const requestId = ++state.workspacesRequest;
+  const node = selectedNode();
+  if (!node) return;
+  try {
+    const response = await requestJson(`/api/workspaces?${addNodeQuery()}`);
+    if (requestId !== state.workspacesRequest || selectedNode() !== node) return;
+    if (!response.ok) throw new Error(response.message);
+    state.workspaces = response.data || [];
+    const sessions = state.workspaces.map((workspace) => workspace.session);
+    if (!$("#sessions").options.length || [...$("#sessions").options].some((option) => !sessions.includes(option.value))) {
+      const selected = $("#sessions").value;
+      $("#sessions").innerHTML = renderSessionOptions(sessions, "No cached sessions");
+      if (sessions.includes(selected)) $("#sessions").value = selected;
+      else if (sessions.length) $("#sessions").value = sessions[0];
+    } else {
+      [...$("#sessions").options].forEach((option) => { option.textContent = sessionOptionLabel(option.value); });
+    }
+    renderAliasForm();
+    setConnection(true);
+  } catch (error) {
+    if (requestId === state.workspacesRequest) console.warn("Unable to load workspace aliases", error);
+  }
+}
+
+async function loadNodeSettings() {
+  const requestId = ++state.nodeSettingsRequest;
+  const node = selectedNode();
+  if (!node) return;
+  const subtitle = $("#node-settings-subtitle");
+  try {
+    const response = await requestJson(`/api/nodes/${encodeURIComponent(node)}/settings`);
+    if (requestId !== state.nodeSettingsRequest || selectedNode() !== node) return;
+    if (!response.ok) throw new Error(response.message);
+    state.nodeSettings = {
+      settings: response.data.settings || response.data,
+      environment_overrides: response.data.environment_overrides || [],
+    };
+    renderNodeSettings();
+    subtitle.textContent = `${state.nodeSettings.settings.name} · ${state.nodeSettings.settings.node_id}`;
+  } catch (error) {
+    if (requestId !== state.nodeSettingsRequest) return;
+    state.nodeSettings = null;
+    showSettingsMessage("#node-settings-message", error.message || "Unable to load node settings", "error");
+    subtitle.textContent = "Node settings unavailable";
+  }
+}
+
+function overrideFor(field) {
+  return state.nodeSettings?.environment_overrides?.find((override) => override.field === field) || null;
+}
+
+function renderNodeSettings() {
+  const settings = state.nodeSettings?.settings;
+  if (!settings) return;
+  $("#node-name").value = settings.name || "";
+  $("#node-role").value = settings.role || "worker";
+  $("#node-leader-mode").value = settings.leader_mode || "standard";
+  $("#node-leader-url").value = settings.leader_url || "";
+  $("#node-bind-host").value = settings.bind_host || "";
+  $("#node-web-port").value = settings.web_port || "";
+  $("#node-token-mode").value = "keep";
+  $("#node-token-value").value = "";
+  const leader = settings.role === "leader";
+  $("#leader-mode-field").hidden = !leader;
+  $("#leader-url-field").hidden = !leader;
+  ["name","role","leader_mode","leader_url","bind_host","web_port","enrollment_token"].forEach((field) => {
+    const override = overrideFor(field);
+    const selector = field === "enrollment_token" ? "#node-token-mode" : `#node-${field}`;
+    const input = $(selector);
+    if (input) {
+      input.disabled = Boolean(override);
+      input.title = override ? `Controlled by ${override.variable}` : "";
+    }
+  });
+  $("#node-settings-overrides").textContent = state.nodeSettings?.environment_overrides?.length
+    ? `Environment overrides: ${state.nodeSettings.environment_overrides.map((override) => override.variable).join(", ")}`
+    : "";
+}
+
+function showSettingsMessage(selector, message, type = "") {
+  const element = $(selector);
+  element.textContent = message || "";
+  element.classList.remove("error", "success", "warning");
+  if (type) element.classList.add(type);
+}
+
+function renderAliasForm() {
+  const select = $("#alias-session");
+  const selected = select.value;
+  select.innerHTML = state.workspaces.length
+    ? state.workspaces.map((workspace) => `<option value="${escapeAttr(workspace.session)}">${escapeHtml(workspace.display_name)}</option>`).join("")
+    : '<option value="">No workspaces</option>';
+  if (state.workspaces.some((workspace) => workspace.session === selected)) select.value = selected;
+  if (document.activeElement?.id !== "alias-value") {
+    $("#alias-value").value = state.workspaces.find((workspace) => workspace.session === select.value)?.alias || "";
+  }
+}
+
+async function loadServiceStatus() {
+  try {
+    const response = await requestJson(`/api/nodes/self/service?scope=${encodeURIComponent($("#service-scope").value)}`);
+    if (!response.ok) throw new Error(response.message);
+    state.serviceStatus = response.data;
+    renderServiceStatus();
+  } catch (error) {
+    state.serviceStatus = null;
+    $("#service-status").textContent = error.message || "Unable to load service status";
+  }
+}
+
+function renderServiceStatus() {
+  const status = state.serviceStatus;
+  if (!status) return;
+  const enabled = status.enabled ? "enabled" : "disabled";
+  const running = status.running ? "running" : "stopped";
+  $("#service-status").textContent = `${status.platform} ${status.scope} service: ${status.installed ? "installed" : "not installed"} · ${enabled} · ${running} · ${status.unit}`;
 }
 
 function addNodeQuery(query = new URLSearchParams()) {
@@ -214,6 +359,8 @@ async function loadNodes() {
     if (nodes.some((node) => node.id === selected)) select.value = selected;
     else if (nodes.length) select.value = nodes[0].id;
     if (state.snapshot && state.snapshotNode === select.value) renderTask();
+    await loadWorkspaces();
+    if (state.view === "settings") await loadNodeSettings();
     await loadSessions();
     setConnection(true);
   } catch (error) {
@@ -233,6 +380,8 @@ function updateMeta() {
     meta.textContent = `${state.runPage.total||0} run${(state.runPage.total||0)===1?"":"s"}`;
   } else if (state.view === "docs") {
     meta.textContent = "Local Streamable HTTP endpoint";
+  } else if (state.view === "settings") {
+    meta.textContent = "Node, workspace, and daemon settings";
   } else if (state.snapshot) {
     meta.textContent = `${state.snapshot.project} - ${state.snapshot.source}`;
   } else {
@@ -283,9 +432,7 @@ async function loadSessions() {
     const signature = JSON.stringify(sessions);
     if (signature !== state.sessionsSignature) {
       state.sessionsSignature = signature;
-      select.innerHTML = sessions.length
-        ? sessions.map((name) => `<option value="${escapeAttr(name)}">${escapeHtml(name)}</option>`).join("")
-        : '<option value="">No sessions</option>';
+      select.innerHTML = renderSessionOptions(sessions);
     }
     if (sessions.includes(selected)) select.value = selected;
     else if (sessions.length) select.value = sessions[0];
@@ -1529,6 +1676,7 @@ function bindEvents() {
     if (button) setView(button.dataset.view);
   });
   $("#nodes").addEventListener("change", () => {
+    if (state.view === "settings") loadNodeSettings().catch(() => {});
     if ($("#config-dialog").open && !requestCloseConfig()) {
       $("#nodes").value = state.configNode || state.snapshotNode || "";
       return;
@@ -1676,6 +1824,116 @@ function bindEvents() {
     state.configDirty = true;
     renderConfigTaskList();
   });
+  $("#reload-node-settings").addEventListener("click", loadNodeSettings);
+  $("#node-role").addEventListener("change", () => {
+    const leader = $("#node-role").value === "leader";
+    $("#leader-mode-field").hidden = !leader;
+    $("#leader-url-field").hidden = !leader;
+  });
+  $("#node-token-mode").addEventListener("change", () => {
+    $("#token-value-field").hidden = $("#node-token-mode").value !== "set";
+  });
+  $("#node-settings-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!state.nodeSettings) return;
+    const settings = state.nodeSettings.settings;
+    const body = {};
+    if (!overrideFor("name")) body.name = $("#node-name").value.trim();
+    if (!overrideFor("role")) body.role = $("#node-role").value;
+    const roleOverridden = Boolean(overrideFor("role"));
+    if ($("#node-role").value === "leader") {
+      if (!overrideFor("leader_mode")) body.leader_mode = $("#node-leader-mode").value;
+      if (!overrideFor("leader_url")) body.leader_url = null;
+    } else {
+      if (!roleOverridden && !overrideFor("leader_url")) body.leader_url = $("#node-leader-url").value.trim();
+    }
+    if (roleOverridden) {
+      delete body.leader_mode;
+      delete body.leader_url;
+    }
+    if (!overrideFor("bind_host")) body.bind_host = $("#node-bind-host").value.trim();
+    if (!overrideFor("web_port")) {
+      const port = Number($("#node-web-port").value);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        showSettingsMessage("#node-settings-message", "Web port must be 1-65535", "error");
+        return;
+      }
+      body.web_port = port;
+    }
+    const tokenMode = $("#node-token-mode").value;
+    if (tokenMode === "set") {
+      const value = $("#node-token-value").value;
+      if (!value) {
+        showSettingsMessage("#node-settings-message", "Enter a token value or keep the current token", "error");
+        return;
+      }
+      body.enrollment_token = { mode: "set", value };
+    } else if (tokenMode === "clear") {
+      body.enrollment_token = { mode: "clear" };
+    }
+    try {
+      const node = selectedNode();
+      const response = await requestJson(`/api/nodes/${encodeURIComponent(node)}/settings`, {
+        method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+      });
+      if (!response.ok) throw new Error(response.message);
+      state.nodeSettings = response.data;
+      renderNodeSettings();
+      showSettingsMessage(
+        "#node-settings-message",
+        response.data.restart_required ? "Settings saved. Restart the daemon to apply the new configuration." : "Settings saved.",
+        response.data.restart_required ? "warning" : "success",
+      );
+    } catch (error) {
+      showSettingsMessage("#node-settings-message", error.message || "Unable to save node settings", "error");
+    }
+  });
+  $("#alias-session").addEventListener("change", renderAliasForm);
+  $("#alias-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const session = $("#alias-session").value;
+    if (!session) return;
+    try {
+      const response = await requestJson(`/api/workspaces/${encodeURIComponent(session)}/alias?${addNodeQuery()}`, {
+        method: "PUT", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ alias: $("#alias-value").value.trim() }),
+      });
+      if (!response.ok) throw new Error(response.message);
+      await loadWorkspaces();
+      showSettingsMessage("#alias-message", "Alias saved", "success");
+    } catch (error) {
+      showSettingsMessage("#alias-message", error.message || "Unable to save alias", "error");
+    }
+  });
+  $("#clear-alias").addEventListener("click", async () => {
+    $("#alias-value").value = "";
+    $("#alias-form").requestSubmit();
+  });
+  $("#reload-service").addEventListener("click", loadServiceStatus);
+  $("#service-scope").addEventListener("change", () => {
+    $("#service-home-field").hidden = $("#service-scope").value !== "system";
+    loadServiceStatus();
+  });
+  $("#service-form").addEventListener("submit", (event) => event.preventDefault());
+  $$("[data-service]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const scope = $("#service-scope").value;
+      const body = { action: button.dataset.service, scope };
+      if (scope === "system") body.home = $("#service-home").value.trim() || null;
+      showSettingsMessage("#service-message", "Working…");
+      try {
+        const response = await requestJson("/api/nodes/self/service", {
+          method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+        });
+        if (!response.ok) throw new Error(response.message);
+        state.serviceStatus = response.data;
+        renderServiceStatus();
+        showSettingsMessage("#service-message", "Service operation completed", "success");
+      } catch (error) {
+        showSettingsMessage("#service-message", error.message || "Service operation failed", "error");
+      }
+    });
+  });
   $("#config-form").addEventListener("submit", (event) => { event.preventDefault(); saveConfig(); });
   $("#refresh-runs")?.addEventListener("click", () => loadRuns().catch((e)=>showToast(e.message||"Unable to load runs")));
   ["run-session","run-task","run-status","run-trigger","run-page-size"].forEach((id)=>{
@@ -1769,6 +2027,8 @@ function tick() {
     loadAudit();
   } else if (state.view === "runs") {
     loadRuns().catch(() => {});
+  } else if (state.view === "settings") {
+    loadWorkspaces().catch(() => {});
   }
 }
 

@@ -52,6 +52,9 @@ marks restarts in the performance charts.
 taskdeck register --project /path/to/project --session api
 taskdeck update --project /path/to/project --session api
 taskdeck list
+taskdeck workspace list
+taskdeck workspace set-alias --session api --alias "Backend API"
+taskdeck workspace clear-alias --session api
 taskdeck status --session api
 taskdeck start --session api --task "Run Backend API"
 taskdeck pause --session api --task "Run Backend API"
@@ -60,6 +63,11 @@ taskdeck restart --session api --task "Run Backend API"
 taskdeck stop --session api
 taskdeck remove --session api
 ```
+
+A workspace alias is only a display name in the Web UI, CLI, and TUI. The
+stable `session` identifier, project path, `taskdeck.yaml`, and MCP arguments
+do not change. Aliases are unique per node and can be cleared by setting an
+empty value.
 
 Running `taskdeck` without a subcommand opens the TUI. Detaching the TUI does
 not stop managed tasks.
@@ -93,6 +101,14 @@ taskdeck node configure --role leader --leader-mode pure-master \
   --name master --bind-host 0.0.0.0 --token "$TASKDECK_TOKEN"
 ```
 
+The Web UI Settings page edits the current node and, on a leader, connected or
+known workers. It never returns an enrollment token. Token updates use
+explicit `keep`, `set`, and `clear` actions. Saving stores settings atomically
+and reports `restart_required` when role, listener, or upstream settings
+changed; Taskdeck does not restart the daemon during the HTTP request. If
+`TASKDECK_*` variables control a field, the UI shows the override and leaves
+that field disabled.
+
 Changing node configuration stops the active daemon; the next command starts
 it with the new settings. A standard leader cannot switch to pure master while
 local projects remain registered. Leaders cannot connect to another leader.
@@ -101,6 +117,36 @@ Workers connect outbound over WebSocket, so no worker ingress port is required.
 If the leader is unavailable, local worker tasks, CLI, TUI, Web UI, and MCP keep
 working. The leader retains the last worker inventory while offline and refuses
 new remote actions rather than queueing them.
+
+## Native daemon startup
+
+The daemon can be registered with the operating system service manager. Taskdeck
+uses a user LaunchAgent/systemd unit/Task Scheduler task by default and can also
+install a system service. The service runs the foreground `taskdeck daemon`
+process and records `TASKDECK_HOME` explicitly. A system service requires a
+separate state home so it does not share a user's state by accident.
+
+```bash
+taskdeck service status
+taskdeck service install --scope user
+taskdeck service start
+taskdeck service stop
+taskdeck service uninstall
+
+# System services require an existing directory and generally require elevation.
+sudo taskdeck service install --scope system --home /var/lib/taskdeck
+sudo taskdeck service start --scope system
+sudo taskdeck service uninstall --scope system
+```
+
+On macOS Taskdeck creates a launchd plist; on Linux it creates a systemd unit;
+on Windows it creates a Task Scheduler task with a command wrapper. `status`
+inspects installed, enabled, and running state. Installation does not
+automatically start or stop the daemon.
+
+The Web UI Settings page can inspect and manage the service on the current
+device for either scope. It does not install an operating-system service on a
+remote worker.
 
 The enrollment token protects worker admission. Use TLS directly or at a
 trusted reverse proxy before exposing a leader outside a private development
@@ -218,6 +264,12 @@ cluster endpoints are:
 
 ```text
 GET  /api/nodes
+GET  /api/nodes/{node}/settings
+PUT  /api/nodes/{node}/settings
+GET  /api/nodes/self/service
+POST /api/nodes/self/service   { action, scope, home }
+GET  /api/workspaces?node=NODE_ID
+PUT  /api/workspaces/{session}/alias?node=NODE_ID
 GET  /api/sessions?node=NODE_ID
 GET  /api/sessions/{session}?node=NODE_ID
 GET  /api/sessions/{session}/tasks/{task}/logs?node=NODE_ID

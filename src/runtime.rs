@@ -611,6 +611,7 @@ fn display_path(path: &std::path::Path) -> String {
 
 pub struct SessionRuntime {
     name: String,
+    alias: Option<String>,
     project: std::path::PathBuf,
     source: String,
     tasks: BTreeMap<String, TaskRuntime>,
@@ -622,6 +623,7 @@ impl SessionRuntime {
         let task_order = definition.task_order;
         Self {
             name: definition.session,
+            alias: None,
             project: definition.project,
             source: definition.source,
             tasks: definition
@@ -631,6 +633,14 @@ impl SessionRuntime {
                 .collect(),
             task_order,
         }
+    }
+
+    pub fn set_alias(&mut self, alias: Option<String>) {
+        self.alias = alias;
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub fn same_project(&self, project: &std::path::Path) -> bool {
@@ -778,6 +788,7 @@ impl SessionRuntime {
             .collect::<Result<_>>()?;
         Ok(SessionSnapshot {
             name: self.name.clone(),
+            alias: self.alias.clone(),
             project: self.project.clone(),
             source: self.source.clone(),
             tasks,

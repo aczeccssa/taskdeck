@@ -95,6 +95,7 @@ impl DaemonState {
                 match config::discover(&registration.project, Some(&registration.session)) {
                     Ok(definition) => {
                         let mut runtime = SessionRuntime::new(definition);
+                        runtime.set_alias(registration.alias);
                         runtime.auto_start();
                         sessions.insert(registration.session, runtime);
                     }
@@ -153,11 +154,24 @@ impl DaemonState {
         if !self.execution_enabled() {
             return Vec::new();
         }
+        let aliases = self
+            .store
+            .registrations()
+            .map(|registrations| {
+                registrations
+                    .into_iter()
+                    .map(|registration| (registration.session, registration.alias))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
         self.sessions
             .lock()
             .expect("sessions lock")
             .values_mut()
-            .filter_map(|runtime| runtime.snapshot(0).ok())
+            .filter_map(|runtime| {
+                runtime.set_alias(aliases.get(runtime.name()).cloned().flatten());
+                runtime.snapshot(0).ok()
+            })
             .collect()
     }
 
@@ -1998,6 +2012,50 @@ fn handle(state: &DaemonState, request: Request) -> Result<Response> {
                 .expect("task metrics lock")
                 .remove_session(&session);
             Ok(Response::empty(format!("removed session '{session}'")))
+        }
+        Request::ListWorkspaces => {
+            require_local_execution(state)?;
+            Ok(Response::ok(
+                "workspaces",
+                state.store.workspace_summaries()?,
+            ))
+        }
+        Request::SetWorkspaceAlias { session, alias } => {
+            require_local_execution(state)?;
+            let normalized = alias
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            state
+                .store
+                .set_registration_alias(&session, normalized.as_deref())?;
+            let mut sessions = state.sessions.lock().expect("sessions lock");
+            if let Some(runtime) = sessions.get_mut(&session) {
+                runtime.set_alias(normalized);
+            }
+            let summary = state
+                .store
+                .workspace_summaries()?
+                .into_iter()
+                .find(|workspace| workspace.session == session)
+                .context("session disappeared while setting alias")?;
+            Ok(Response::ok("workspace alias updated", summary))
+        }
+        Request::GetNodeSettings => Ok(Response::ok(
+            "node settings",
+            state.store.node_settings_view()?,
+        )),
+        Request::PutNodeSettings { patch } => {
+            let result = state.store.configure_patch(patch)?;
+            Ok(Response::ok(
+                if result.restart_required {
+                    "saved; restart required"
+                } else {
+                    "saved"
+                },
+                result,
+            ))
         }
         Request::Shutdown => {
             state.shutdown.store(true, Ordering::SeqCst);
