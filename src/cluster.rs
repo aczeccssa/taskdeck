@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 use crate::daemon::{DaemonState, dispatch_async_with_audit};
 use crate::protocol::{
-    Action, AuditContext, AuditRecord, AuditStatus, EditableTaskInput, EventFilter, NodeSummary,
-    Request, Response, SessionSnapshot, TaskRunFilter,
+    Action, AuditContext, AuditRecord, AuditStatus, EditableTaskInput, EventFilter,
+    NodeSettingsPatch, NodeSummary, Request, Response, SessionSnapshot, TaskRunFilter,
 };
 use crate::state::{NodeSettings, StateStore};
 
@@ -24,6 +24,7 @@ const COMMAND_CACHE_SIZE: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum AgentMessage {
     Hello {
         protocol: u32,
@@ -66,6 +67,16 @@ pub enum AgentMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RemoteRequest {
     ListSessions,
+    ListWorkspaces,
+    SetWorkspaceAlias {
+        session: String,
+        #[serde(default)]
+        alias: Option<String>,
+    },
+    GetNodeSettings,
+    PutNodeSettings {
+        patch: NodeSettingsPatch,
+    },
     ListTaskRuns {
         filter: TaskRunFilter,
     },
@@ -115,6 +126,12 @@ impl RemoteRequest {
     pub fn into_local(self) -> Request {
         match self {
             Self::ListSessions => Request::ListSessions,
+            Self::ListWorkspaces => Request::ListWorkspaces,
+            Self::SetWorkspaceAlias { session, alias } => {
+                Request::SetWorkspaceAlias { session, alias }
+            }
+            Self::GetNodeSettings => Request::GetNodeSettings,
+            Self::PutNodeSettings { patch } => Request::PutNodeSettings { patch },
             Self::ListTaskRuns { filter } => Request::ListTaskRuns { filter },
             Self::ListEvents { filter } => Request::ListEvents { filter },
             Self::Snapshot { session, tail } => Request::Snapshot { session, tail },

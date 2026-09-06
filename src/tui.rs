@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 use crate::daemon;
 use crate::protocol::{
     Action, AuditSource, LogLine, Request, Response, SessionSnapshot, TaskLogsSnapshot, TaskStatus,
+    WorkspaceSummary,
 };
 
 const LOG_CACHE_LIMIT: usize = 1_000;
@@ -58,6 +59,13 @@ impl App {
             log_generation: None,
             last_log_seq,
         }
+    }
+
+    fn display_name(&self) -> &str {
+        self.snapshot
+            .alias
+            .as_deref()
+            .unwrap_or(&self.snapshot.name)
     }
 
     fn selected_label(&self) -> Option<&str> {
@@ -192,6 +200,21 @@ pub async fn run(project: &Path, requested_session: Option<String>) -> Result<()
     )?;
     let session = snapshot.name.clone();
     let mut app = App::new(snapshot);
+    if let Ok(response) = daemon::request(&Request::ListWorkspaces).await {
+        if response.ok {
+            if let Some(data) = response.data {
+                if let Ok(workspaces) = serde_json::from_value::<Vec<WorkspaceSummary>>(data) {
+                    if let Some(alias) = workspaces
+                        .iter()
+                        .find(|workspace| workspace.session == session)
+                        .and_then(|workspace| workspace.alias.clone())
+                    {
+                        app.snapshot.alias = Some(alias);
+                    }
+                }
+            }
+        }
+    }
 
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen)?;
@@ -458,7 +481,7 @@ fn render(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" Taskdeck / {} ", app.snapshot.name)),
+                .title(format!(" Taskdeck / {} ", app.display_name())),
         )
         .highlight_style(
             Style::default()
@@ -507,7 +530,7 @@ fn render(frame: &mut Frame, app: &App) {
             Span::styled(command.to_string(), Style::default().fg(Color::White)),
         ]),
         Line::from(Span::styled(
-            format!("cwd: {cwd}"),
+            format!("session: {}  cwd: {cwd}", app.snapshot.name),
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -635,6 +658,7 @@ mod tests {
     fn merge_logs_is_incremental_bounded_and_resets_on_generation_change() {
         let mut app = App::new(SessionSnapshot {
             name: "demo".to_string(),
+            alias: None,
             project: "/tmp".into(),
             source: "test".to_string(),
             tasks: Default::default(),

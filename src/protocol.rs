@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use unicode_casefold::UnicodeCaseFold;
@@ -140,9 +141,73 @@ pub struct SessionSnapshot {
     pub name: String,
     pub project: PathBuf,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
     pub tasks: BTreeMap<String, TaskSnapshot>,
     #[serde(default)]
     pub task_order: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceSummary {
+    pub session: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    pub display_name: String,
+    pub project: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceScope {
+    User,
+    System,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentOverride {
+    pub field: String,
+    pub variable: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeSettingsView {
+    #[serde(flatten)]
+    pub settings: crate::state::PublicNodeSettings,
+    pub environment_overrides: Vec<EnvironmentOverride>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum EnrollmentTokenUpdate {
+    Keep,
+    Clear,
+    Set { value: String },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeSettingsPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leader_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leader_url: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrollment_token: Option<EnrollmentTokenUpdate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeSettingsWriteResult {
+    pub settings: crate::state::PublicNodeSettings,
+    pub restart_required: bool,
+    pub environment_overrides: Vec<EnvironmentOverride>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -908,6 +973,10 @@ impl Request {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Ping => "ping",
+            Self::ListWorkspaces => "list_workspaces",
+            Self::SetWorkspaceAlias { .. } => "set_workspace_alias",
+            Self::GetNodeSettings => "get_node_settings",
+            Self::PutNodeSettings { .. } => "put_node_settings",
             Self::ListTaskRuns { .. } => "list_task_runs",
             Self::ListEvents { .. } => "list_events",
             Self::Register { .. } => "register",
@@ -942,7 +1011,8 @@ impl Request {
             | Self::GetSessionConfig { session, .. }
             | Self::PutSessionConfig { session, .. }
             | Self::Action { session, .. }
-            | Self::RemoveSession { session } => Some(session.as_str()),
+            | Self::RemoveSession { session }
+            | Self::SetWorkspaceAlias { session, .. } => Some(session.as_str()),
             Self::ListTaskRuns { filter } => filter.session.as_deref(),
             _ => None,
         }
@@ -979,6 +1049,16 @@ pub enum Request {
         session: Option<String>,
     },
     ListSessions,
+    ListWorkspaces,
+    SetWorkspaceAlias {
+        session: String,
+        #[serde(default)]
+        alias: Option<String>,
+    },
+    GetNodeSettings,
+    PutNodeSettings {
+        patch: NodeSettingsPatch,
+    },
     Snapshot {
         session: String,
         tail: Option<usize>,

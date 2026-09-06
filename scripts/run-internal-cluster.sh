@@ -103,7 +103,9 @@ printf 'Resetting internal cluster project %s...\n' "$project_name"
 down_stack
 
 copy_report() {
-    cid=$(docker compose -f "$compose_file" --project-name "$project_name" ps -q middleman 2>/dev/null || true)
+    # The middleman exits immediately after writing its final report, so include
+    # stopped containers when resolving the copy source.
+    cid=$(docker compose -f "$compose_file" --project-name "$project_name" ps -aq middleman 2>/dev/null || true)
     tmp_report="$report_host_dir/report.json.tmp"
     rm -f "$tmp_report"
     if [ -n "$cid" ]; then

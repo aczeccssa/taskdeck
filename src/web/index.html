@@ -35,6 +35,9 @@
           <button class="nav-button" type="button" data-view="docs" aria-label="MCP Guide" title="MCP Guide">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h8l4 4v14H7zM15 3v5h4M10 12h6M10 16h6"/></svg><span>MCP Guide</span>
           </button>
+          <button class="nav-button" type="button" data-view="settings" aria-label="Settings" title="Settings">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.4-2.4 1A7 7 0 0 0 15 6l-.3-2.6h-4L10.4 6A7 7 0 0 0 9 7.1l-2.4-1-2 3.4 2 1.5a7 7 0 0 0 0 2l-2 1.5 2 3.4 2.4-1A7 7 0 0 0 10.4 18l.3 2.6h4L15 18a7 7 0 0 0 1.5-1.1l2.4 1 2-3.4-2-1.5a7 7 0 0 0 .1-1z"/></svg><span>Settings</span>
+          </button>
         </nav>
 
         <div class="nav-spacer"></div>
@@ -115,8 +118,58 @@
             <section class="docs-section"><header><h2>Operations</h2></header><div class="operation-list"><div><code>sessions</code><span>List registered sessions</span></div><div><code>status</code><span>Inspect task state</span></div><div><code>logs</code><span>Read recent output</span></div><div><code>start</code><span>Start one or all tasks</span></div><div><code>pause</code><span>Pause a process group</span></div><div><code>resume</code><span>Resume a process group</span></div><div><code>restart</code><span>Restart one or all tasks</span></div><div><code>stop</code><span>Stop one or all tasks</span></div></div></section>
           </article>
         </section>
-      </main>
-    </div>
+        <section class="view settings-view" id="settings-view" hidden>
+          <div class="settings">
+            <header class="docs-header"><div class="eyebrow">Configuration &amp; management</div><h1>Settings</h1><p>Configure nodes, workspace aliases, and daemon startup.</p></header>
+
+            <section class="settings-panel" aria-labelledby="node-settings-title">
+              <header><div><h2 id="node-settings-title">Node settings</h2><p id="node-settings-subtitle">Select a node to inspect its configuration.</p></div><button class="button" id="reload-node-settings" type="button">Reload</button></header>
+              <form class="settings-form" id="node-settings-form">
+                <div class="field-grid">
+                  <label class="field"><span>Name</span><input id="node-name" type="text" autocomplete="off"></label>
+                  <label class="field"><span>Role</span><select id="node-role"><option value="worker">Worker</option><option value="leader">Leader</option></select></label>
+                  <label class="field" id="leader-mode-field"><span>Leader mode</span><select id="node-leader-mode"><option value="standard">Standard</option><option value="pure_master">Pure master</option></select></label>
+                  <label class="field" id="leader-url-field"><span>Leader URL</span><input id="node-leader-url" type="url" placeholder="http://leader:9837" autocomplete="off"></label>
+                  <label class="field"><span>Bind host</span><input id="node-bind-host" type="text" autocomplete="off"></label>
+                  <label class="field"><span>Web port</span><input id="node-web-port" type="number" min="1" max="65535"></label>
+                  <label class="field"><span>Enrollment token</span><select id="node-token-mode"><option value="keep">Keep unchanged</option><option value="set">Set value</option><option value="clear">Clear</option></select></label>
+                  <label class="field" id="token-value-field" hidden><span>Token value</span><input id="node-token-value" type="password" autocomplete="new-password"></label>
+                </div>
+                <div class="settings-message" id="node-settings-message" role="status"></div>
+                <footer class="settings-footer"><span id="node-settings-overrides" class="muted"></span><button class="button primary" type="submit">Save settings</button></footer>
+              </form>
+            </section>
+
+            <section class="settings-panel" aria-labelledby="workspace-alias-title">
+              <header><div><h2 id="workspace-alias-title">Workspace alias</h2><p>Aliases are display names. The stable session ID remains unchanged.</p></div></header>
+              <form class="settings-form" id="alias-form">
+                <div class="field-grid compact-grid">
+                  <label class="field"><span>Workspace</span><select id="alias-session"></select></label>
+                  <label class="field"><span>Alias</span><input id="alias-value" type="text" placeholder="Backend API" autocomplete="off"></label>
+                </div>
+                <div class="settings-message" id="alias-message" role="status"></div>
+                <footer class="settings-footer"><span class="muted">Leave the alias empty to use the session ID.</span><div class="settings-actions"><button class="button" type="button" id="clear-alias">Clear</button><button class="button primary" type="submit">Save alias</button></div></footer>
+              </form>
+            </section>
+
+            <section class="settings-panel" aria-labelledby="service-title">
+              <header><div><h2 id="service-title">Daemon startup</h2><p>Manage the native service for this device.</p></div><button class="button" id="reload-service" type="button">Refresh</button></header>
+              <div class="service-grid">
+                <div id="service-status" class="muted">Loading service status</div>
+                <form class="settings-form" id="service-form">
+                  <div class="field-grid compact-grid">
+                    <label class="field"><span>Scope</span><select id="service-scope"><option value="user">User</option><option value="system">System</option></select></label>
+                    <label class="field" id="service-home-field" hidden><span>TASKDECK_HOME</span><input id="service-home" type="text" autocomplete="off" placeholder="/var/lib/taskdeck"></label>
+                  </div>
+                  <div class="settings-message" id="service-message" role="status"></div>
+                  <footer class="settings-footer"><span></span><div class="settings-actions"><button class="button" type="button" data-service="install">Install</button><button class="button" type="button" data-service="uninstall">Uninstall</button><button class="button" type="button" data-service="start">Start</button><button class="button" type="button" data-service="stop">Stop</button></div></footer>
+                </form>
+              </div>
+            </section>
+          </div>
+        </section>
+
+
 
     <dialog class="drawer config-drawer" id="config-dialog" aria-labelledby="config-dialog-title">
       <div class="drawer-shell">

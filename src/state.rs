@@ -27,7 +27,7 @@ pub const DEFAULT_BIND_HOST: &str = "0.0.0.0";
 pub const DEFAULT_WEB_PORT: u16 = 9837;
 const DATABASE_FILE: &str = "state.db";
 pub const AUTH_SESSION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
-const SCHEMA_VERSION: &str = "4";
+const SCHEMA_VERSION: &str = "5";
 pub const AUDIT_RETENTION_LIMIT: usize = 10_000;
 
 #[cfg(test)]
@@ -197,8 +197,15 @@ impl AuthSettings {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Registration {
     pub session: String,
+    pub alias: Option<String>,
     pub project: PathBuf,
     pub registered_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeSettingsWrite {
+    pub settings: NodeSettings,
+    pub restart_required: bool,
 }
 
 pub struct StateStore {
@@ -219,6 +226,7 @@ impl StateStore {
              );
              CREATE TABLE IF NOT EXISTS registrations (
                  session TEXT PRIMARY KEY,
+                 alias TEXT,
                  project TEXT NOT NULL,
                  registered_at_ms INTEGER NOT NULL
              );
@@ -335,9 +343,12 @@ impl StateStore {
              );
              CREATE TABLE registrations (
                  session TEXT PRIMARY KEY,
+                 alias TEXT,
                  project TEXT NOT NULL,
                  registered_at_ms INTEGER NOT NULL
              );
+             CREATE UNIQUE INDEX idx_registrations_alias
+                 ON registrations(alias) WHERE alias IS NOT NULL;
              CREATE TABLE workers (
                  node_id TEXT PRIMARY KEY,
                  name TEXT NOT NULL,
@@ -442,10 +453,11 @@ impl StateStore {
 
     fn initialize(&self) -> Result<()> {
         let connection = self.connection.lock().expect("state store lock");
+        ensure_registration_alias_column(&connection)?;
         let version = get_metadata(&connection, "schema_version")?;
         match version.as_deref() {
             None => set_metadata(&connection, "schema_version", SCHEMA_VERSION)?,
-            Some("1" | "2" | "3") => {
+            Some("1" | "2" | "3" | "4") => {
                 if get_metadata(&connection, "bind_host")?.as_deref() == Some("127.0.0.1") {
                     set_metadata(&connection, "bind_host", DEFAULT_BIND_HOST)?;
                 }
@@ -521,16 +533,63 @@ impl StateStore {
         Ok(settings)
     }
 
+    pub fn node_settings_view(&self) -> Result<crate::protocol::NodeSettingsView> {
+        let settings = self.node_settings()?;
+        let overrides = environment_overrides();
+        Ok(crate::protocol::NodeSettingsView {
+            settings: settings.public(),
+            environment_overrides: overrides,
+        })
+    }
+
+    pub fn configure_patch(
+        &self,
+        patch: crate::protocol::NodeSettingsPatch,
+    ) -> Result<crate::protocol::NodeSettingsWriteResult> {
+        let original = self.read_node_settings()?;
+        let update = NodeSettingsUpdate {
+            role: patch.role.as_deref().map(NodeRole::parse).transpose()?,
+            leader_mode: patch
+                .leader_mode
+                .as_deref()
+                .map(LeaderMode::parse)
+                .transpose()?,
+            name: patch.name.map(|value| value.trim().to_string()),
+            leader_url: patch.leader_url,
+            enrollment_token: match patch.enrollment_token {
+                Some(crate::protocol::EnrollmentTokenUpdate::Keep) => None,
+                Some(crate::protocol::EnrollmentTokenUpdate::Clear) => Some(None),
+                Some(crate::protocol::EnrollmentTokenUpdate::Set { value }) => Some(Some(value)),
+                None => None,
+            },
+            bind_host: patch.bind_host.map(|value| value.trim().to_string()),
+            web_port: patch.web_port,
+        };
+        let written = self.configure(update)?;
+        let restart_required = original != written;
+        Ok(crate::protocol::NodeSettingsWriteResult {
+            settings: written.public(),
+            restart_required,
+            environment_overrides: environment_overrides(),
+        })
+    }
+
+    fn read_node_settings(&self) -> Result<NodeSettings> {
+        let connection = self.connection.lock().expect("state store lock");
+        read_node_settings(&connection)
+    }
+
     pub fn registrations(&self) -> Result<Vec<Registration>> {
         let connection = self.connection.lock().expect("state store lock");
         let mut statement = connection.prepare(
-            "SELECT session, project, registered_at_ms FROM registrations ORDER BY session",
+            "SELECT session, alias, project, registered_at_ms FROM registrations ORDER BY session",
         )?;
         let rows = statement.query_map([], |row| {
             Ok(Registration {
                 session: row.get(0)?,
-                project: PathBuf::from(row.get::<_, String>(1)?),
-                registered_at_ms: row.get::<_, i64>(2)? as u64,
+                alias: row.get(1)?,
+                project: PathBuf::from(row.get::<_, String>(2)?),
+                registered_at_ms: row.get::<_, i64>(3)? as u64,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -551,6 +610,41 @@ impl StateStore {
             params![session, project, current_timestamp_ms() as i64],
         )?;
         Ok(())
+    }
+
+    pub fn set_registration_alias(&self, session: &str, alias: Option<&str>) -> Result<()> {
+        let alias = alias
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let connection = self.connection.lock().expect("state store lock");
+        let changed = connection.execute(
+            "UPDATE registrations SET alias=?2 WHERE session=?1",
+            params![session, alias],
+        )?;
+        if changed == 0 {
+            bail!("session '{session}' is not registered");
+        }
+        Ok(())
+    }
+
+    pub fn workspace_summaries(&self) -> Result<Vec<crate::protocol::WorkspaceSummary>> {
+        Ok(self
+            .registrations()?
+            .into_iter()
+            .map(|registration| {
+                let display_name = registration
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| registration.session.clone());
+                crate::protocol::WorkspaceSummary {
+                    session: registration.session,
+                    alias: registration.alias,
+                    display_name,
+                    project: registration.project,
+                }
+            })
+            .collect())
     }
 
     pub fn remove_registration(&self, session: &str) -> Result<bool> {
@@ -1664,6 +1758,51 @@ fn apply_environment(settings: &mut NodeSettings) -> Result<()> {
     Ok(())
 }
 
+fn ensure_registration_alias_column(connection: &Connection) -> Result<()> {
+    let exists: bool = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('registrations') WHERE name='alias'",
+            [],
+            |row| row.get::<_, i64>(0).map(|count| count > 0),
+        )
+        .context("failed to inspect registrations schema")?;
+    if !exists {
+        connection
+            .execute("DROP INDEX IF EXISTS idx_registrations_alias", [])
+            .context("failed to remove stale workspace alias index")?;
+        connection
+            .execute("ALTER TABLE registrations ADD COLUMN alias TEXT", [])
+            .context("failed to add workspace alias column")?;
+    }
+    connection.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_registrations_alias
+             ON registrations(alias) WHERE alias IS NOT NULL;",
+    )?;
+    Ok(())
+}
+
+pub fn environment_overrides() -> Vec<crate::protocol::EnvironmentOverride> {
+    [
+        ("role", "TASKDECK_ROLE"),
+        ("leader_mode", "TASKDECK_LEADER_MODE"),
+        ("name", "TASKDECK_NODE_NAME"),
+        ("leader_url", "TASKDECK_LEADER_URL"),
+        ("enrollment_token", "TASKDECK_ENROLLMENT_TOKEN"),
+        ("bind_host", "TASKDECK_BIND_HOST"),
+        ("web_port", "TASKDECK_WEB_PORT"),
+    ]
+    .into_iter()
+    .filter_map(|(field, variable)| {
+        env::var(variable)
+            .is_ok()
+            .then_some(crate::protocol::EnvironmentOverride {
+                field: field.to_string(),
+                variable: variable.to_string(),
+            })
+    })
+    .collect()
+}
+
 fn current_timestamp_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1728,6 +1867,115 @@ mod tests {
 
         let migrated = StateStore::open(dir.path()).unwrap();
         assert_eq!(migrated.node_settings().unwrap().bind_host, "192.168.1.20");
+    }
+
+    #[test]
+    fn schema_four_migrates_and_preserves_workspace_registrations() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("state.db");
+        {
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA journal_mode=WAL;
+                     CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+                     CREATE TABLE registrations(session TEXT PRIMARY KEY,project TEXT NOT NULL,registered_at_ms INTEGER NOT NULL);
+                     INSERT INTO metadata VALUES ('schema_version','4');
+                     INSERT INTO metadata VALUES ('node_id','legacy-id');
+                     INSERT INTO metadata VALUES ('node_name','legacy');
+                     INSERT INTO metadata VALUES ('role','worker');
+                     INSERT INTO metadata VALUES ('leader_mode','standard');
+                     INSERT INTO metadata VALUES ('bind_host','0.0.0.0');
+                     INSERT INTO metadata VALUES ('web_port','9837');
+                     INSERT INTO registrations VALUES ('api','/tmp/api',7);",
+                )
+                .unwrap();
+        }
+        let store = StateStore::open(dir.path()).unwrap();
+        let registration = &store.registrations().unwrap()[0];
+        assert_eq!(registration.session, "api");
+        assert_eq!(registration.alias, None);
+        assert_eq!(registration.project, Path::new("/tmp/api"));
+        assert_eq!(store.node_settings().unwrap().node_id, "legacy-id");
+    }
+
+    #[test]
+    fn aliases_are_trimmed_unique_cleared_and_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(dir.path()).unwrap();
+        store
+            .upsert_registration("api", Path::new("/tmp/api"))
+            .unwrap();
+        store
+            .upsert_registration("web", Path::new("/tmp/web"))
+            .unwrap();
+        store
+            .set_registration_alias("api", Some("  Backend API  "))
+            .unwrap();
+        assert_eq!(
+            store.registrations().unwrap()[0].alias.as_deref(),
+            Some("Backend API")
+        );
+        assert!(
+            store
+                .set_registration_alias("web", Some("Backend API"))
+                .is_err()
+        );
+        store.set_registration_alias("api", Some("   ")).unwrap();
+        assert_eq!(store.registrations().unwrap()[0].alias, None);
+        let summaries = store.workspace_summaries().unwrap();
+        assert_eq!(summaries[0].session, "api");
+        assert_eq!(summaries[0].display_name, "api");
+        store
+            .set_registration_alias("api", Some("Backend"))
+            .unwrap();
+        assert_eq!(
+            StateStore::open(dir.path())
+                .unwrap()
+                .registrations()
+                .unwrap()[0]
+                .alias
+                .as_deref(),
+            Some("Backend")
+        );
+    }
+
+    #[test]
+    fn node_settings_patch_handles_tokens_and_restart_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(dir.path()).unwrap();
+        let result = store
+            .configure_patch(crate::protocol::NodeSettingsPatch {
+                name: Some(" laptop ".to_string()),
+                bind_host: Some("127.0.0.1".to_string()),
+                web_port: Some(9937),
+                enrollment_token: Some(crate::protocol::EnrollmentTokenUpdate::Set {
+                    value: "secret".to_string(),
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(result.settings.name, "laptop");
+        assert!(result.restart_required);
+        assert!(result.settings.has_enrollment_token);
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("secret"));
+        let result = store
+            .configure_patch(crate::protocol::NodeSettingsPatch {
+                enrollment_token: Some(crate::protocol::EnrollmentTokenUpdate::Clear),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!result.settings.has_enrollment_token);
+        assert!(result.restart_required);
+        assert!(
+            store
+                .configure_patch(crate::protocol::NodeSettingsPatch {
+                    role: Some("master".to_string()),
+                    ..Default::default()
+                })
+                .is_err()
+        );
     }
 
     #[test]

@@ -8,18 +8,19 @@ use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response as AxumResponse};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::cluster::{self, RemoteRequest};
 use crate::daemon::{DaemonState, record_audit_value};
+use crate::platform_service::{ServiceAction, service_control, service_status};
 #[cfg(test)]
 use crate::protocol::McpCallListPage;
 use crate::protocol::{
     Action, AuditContext, AuditFilter, AuditSource, AuditStatus, AuditTransport, EditableTaskInput,
-    EventFilter, McpCallRecord, Response, TaskRunFilter, casefold_search_text,
+    EventFilter, McpCallRecord, Response, ServiceScope, TaskRunFilter, casefold_search_text,
 };
 
 pub async fn serve(state: DaemonState, listener: tokio::net::TcpListener) -> Result<()> {
@@ -38,6 +39,19 @@ fn app(state: DaemonState) -> Router {
         .route("/healthz", get(health))
         .route("/api/agent/connect", get(agent_connect))
         .route("/api/nodes", get(list_nodes))
+        .route(
+            "/api/nodes/{node}/settings",
+            get(node_settings).put(update_node_settings),
+        )
+        .route(
+            "/api/nodes/self/service",
+            get(node_service).post(node_service_action),
+        )
+        .route("/api/workspaces", get(list_workspaces))
+        .route(
+            "/api/workspaces/{session}/alias",
+            put(update_workspace_alias),
+        )
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/{session}", get(session_snapshot))
         .route("/api/sessions/{session}/tasks/{task}/logs", get(task_logs))
@@ -275,6 +289,207 @@ async fn favicon() -> impl IntoResponse {
 
 async fn list_nodes(State(state): State<DaemonState>) -> Json<Response> {
     Json(Response::ok("nodes", state.node_summaries()))
+}
+
+async fn node_settings(
+    State(state): State<DaemonState>,
+    Path(node): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Response> {
+    dispatch_selected_node(state, &node, &query, RemoteRequest::GetNodeSettings).await
+}
+
+#[derive(Debug, Deserialize)]
+struct ServiceActionBody {
+    action: ServiceAction,
+    scope: ServiceScope,
+    #[serde(default)]
+    home: Option<String>,
+}
+
+async fn node_service(
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Response>, Json<Response>> {
+    let scope = match query.get("scope").map(String::as_str) {
+        Some("system") => ServiceScope::System,
+        _ => ServiceScope::User,
+    };
+    let result = tokio::task::spawn_blocking(move || service_status(scope))
+        .await
+        .map_err(|error| {
+            Json(Response::error(format!(
+                "service status task failed: {error}"
+            )))
+        })?;
+    match result {
+        Ok(status) => Ok(Json(Response::ok("service status", status))),
+        Err(error) => Err(Json(Response::error(format!("{error:#}")))),
+    }
+}
+
+async fn node_service_action(
+    State(state): State<DaemonState>,
+    Json(body): Json<ServiceActionBody>,
+) -> Result<Json<Response>, Json<Response>> {
+    let started = std::time::Instant::now();
+    let home = body.home.clone().map(std::path::PathBuf::from);
+    let home_for_audit = home.clone();
+    let scope = body.scope;
+    let action = body.action;
+    let result = tokio::task::spawn_blocking(move || service_control(scope, action, home))
+        .await
+        .map_err(|error| Json(Response::error(format!("service task failed: {error}"))))?;
+    let response = match result {
+        Ok(status) => Response::ok(
+            match action {
+                ServiceAction::Status => "service status",
+                ServiceAction::Install => "service installed",
+                ServiceAction::Uninstall => "service uninstalled",
+                ServiceAction::Start => "service started",
+                ServiceAction::Stop => "service stopped",
+            },
+            status,
+        ),
+        Err(error) => Response::error(format!("{error:#}")),
+    };
+    let response_value = serde_json::to_value(&response).unwrap_or_else(
+        |error| serde_json::json!({"ok": response.ok, "message": format!("{error}")}),
+    );
+    let _ = record_audit_value(
+        &state,
+        AuditContext::new(AuditSource::Web, AuditTransport::Http),
+        None,
+        "service_control",
+        match action {
+            ServiceAction::Status => "status",
+            ServiceAction::Install => "install",
+            ServiceAction::Uninstall => "uninstall",
+            ServiceAction::Start => "start",
+            ServiceAction::Stop => "stop",
+        },
+        None,
+        None,
+        AuditStatus::from_ok(response.ok),
+        current_millis(),
+        started.elapsed().as_millis() as u64,
+        serde_json::json!({"action": action, "scope": scope, "home": home_for_audit}),
+        response_value,
+        serde_json::json!({"node":"self"}),
+        Some(state.public_settings().node_id),
+    );
+    if response.ok {
+        Ok(Json(response))
+    } else {
+        Err(Json(response))
+    }
+}
+
+fn current_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+async fn list_workspaces(
+    State(state): State<DaemonState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Response> {
+    let node = match selected_node(&state, &query) {
+        Ok(node) => node,
+        Err(response) => return Json(response),
+    };
+    let request = RemoteRequest::ListWorkspaces;
+    let response = state
+        .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
+        .await;
+    if response.ok || node == "self" {
+        return Json(response);
+    }
+    if let Some(inventory) = state.cluster.cached_inventory(&node) {
+        let summaries = inventory
+            .into_iter()
+            .map(|session| crate::protocol::WorkspaceSummary {
+                display_name: session
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| session.name.clone()),
+                session: session.name,
+                alias: session.alias,
+                project: session.project,
+            })
+            .collect::<Vec<_>>();
+        return Json(Response::ok("cached workspaces", summaries));
+    }
+    Json(response)
+}
+
+async fn update_workspace_alias(
+    State(state): State<DaemonState>,
+    Path(session): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    Json(body): Json<Value>,
+) -> Json<Response> {
+    let node = match selected_node(&state, &query) {
+        Ok(node) => node,
+        Err(response) => return Json(response),
+    };
+    let alias = body
+        .get("alias")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let request = RemoteRequest::SetWorkspaceAlias { session, alias };
+    Json(
+        state
+            .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
+            .await,
+    )
+}
+
+async fn update_node_settings(
+    State(state): State<DaemonState>,
+    Path(node): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    Json(patch): Json<crate::protocol::NodeSettingsPatch>,
+) -> Json<Response> {
+    dispatch_selected_node(
+        state,
+        &node,
+        &query,
+        RemoteRequest::PutNodeSettings { patch },
+    )
+    .await
+}
+
+async fn dispatch_selected_node(
+    state: DaemonState,
+    requested_node: &str,
+    query: &HashMap<String, String>,
+    request: RemoteRequest,
+) -> Json<Response> {
+    let inferred = query
+        .get("node")
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| requested_node.to_string());
+    let response = if inferred == "self" {
+        let audit = AuditContext::new(AuditSource::Web, AuditTransport::Http)
+            .with_request_defaults(&request.clone().into_local())
+            .with_origin_node(state.public_settings().node_id);
+        crate::daemon::dispatch_async_with_audit(state.clone(), request.into_local(), Some(audit))
+            .await
+    } else if state.public_settings().role == crate::state::NodeRole::Worker {
+        Response::error("worker node settings are local-only")
+    } else {
+        state
+            .dispatch_node_with_audit(
+                &inferred,
+                request.clone(),
+                web_audit_context(&state, &request),
+            )
+            .await
+    };
+    Json(response)
 }
 
 fn selected_node(
@@ -1204,6 +1419,13 @@ mod tests {
         assert!(INDEX_HTML.contains("id=\"audit-view\""));
         assert!(INDEX_HTML.contains("id=\"audit-dialog\""));
         assert!(INDEX_HTML.contains("id=\"config-dialog\""));
+        assert!(INDEX_HTML.contains("data-view=\"settings\""));
+        assert!(INDEX_HTML.contains("id=\"node-settings-form\""));
+        assert!(INDEX_HTML.contains("id=\"alias-form\""));
+        assert!(INDEX_HTML.contains("id=\"service-form\""));
+        assert!(APP_JS.contains("loadNodeSettings"));
+        assert!(APP_JS.contains("/api/workspaces"));
+        assert!(APP_JS.contains("/api/nodes/self/service"));
         assert!(!INDEX_HTML.contains("<style>"));
         assert!(!INDEX_HTML.contains("<script>const"));
         assert!(STYLES_CSS.contains("prefers-color-scheme: dark"));
@@ -2070,6 +2292,176 @@ mod tests {
         }
         let body = Body::from(body.unwrap_or_default().to_owned());
         app.oneshot(builder.body(body).unwrap()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn workspaces_api_lists_and_updates_aliases_without_changing_session_id() {
+        let state = DaemonState::new();
+        state
+            .store
+            .upsert_registration("api", &PathBuf::from("/tmp/api"))
+            .unwrap();
+        let response = http_route(state.clone(), "GET", "/api/workspaces", &[], None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Response = serde_json::from_slice(&body).unwrap();
+        let data = parsed.data.unwrap();
+        assert_eq!(data[0]["session"], "api");
+        assert_eq!(data[0]["display_name"], "api");
+        let response = http_route(
+            state,
+            "PUT",
+            "/api/workspaces/api/alias",
+            &[(header::CONTENT_TYPE, "application/json")],
+            Some(r#"{"alias":"Backend API"}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Response = serde_json::from_slice(&body).unwrap();
+        let data = parsed.data.unwrap();
+        assert_eq!(data["session"], "api");
+        assert_eq!(data["alias"], "Backend API");
+        assert_eq!(data["display_name"], "Backend API");
+    }
+
+    #[tokio::test]
+    async fn node_settings_api_keeps_token_hidden_and_reports_restart() {
+        let state = DaemonState::new();
+        let response =
+            http_route(state.clone(), "GET", "/api/nodes/self/settings", &[], None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Response = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.data.unwrap()["has_enrollment_token"], false);
+        let body = serde_json::json!({
+            "bind_host": "127.0.0.1",
+            "web_port": 9937,
+            "enrollment_token": {"mode":"set","value":"secret"}
+        })
+        .to_string();
+        let response = http_route(
+            state,
+            "PUT",
+            "/api/nodes/self/settings",
+            &[(header::CONTENT_TYPE, "application/json")],
+            Some(&body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body).to_string();
+        assert!(!text.contains("secret"));
+        let parsed: Response = serde_json::from_slice(&body).unwrap();
+        let data = parsed.data.unwrap();
+        assert_eq!(data["restart_required"], true);
+        assert_eq!(data["settings"]["has_enrollment_token"], true);
+    }
+
+    #[tokio::test]
+    async fn workspaces_route_uses_cached_aliases_for_offline_worker() {
+        let mut state = DaemonState::new();
+        let settings = state
+            .store
+            .configure(crate::state::NodeSettingsUpdate {
+                role: Some(crate::state::NodeRole::Leader),
+                ..Default::default()
+            })
+            .unwrap();
+        *state.settings.lock().expect("node settings lock") = settings;
+        let snapshot = crate::protocol::SessionSnapshot {
+            name: "api".to_string(),
+            alias: Some("Backend API".to_string()),
+            project: PathBuf::from("/tmp/api"),
+            source: "taskdeck.yaml".to_string(),
+            tasks: Default::default(),
+            task_order: Vec::new(),
+        };
+        state
+            .store
+            .upsert_worker(
+                "worker-7",
+                "Worker",
+                current_millis(),
+                &serde_json::to_string(&vec![snapshot]).unwrap(),
+            )
+            .unwrap();
+        state.cluster = crate::cluster::LeaderCluster::new(state.store.clone(), None).unwrap();
+        let response = http_route(state, "GET", "/api/workspaces?node=worker-7", &[], None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Response = serde_json::from_slice(&body).unwrap();
+        let data = parsed.data.unwrap();
+        assert_eq!(data[0]["session"], "api");
+        assert_eq!(data[0]["alias"], "Backend API");
+        assert_eq!(data[0]["display_name"], "Backend API");
+    }
+
+    #[tokio::test]
+    async fn node_settings_and_service_actions_are_audited_with_token_redaction() {
+        let state = DaemonState::new();
+        let body = serde_json::json!({
+            "web_port": 9937,
+            "enrollment_token": {"mode":"set","value":"secret"}
+        })
+        .to_string();
+        let response = http_route(
+            state.clone(),
+            "PUT",
+            "/api/nodes/self/settings",
+            &[(header::CONTENT_TYPE, "application/json")],
+            Some(&body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = serde_json::json!({"action":"status","scope":"user"}).to_string();
+        let response = http_route(
+            state.clone(),
+            "POST",
+            "/api/nodes/self/service",
+            &[(header::CONTENT_TYPE, "application/json")],
+            Some(&body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let settings_page = state
+            .store
+            .list_audit(&AuditFilter {
+                q: None,
+                source: Some("web".to_string()),
+                status: None,
+                node: None,
+                session: None,
+                task: None,
+                operation: Some("put_node_settings".to_string()),
+                page: 1,
+                page_size: 20,
+            })
+            .unwrap();
+        assert_eq!(settings_page.total, 1);
+        let settings_detail = state
+            .store
+            .audit_detail(&settings_page.items[0].audit_id)
+            .unwrap()
+            .unwrap();
+        let request_text = serde_json::to_string(&settings_detail.request).unwrap();
+        assert!(!request_text.contains("secret"));
+        let service_page = state
+            .store
+            .list_audit(&AuditFilter {
+                q: None,
+                source: Some("web".to_string()),
+                status: None,
+                node: None,
+                session: None,
+                task: None,
+                operation: Some("status".to_string()),
+                page: 1,
+                page_size: 20,
+            })
+            .unwrap();
+        assert_eq!(service_page.total, 1);
+        assert_eq!(service_page.items[0].operation, "status");
     }
 
     #[tokio::test]
