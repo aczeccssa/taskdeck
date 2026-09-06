@@ -27,6 +27,16 @@ const state = {
   workflowEditorActive: false,
   workflowDraftMembers: [],
   workflowLastResults: null,
+  boards: [],
+  boardTargets: [],
+  boardRequest: 0,
+  boardsSignature: "",
+  boardEditingId: null,
+  boardEditorActive: false,
+  boardDraftCards: [],
+  boardSnapshots: {},
+  boardCardData: {},
+  boardLiveBusy: false,
   nodeSettings: null,
   nodeSettingsRequest: 0,
   serviceStatus: null,
@@ -91,6 +101,7 @@ const icons = {
   settings: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.4-2.4 1A7 7 0 0 0 15 6l-.3-2.6h-4L10.4 6A7 7 0 0 0 9 7.1l-2.4-1-2 3.4 2 1.5a7 7 0 0 0 0 2l-2 1.5 2 3.4 2.4-1A7 7 0 0 0 10.4 18l.3 2.6h4L15 18a7 7 0 0 0 1.5-1.1l2.4 1 2-3.4-2-1.5a7 7 0 0 0 .1-1z"/></svg>',
   trash: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"/></svg>',
   grip: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="7" r="1"/><circle cx="15" cy="7" r="1"/><circle cx="9" cy="12" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="9" cy="17" r="1"/><circle cx="15" cy="17" r="1"/></svg>',
+  pin: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6v6l2 3v2h-4v7l-1 1-1-1v-7H7v-2l2-3z"/></svg>',
 };
 
 function loadSeenExits() {
@@ -185,11 +196,12 @@ function setView(view) {
   });
   $("#sessions").hidden = view !== "tasks";
   $("#nodes").hidden = false;
-  $("#page-title").textContent = view === "calls" ? "MCP Calls" : view === "audit" ? "Audit Log" : view === "runs" ? "Task Runs" : view === "docs" ? "MCP Guide" : view === "settings" ? "Settings" : view === "workflows" ? "Workflows" : "Task workspace";
+  $("#page-title").textContent = view === "calls" ? "MCP Calls" : view === "audit" ? "Audit Log" : view === "runs" ? "Task Runs" : view === "docs" ? "MCP Guide" : view === "settings" ? "Settings" : view === "workflows" ? "Workflows" : view === "boards" ? "Boards" : "Task workspace";
   if (view === "calls") loadMcpCalls();
   if (view === "audit") loadAudit();
   if (view === "runs") loadRuns().catch((error) => showToast(error.message || "Unable to load runs"));
   if (view === "workflows") loadWorkflowGroups().catch((error) => showToast(error.message || "Unable to load workflows"));
+  if (view === "boards") loadBoards().catch((error) => showToast(error.message || "Unable to load boards"));
   if (view === "settings") {
     loadNodeSettings().catch((error) => showToast(error.message || "Unable to load settings"));
     loadServiceStatus();
@@ -500,6 +512,466 @@ async function openWorkflowMember(node, session) {
   }
 }
 
+function boardCardKey(card) {
+  return `${card.node_id}\u0000${card.session}\u0000${card.task}`;
+}
+
+function boardPinnedCards() {
+  const seen = new Set();
+  const cards = [];
+  state.boards.forEach((board) => {
+    board.cards.forEach((card) => {
+      if (!card.pinned) return;
+      const key = boardCardKey(card);
+      if (seen.has(key)) return;
+      seen.add(key);
+      cards.push({ ...card, key });
+    });
+  });
+  return cards;
+}
+
+function boardLiveCards() {
+  const cards = [];
+  state.boards.forEach((board) => {
+    board.cards.forEach((card) => cards.push({ ...card, key: boardCardKey(card) }));
+  });
+  return cards;
+}
+
+async function loadBoards() {
+  const requestId = ++state.boardRequest;
+  try {
+    const response = await requestJson("/api/boards");
+    if (requestId !== state.boardRequest) return;
+    if (!response.ok) throw new Error(response.message);
+    state.boards = response.data?.boards || [];
+    state.boardTargets = response.data?.targets || [];
+    renderBoards();
+    setConnection(true);
+    updateMeta();
+    await refreshBoardLive();
+  } catch (error) {
+    if (requestId !== state.boardRequest) return;
+    state.boards = [];
+    state.boardTargets = [];
+    const list = $("#board-list");
+    if (list) list.innerHTML = `<div class="empty-state compact"><div><h1>Boards unavailable</h1><p>${escapeHtml(error.message || "Leader boards are unavailable")}</p></div></div>`;
+    const summary = $("#boards-summary");
+    if (summary) summary.textContent = "Leader-only boards";
+    renderBoardEditor();
+  }
+}
+
+function renderBoards() {
+  const signature = JSON.stringify([state.boards, state.boardTargets, state.nodes]);
+  if (signature === state.boardsSignature) return;
+  state.boardsSignature = signature;
+  const cardCount = state.boards.reduce((total, board) => total + (board.cards?.length || 0), 0);
+  const summary = $("#boards-summary");
+  if (summary) summary.textContent = `${state.boards.length} boards · ${cardCount} cards · ${boardPinnedCards().length} pinned`;
+  renderBoardOverview();
+  renderBoardPinned();
+  renderBoardList();
+  renderBoardEditor();
+}
+
+function renderBoardOverview() {
+  const nodes = $("#board-nodes");
+  if (nodes) {
+    nodes.innerHTML = state.nodes.length
+      ? state.nodes.map((node) => `<div class="board-node ${node.online ? "" : "offline"}"><div class="board-node-heading"><span class="status-pill ${node.online ? "" : "error"}">${node.online ? "online" : "offline"}</span><strong>${escapeHtml(node.is_self ? `This device · ${node.name}` : node.name)}</strong></div><span>${escapeHtml(node.role || "node")}${node.mode ? ` · ${escapeHtml(node.mode)}` : ""} · ${node.sessions?.length || 0} workspace${(node.sessions?.length || 0) === 1 ? "" : "s"}</span></div>`).join("")
+      : '<div class="muted">No nodes known.</div>';
+  }
+  const workspaces = $("#board-workspaces");
+  if (workspaces) {
+    workspaces.innerHTML = state.boardTargets.length
+      ? state.boardTargets.map((target) => `<button class="workflow-target" type="button" data-board-open data-node="${escapeAttr(target.node_id)}" data-session="${escapeAttr(target.session)}"><strong>${escapeHtml(target.workspace_display_name)}</strong><span>${escapeHtml(target.node_name)} · ${escapeHtml(target.session)} · ${target.tasks?.length || 0} task${(target.tasks?.length || 0) === 1 ? "" : "s"}</span></button>`).join("")
+      : '<div class="muted">No workspaces registered.</div>';
+  }
+}
+
+function boardCardStatus(card) {
+  const snapshot = state.boardSnapshots[`${card.node_id}\u0000${card.session}`];
+  if (!snapshot || snapshot.error) return { status: "unknown", dot: "failed", label: snapshot?.error || "Unavailable" };
+  const task = snapshot.tasks?.[card.task];
+  if (!task) return { status: "unknown", dot: "failed", label: "Task not found" };
+  const status = task.status || "unknown";
+  const dot = status === "running" ? "running" : status === "failed" ? "failed" : status === "exited" ? "exited" : status === "paused" ? "suspected" : "";
+  return { status, dot, label: status, task };
+}
+
+function boardCardMarkup(card, { compact = false } = {}) {
+  const key = card.key || boardCardKey(card);
+  if (compact) {
+    return `<article class="board-card compact" data-board-open data-node="${escapeAttr(card.node_id)}" data-session="${escapeAttr(card.session)}" data-pin-tile="${escapeAttr(key)}">
+      <div class="board-card-title"><span class="task-state-dot board-dot" data-board-dot aria-hidden="true"></span><div><strong>${escapeHtml(card.task)}</strong><span>${escapeHtml(card.workspace_display_name || card.session)} · ${escapeHtml(card.node_name || card.node_id)}</span></div></div>
+      <span class="status-pill" data-pin-status>Loading</span>
+    </article>`;
+  }
+  const modes = `<div class="board-card-modes" role="group" aria-label="Card view">${["status", "logs", "metrics"].map((mode) => `<button type="button" data-board-mode="${mode}" data-board-card="${escapeAttr(card.id)}" class="${card.mode === mode ? "active" : ""}">${mode === "metrics" ? "Perf" : mode[0].toUpperCase() + mode.slice(1)}</button>`).join("")}</div>`;
+  const actions = `<div class="board-card-actions"><button class="button compact" type="button" data-board-action="start" data-board-card="${escapeAttr(card.id)}">start</button><button class="button compact" type="button" data-board-action="restart" data-board-card="${escapeAttr(card.id)}">restart</button><button class="button compact" type="button" data-board-action="stop" data-board-card="${escapeAttr(card.id)}">stop</button><button class="icon-button" type="button" data-board-pin data-board-card="${escapeAttr(card.id)}" aria-label="${card.pinned ? "Unpin card" : "Pin card"}" title="${card.pinned ? "Unpin" : "Pin to pinned tasks"}" aria-pressed="${card.pinned}">${icons.pin}</button><button class="icon-button" type="button" data-board-remove data-board-card="${escapeAttr(card.id)}" aria-label="Remove card" title="Remove">&times;</button></div>`;
+  const body = card.available === false
+    ? `<div class="board-card-note">${escapeHtml(card.skip_reason || "unavailable")}</div>`
+    : '<div class="board-card-body" data-board-card-body><div class="board-card-note">Loading&hellip;</div></div>';
+  return `<article class="board-card" data-board-card-tile="${escapeAttr(card.id)}" data-card-key="${escapeAttr(key)}">
+    <header class="board-card-header"><div class="board-card-title"><span class="task-state-dot board-dot" data-board-dot aria-hidden="true"></span><div><strong>${escapeHtml(card.task)}</strong><span>${escapeHtml(card.workspace_display_name || card.session)} · ${escapeHtml(card.node_name || card.node_id)}</span></div></div>${modes}</header>
+    ${body}
+    <footer class="board-card-foot">${actions}</footer>
+  </article>`;
+}
+
+function renderBoardPinned() {
+  const pinned = $("#board-pinned");
+  if (!pinned) return;
+  const cards = boardPinnedCards();
+  pinned.innerHTML = cards.length
+    ? cards.map((card) => boardCardMarkup(card, { compact: true })).join("")
+    : '<div class="muted">Pin cards from any board to watch their status here.</div>';
+}
+
+function renderBoardList() {
+  const list = $("#board-list");
+  if (!list) return;
+  list.innerHTML = state.boards.length
+    ? state.boards.map((board) => `<article class="workflow-card board-panel">
+        <header><div><h2>${escapeHtml(board.name)}</h2><p>${board.cards?.length || 0} card${(board.cards?.length || 0) === 1 ? "" : "s"}</p></div><div class="workflow-card-actions"><button class="button compact" type="button" data-board-edit="${escapeAttr(board.id)}">Edit</button><button class="button compact danger" type="button" data-board-delete="${escapeAttr(board.id)}">Delete</button></div></header>
+        <div class="board-card-grid">${board.cards?.length ? board.cards.map((card) => boardCardMarkup({ ...card, key: boardCardKey(card) })).join("") : '<div class="muted">No cards yet. Edit the board to add task cards.</div>'}</div>
+      </article>`).join("")
+    : '<div class="empty-state compact"><div><h1>No boards</h1><p>Create a board to tile task status, logs, and performance across nodes and workspaces.</p></div></div>';
+}
+
+async function refreshBoardLive() {
+  if (state.view !== "boards" || state.boardLiveBusy) return;
+  state.boardLiveBusy = true;
+  try {
+    const cards = boardLiveCards();
+    const pairs = [...new Set(cards.filter((card) => card.available !== false).map((card) => `${card.node_id}\u0000${card.session}`))];
+    await Promise.all(pairs.map((pair) => {
+      const [node, session] = pair.split("\u0000");
+      return loadBoardSnapshot(node, session);
+    }));
+    await Promise.all([
+      ...cards.filter((card) => card.available !== false && card.mode === "logs").map(loadBoardCardLogs),
+      ...cards.filter((card) => card.available !== false && card.mode === "metrics").map(loadBoardCardMetrics),
+    ]);
+    cards.forEach(updateBoardCardDom);
+    updateBoardPinnedDom();
+  } finally {
+    state.boardLiveBusy = false;
+  }
+}
+
+async function loadBoardSnapshot(node, session) {
+  const key = `${node}\u0000${session}`;
+  try {
+    const response = await requestJson(`/api/sessions/${encodeURIComponent(session)}?node=${encodeURIComponent(node)}&tail=0`);
+    if (!response.ok) throw new Error(response.message);
+    state.boardSnapshots[key] = response.data;
+  } catch (error) {
+    state.boardSnapshots[key] = { error: error.message || "unavailable" };
+  }
+}
+
+async function loadBoardCardLogs(card) {
+  try {
+    const response = await requestJson(`/api/sessions/${encodeURIComponent(card.session)}/tasks/${encodeURIComponent(card.task)}/logs?node=${encodeURIComponent(card.node_id)}&limit=80`);
+    if (!response.ok) throw new Error(response.message);
+    state.boardCardData[card.key] = { ...(state.boardCardData[card.key] || {}), logs: { lines: response.data?.lines || [] } };
+  } catch (error) {
+    state.boardCardData[card.key] = { ...(state.boardCardData[card.key] || {}), logs: { lines: [], error: error.message || "Logs unavailable" } };
+  }
+}
+
+async function loadBoardCardMetrics(card) {
+  try {
+    const response = await requestJson(`/api/sessions/${encodeURIComponent(card.session)}/tasks/${encodeURIComponent(card.task)}/metrics?node=${encodeURIComponent(card.node_id)}&window=600`);
+    if (!response.ok) throw new Error(response.message);
+    state.boardCardData[card.key] = { ...(state.boardCardData[card.key] || {}), metrics: response.data };
+  } catch (error) {
+    state.boardCardData[card.key] = { ...(state.boardCardData[card.key] || {}), metrics: null };
+  }
+}
+
+function updateBoardCardDom(card) {
+  const tile = $(`[data-board-card-tile="${CSS.escape(card.id)}"]`);
+  if (!tile) return;
+  const info = boardCardStatus(card);
+  const dot = $(".board-dot", tile);
+  if (dot) {
+    dot.className = `task-state-dot board-dot ${info.dot || ""}`;
+    dot.title = info.label;
+  }
+  const body = $("[data-board-card-body]", tile);
+  if (!body) return;
+  if (card.mode === "logs") {
+    const logs = state.boardCardData[card.key]?.logs;
+    const lines = logs?.lines || [];
+    body.innerHTML = lines.length
+      ? `<div class="board-logs">${lines.map((line) => `<div class="log-row ${escapeAttr(line.stream)}"><span class="log-text">${escapeHtml(line.text)}</span></div>`).join("")}</div>`
+      : `<div class="board-card-note">${escapeHtml(logs?.error || "No output yet")}</div>`;
+    body.scrollTop = body.scrollHeight;
+  } else if (card.mode === "metrics") {
+    const metrics = state.boardCardData[card.key]?.metrics;
+    if (!metrics) {
+      body.innerHTML = '<div class="board-card-note">No samples</div>';
+    } else {
+      const current = metrics.current || { cpu_percent: 0, memory_bytes: 0, process_count: 0 };
+      const samples = metrics.samples || [];
+      const markers = metrics.restart_markers_ms || [];
+      body.innerHTML = `<div class="board-metric-summary"><div><span>CPU</span><strong>${Number(current.cpu_percent || 0).toFixed(1)}%</strong></div><div><span>RSS</span><strong>${formatBytes(current.memory_bytes)}</strong></div><div><span>Proc</span><strong>${current.process_count || 0}</strong></div></div>
+        <div class="board-metric-chart">${chartMarkup(samples, "cpu_percent", "", (value) => `${value.toFixed(1)}%`, markers)}</div>
+        <div class="board-metric-chart">${chartMarkup(samples, "memory_bytes", "memory", formatBytes, markers)}</div>`;
+    }
+  } else {
+    const task = info.task;
+    if (!task) {
+      body.innerHTML = `<div class="board-card-note">${escapeHtml(info.label)}</div>`;
+    } else {
+      body.innerHTML = `<div class="board-status-facts"><div><span>Status</span><strong class="status ${escapeAttr(task.status || "unknown")}">${escapeHtml(task.status || "unknown")}</strong></div><div><span>PID</span><strong>${task.pid ?? "-"}</strong></div><div><span>Exit code</span><strong>${task.exit_code ?? "-"}</strong></div><div><span>Command</span><strong title="${escapeAttr(task.command)}">${escapeHtml(task.command)}</strong></div></div>`;
+    }
+  }
+}
+
+function updateBoardPinnedDom() {
+  boardPinnedCards().forEach((card) => {
+    const tile = $(`[data-pin-tile="${CSS.escape(card.key)}"]`);
+    if (!tile) return;
+    const info = boardCardStatus(card);
+    const dot = $(".board-dot", tile);
+    if (dot) {
+      dot.className = `task-state-dot board-dot ${info.dot || ""}`;
+      dot.title = info.label;
+    }
+    const status = $("[data-pin-status]", tile);
+    if (status) {
+      status.className = `status-pill ${info.dot === "failed" ? "error" : ""}`;
+      status.textContent = info.label;
+    }
+  });
+}
+
+function findBoardCard(cardId) {
+  for (const board of state.boards) {
+    const card = board.cards.find((candidate) => candidate.id === cardId);
+    if (card) return { board, card };
+  }
+  return null;
+}
+
+async function saveBoardCards(board, cards) {
+  try {
+    const response = await requestJson(`/api/boards/${encodeURIComponent(board.id)}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name: board.name,
+        cards: cards.map((card) => ({ node_id: card.node_id, session: card.session, task: card.task, mode: card.mode, pinned: card.pinned })),
+      }),
+    });
+    if (!response.ok) throw new Error(response.message);
+    await loadBoards();
+  } catch (error) {
+    showToast(error.message || "Unable to update board");
+  }
+}
+
+function mutateBoardCard(cardId, transform) {
+  const found = findBoardCard(cardId);
+  if (!found) return;
+  saveBoardCards(
+    found.board,
+    found.board.cards.map((card) => (card.id === cardId ? transform({ ...card }) : card)),
+  );
+}
+
+function setBoardCardMode(cardId, mode) {
+  mutateBoardCard(cardId, (card) => {
+    card.mode = mode;
+    return card;
+  });
+}
+
+function toggleBoardCardPin(cardId) {
+  mutateBoardCard(cardId, (card) => {
+    card.pinned = !card.pinned;
+    return card;
+  });
+}
+
+function removeBoardCard(cardId) {
+  const found = findBoardCard(cardId);
+  if (!found) return;
+  saveBoardCards(found.board, found.board.cards.filter((card) => card.id !== cardId));
+}
+
+async function runBoardCardAction(cardId, action, button) {
+  const found = findBoardCard(cardId);
+  if (!found) return;
+  const card = found.card;
+  button.disabled = true;
+  try {
+    const response = await requestJson("/api/action", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ node: card.node_id, session: card.session, task: card.task, action }),
+    });
+    if (!response.ok) throw new Error(response.message);
+    await refreshBoardLive();
+  } catch (error) {
+    showToast(error.message || "Action failed");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function beginBoardEditor(board = null) {
+  state.boardEditorActive = true;
+  state.boardEditingId = board?.id || null;
+  state.boardDraftCards = (board?.cards || []).map((card) => ({
+    node_id: card.node_id,
+    session: card.session,
+    task: card.task,
+    mode: card.mode || "status",
+    pinned: Boolean(card.pinned),
+  }));
+  $("#board-name").value = board?.name || "";
+  renderBoardEditor();
+}
+
+function cancelBoardEditor() {
+  state.boardEditorActive = false;
+  state.boardEditingId = null;
+  state.boardDraftCards = [];
+  $("#board-name").value = "";
+  renderBoardEditor();
+}
+
+function renderBoardEditor() {
+  const cards = $("#board-cards");
+  if (!cards) return;
+  $("#board-editor-title").textContent = state.boardEditingId ? "Edit board" : "New board";
+  $("#save-board").disabled = !state.boardEditorActive;
+  $("#add-board-card").disabled = !state.boardEditorActive;
+  $("#cancel-board").disabled = !state.boardEditorActive;
+  if (!state.boardEditorActive) {
+    cards.innerHTML = '<div class="muted">Select a board to edit, or create a new one.</div>';
+    showBoardMessage("", "");
+    return;
+  }
+  cards.innerHTML = state.boardDraftCards.length
+    ? state.boardDraftCards.map(renderBoardCardEditor).join("")
+    : '<div class="muted">Add at least one task card.</div>';
+}
+
+function renderBoardCardEditor(card, index) {
+  const targetIndex = state.boardTargets.findIndex((target) => target.node_id === card.node_id && target.session === card.session);
+  const missingOption = targetIndex < 0 && card.node_id && card.session
+    ? `<option value="-1" selected>${escapeHtml(card.node_id)} / ${escapeHtml(card.session)} (cached or missing)</option>`
+    : "";
+  const targetOptions = state.boardTargets.map((target, optionIndex) => `<option value="${optionIndex}" ${optionIndex === targetIndex ? "selected" : ""}>${escapeHtml(target.node_name)} / ${escapeHtml(target.workspace_display_name)} (${escapeHtml(target.session)})</option>`).join("");
+  const target = targetIndex >= 0 ? state.boardTargets[targetIndex] : null;
+  const taskOptions = uniqueStrings([...(target?.tasks || []), card.task].filter(Boolean));
+  return `<div class="workflow-member-editor" data-board-card-row="${index}">
+    <select data-board-target="${index}" aria-label="Card workspace">${missingOption}${targetOptions}</select>
+    <select data-board-task="${index}" aria-label="Card task">${taskOptions.length ? taskOptions.map((task) => `<option value="${escapeAttr(task)}" ${task === card.task ? "selected" : ""}>${escapeHtml(task)}</option>`).join("") : '<option value="">No tasks</option>'}</select>
+    <select data-board-mode-select="${index}" aria-label="Card view">${["status", "logs", "metrics"].map((mode) => `<option value="${mode}" ${card.mode === mode ? "selected" : ""}>${mode}</option>`).join("")}</select>
+    <label class="board-pin-toggle" title="Pin card"><input type="checkbox" data-board-pin-check="${index}" aria-label="Pin card" ${card.pinned ? "checked" : ""}></label>
+    <button class="icon-button" type="button" data-board-remove-row="${index}" aria-label="Remove card" title="Remove">&times;</button>
+  </div>`;
+}
+
+function showBoardMessage(message, type = "") {
+  const element = $("#board-message");
+  if (!element) return;
+  element.textContent = message || "";
+  element.classList.remove("error", "success", "warning");
+  if (type) element.classList.add(type);
+}
+
+function addBoardCard() {
+  const target = state.boardTargets.find((candidate) => candidate.tasks?.length) || state.boardTargets[0];
+  if (!target) {
+    showBoardMessage("No visible workspace targets are available.", "error");
+    return;
+  }
+  state.boardEditorActive = true;
+  state.boardDraftCards.push({ node_id: target.node_id, session: target.session, task: target.tasks?.[0] || "", mode: "status", pinned: false });
+  renderBoardEditor();
+}
+
+function handleBoardCardChange(event) {
+  const target = event.target;
+  const index = Number(target.dataset.boardTarget ?? target.dataset.boardTask ?? target.dataset.boardModeSelect ?? target.dataset.boardPinCheck);
+  const card = state.boardDraftCards[index];
+  if (!card) return;
+  if (target.dataset.boardTarget != null) {
+    const selected = state.boardTargets[Number(target.value)];
+    if (selected) {
+      card.node_id = selected.node_id;
+      card.session = selected.session;
+      if (!selected.tasks?.includes(card.task)) card.task = selected.tasks?.[0] || "";
+      renderBoardEditor();
+    }
+  } else if (target.dataset.boardTask != null) {
+    card.task = target.value;
+  } else if (target.dataset.boardModeSelect != null) {
+    card.mode = target.value;
+  } else if (target.dataset.boardPinCheck != null) {
+    card.pinned = target.checked;
+  }
+}
+
+function handleBoardCardEditorButton(event) {
+  const button = event.target.closest("[data-board-remove-row]");
+  if (!button) return;
+  state.boardDraftCards.splice(Number(button.dataset.boardRemoveRow), 1);
+  renderBoardEditor();
+}
+
+async function saveBoard() {
+  if (!state.boardEditorActive) return;
+  const name = $("#board-name").value.trim();
+  if (!name) {
+    showBoardMessage("Board name is required.", "error");
+    return;
+  }
+  if (state.boardDraftCards.some((card) => !card.node_id || !card.session || !card.task)) {
+    showBoardMessage("Every card needs a workspace and task.", "error");
+    return;
+  }
+  const body = { name, cards: state.boardDraftCards };
+  const url = state.boardEditingId ? `/api/boards/${encodeURIComponent(state.boardEditingId)}` : "/api/boards";
+  const method = state.boardEditingId ? "PUT" : "POST";
+  showBoardMessage("Saving board…");
+  try {
+    const response = await requestJson(url, { method, headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    if (!response.ok) throw new Error(response.message);
+    state.boardEditorActive = false;
+    state.boardEditingId = null;
+    state.boardDraftCards = [];
+    $("#board-name").value = "";
+    showBoardMessage("Board saved.", "success");
+    await loadBoards();
+  } catch (error) {
+    showBoardMessage(error.message || "Unable to save board", "error");
+  }
+}
+
+async function deleteBoard(id) {
+  const board = state.boards.find((item) => item.id === id);
+  if (!board || !confirm(`Delete board '${board.name}'?`)) return;
+  try {
+    const response = await requestJson(`/api/boards/${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (!response.ok) throw new Error(response.message);
+    if (state.boardEditingId === id) cancelBoardEditor();
+    await loadBoards();
+    showToast("Board deleted");
+  } catch (error) {
+    showBoardMessage(error.message || "Unable to delete board", "error");
+  }
+}
+
 async function loadNodeSettings() {
   const requestId = ++state.nodeSettingsRequest;
   const node = selectedNode();
@@ -647,6 +1119,9 @@ function updateMeta() {
   } else if (state.view === "workflows") {
     const count = state.workflowGroups.length;
     meta.textContent = `${count} workflow group${count === 1 ? "" : "s"}`;
+  } else if (state.view === "boards") {
+    const pinned = boardPinnedCards().length;
+    meta.textContent = `${state.boards.length} board${state.boards.length === 1 ? "" : "s"} · ${pinned} pinned task${pinned === 1 ? "" : "s"}`;
   } else if (state.snapshot) {
     meta.textContent = `${state.snapshot.project} - ${state.snapshot.source}`;
   } else {
@@ -2205,6 +2680,48 @@ function bindEvents() {
   $("#workflow-members")?.addEventListener("click", handleWorkflowMemberButton);
   $("#save-workflow")?.addEventListener("click", saveWorkflow);
   $("#cancel-workflow")?.addEventListener("click", cancelWorkflowEditor);
+  $("#new-board")?.addEventListener("click", () => beginBoardEditor());
+  $("#refresh-boards")?.addEventListener("click", () => loadBoards().catch((error) => showToast(error.message || "Unable to load boards")));
+  $("#boards-view")?.addEventListener("click", (event) => {
+    const remove = event.target.closest("[data-board-remove]");
+    if (remove) {
+      removeBoardCard(remove.dataset.boardCard);
+      return;
+    }
+    const pin = event.target.closest("[data-board-pin]");
+    if (pin) {
+      toggleBoardCardPin(pin.dataset.boardCard);
+      return;
+    }
+    const action = event.target.closest("[data-board-action]");
+    if (action) {
+      runBoardCardAction(action.dataset.boardCard, action.dataset.boardAction, action);
+      return;
+    }
+    const mode = event.target.closest("[data-board-mode]");
+    if (mode) {
+      setBoardCardMode(mode.dataset.boardCard, mode.dataset.boardMode);
+      return;
+    }
+    const edit = event.target.closest("[data-board-edit]");
+    if (edit) {
+      const board = state.boards.find((item) => item.id === edit.dataset.boardEdit);
+      if (board) beginBoardEditor(board);
+      return;
+    }
+    const removeBoardButton = event.target.closest("[data-board-delete]");
+    if (removeBoardButton) {
+      deleteBoard(removeBoardButton.dataset.boardDelete);
+      return;
+    }
+    const open = event.target.closest("[data-board-open]");
+    if (open) openWorkflowMember(open.dataset.node, open.dataset.session).catch((error) => showToast(error.message || "Unable to open workspace"));
+  });
+  $("#add-board-card")?.addEventListener("click", addBoardCard);
+  $("#board-cards")?.addEventListener("change", handleBoardCardChange);
+  $("#board-cards")?.addEventListener("click", handleBoardCardEditorButton);
+  $("#save-board")?.addEventListener("click", saveBoard);
+  $("#cancel-board")?.addEventListener("click", cancelBoardEditor);
   $("#reload-service").addEventListener("click", loadServiceStatus);
   $("#service-scope").addEventListener("change", () => {
     $("#service-home-field").hidden = $("#service-scope").value !== "system";
@@ -2327,6 +2844,8 @@ function tick() {
     loadWorkspaces().catch(() => {});
   } else if (state.view === "workflows") {
     loadWorkflowGroups().catch(() => {});
+  } else if (state.view === "boards") {
+    loadBoards().catch(() => {});
   }
 }
 

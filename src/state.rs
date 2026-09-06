@@ -19,16 +19,17 @@ use uuid::Uuid;
 
 use crate::protocol::{
     AuditFilter, AuditListItem, AuditListPage, AuditRecord, AuditSource, AuditStatus,
-    AuditTransport, EventFilter, EventListPage, EventRecord, McpCallListItem, McpCallListPage,
-    McpCallRecord, TaskRunFilter, TaskRunListPage, TaskRunRecord, WorkflowGroup,
-    WorkflowGroupInput, WorkflowGroupMember, casefold_search_text, sanitize_audit_value,
+    AuditTransport, Board, BoardCard, BoardCardInput, BoardCardMode, BoardInput, EventFilter,
+    EventListPage, EventRecord, McpCallListItem, McpCallListPage, McpCallRecord, TaskRunFilter,
+    TaskRunListPage, TaskRunRecord, WorkflowGroup, WorkflowGroupInput, WorkflowGroupMember,
+    casefold_search_text, sanitize_audit_value,
 };
 
 pub const DEFAULT_BIND_HOST: &str = "0.0.0.0";
 pub const DEFAULT_WEB_PORT: u16 = 9837;
 const DATABASE_FILE: &str = "state.db";
 pub const AUTH_SESSION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
-const SCHEMA_VERSION: &str = "6";
+const SCHEMA_VERSION: &str = "7";
 pub const AUDIT_RETENTION_LIMIT: usize = 10_000;
 
 #[cfg(test)]
@@ -255,6 +256,26 @@ impl StateStore {
              );
              CREATE INDEX IF NOT EXISTS idx_workflow_group_members_target
                  ON workflow_group_members(node_id, session, task);
+             CREATE TABLE IF NOT EXISTS boards (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL UNIQUE,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS board_cards (
+                 board_id TEXT NOT NULL,
+                 position INTEGER NOT NULL,
+                 card_id TEXT NOT NULL,
+                 node_id TEXT NOT NULL,
+                 session TEXT NOT NULL,
+                 task TEXT NOT NULL,
+                 mode TEXT NOT NULL,
+                 pinned INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY(board_id, position),
+                 FOREIGN KEY(board_id) REFERENCES boards(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_board_cards_target
+                 ON board_cards(node_id, session, task);
              CREATE TABLE IF NOT EXISTS task_runs (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  node_id TEXT NOT NULL,
@@ -392,6 +413,26 @@ impl StateStore {
              );
              CREATE INDEX idx_workflow_group_members_target
                  ON workflow_group_members(node_id, session, task);
+             CREATE TABLE boards (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL UNIQUE,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE board_cards (
+                 board_id TEXT NOT NULL,
+                 position INTEGER NOT NULL,
+                 card_id TEXT NOT NULL,
+                 node_id TEXT NOT NULL,
+                 session TEXT NOT NULL,
+                 task TEXT NOT NULL,
+                 mode TEXT NOT NULL,
+                 pinned INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY(board_id, position),
+                 FOREIGN KEY(board_id) REFERENCES boards(id) ON DELETE CASCADE
+             );
+             CREATE INDEX idx_board_cards_target
+                 ON board_cards(node_id, session, task);
              CREATE TABLE IF NOT EXISTS task_runs (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  node_id TEXT NOT NULL,
@@ -494,7 +535,7 @@ impl StateStore {
         let version = get_metadata(&connection, "schema_version")?;
         match version.as_deref() {
             None => set_metadata(&connection, "schema_version", SCHEMA_VERSION)?,
-            Some("1" | "2" | "3" | "4" | "5") => {
+            Some("1" | "2" | "3" | "4" | "5" | "6") => {
                 if get_metadata(&connection, "bind_host")?.as_deref() == Some("127.0.0.1") {
                     set_metadata(&connection, "bind_host", DEFAULT_BIND_HOST)?;
                 }
@@ -783,6 +824,100 @@ impl StateStore {
     pub fn delete_workflow_group(&self, id: &str) -> Result<bool> {
         let connection = self.connection.lock().expect("state store lock");
         Ok(connection.execute("DELETE FROM workflow_groups WHERE id=?1", params![id])? > 0)
+    }
+
+    pub fn boards(&self) -> Result<Vec<Board>> {
+        let connection = self.connection.lock().expect("state store lock");
+        let mut statement = connection.prepare(
+            "SELECT id, name, created_at_ms, updated_at_ms
+             FROM boards
+             ORDER BY name COLLATE NOCASE, created_at_ms, id",
+        )?;
+        let mut boards = statement
+            .query_map([], |row| {
+                Ok(Board {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    created_at_ms: row.get::<_, i64>(2)? as u64,
+                    updated_at_ms: row.get::<_, i64>(3)? as u64,
+                    cards: Vec::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut cards = connection.prepare(
+            "SELECT card_id, node_id, session, task, mode, pinned
+             FROM board_cards
+             WHERE board_id=?1
+             ORDER BY position",
+        )?;
+        for board in &mut boards {
+            board.cards = cards
+                .query_map(params![board.id], |row| {
+                    Ok(BoardCard {
+                        id: row.get(0)?,
+                        node_id: row.get(1)?,
+                        session: row.get(2)?,
+                        task: row.get(3)?,
+                        mode: normalize_board_card_mode(&row.get::<_, String>(4)?),
+                        pinned: row.get::<_, i64>(5)? != 0,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+        }
+        Ok(boards)
+    }
+
+    pub fn board(&self, id: &str) -> Result<Option<Board>> {
+        Ok(self.boards()?.into_iter().find(|board| board.id == id))
+    }
+
+    pub fn create_board(&self, input: BoardInput) -> Result<Board> {
+        let input = normalize_board_input(input)?;
+        let now = current_timestamp_ms();
+        let id = Uuid::new_v4().to_string();
+        {
+            let mut connection = self.connection.lock().expect("state store lock");
+            let transaction = connection.transaction()?;
+            transaction
+                .execute(
+                    "INSERT INTO boards(id, name, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4)",
+                    params![id, input.name, now as i64, now as i64],
+                )
+                .with_context(|| format!("failed to create board '{}'", input.name))?;
+            write_board_cards(&transaction, &id, &input.cards)?;
+            transaction.commit()?;
+        }
+        self.board(&id)?
+            .with_context(|| format!("board '{id}' disappeared after create"))
+    }
+
+    pub fn update_board(&self, id: &str, input: BoardInput) -> Result<Board> {
+        let input = normalize_board_input(input)?;
+        let now = current_timestamp_ms();
+        {
+            let mut connection = self.connection.lock().expect("state store lock");
+            let transaction = connection.transaction()?;
+            let changed = transaction
+                .execute(
+                    "UPDATE boards SET name=?2, updated_at_ms=?3 WHERE id=?1",
+                    params![id, input.name, now as i64],
+                )
+                .with_context(|| format!("failed to update board '{id}'"))?;
+            if changed == 0 {
+                bail!("board '{id}' not found");
+            }
+            transaction.execute("DELETE FROM board_cards WHERE board_id=?1", params![id])?;
+            write_board_cards(&transaction, id, &input.cards)?;
+            transaction.commit()?;
+        }
+        self.board(id)?
+            .with_context(|| format!("board '{id}' disappeared after update"))
+    }
+
+    pub fn delete_board(&self, id: &str) -> Result<bool> {
+        let connection = self.connection.lock().expect("state store lock");
+        Ok(connection.execute("DELETE FROM boards WHERE id=?1", params![id])? > 0)
     }
 
     pub fn remove_registration(&self, session: &str) -> Result<bool> {
@@ -1471,6 +1606,56 @@ fn write_workflow_members(
                 &member.node_id,
                 &member.session,
                 &member.task
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn normalize_board_card_mode(value: &str) -> BoardCardMode {
+    match value {
+        "logs" => BoardCardMode::Logs,
+        "metrics" => BoardCardMode::Metrics,
+        _ => BoardCardMode::Status,
+    }
+}
+
+fn normalize_board_input(mut input: BoardInput) -> Result<BoardInput> {
+    input.name = input.name.trim().to_string();
+    if input.name.is_empty() {
+        bail!("board name cannot be empty");
+    }
+
+    for card in &mut input.cards {
+        card.node_id = card.node_id.trim().to_string();
+        card.session = card.session.trim().to_string();
+        card.task = card.task.trim().to_string();
+        if card.node_id.is_empty() || card.session.is_empty() || card.task.is_empty() {
+            bail!("board cards require node_id, session, and task");
+        }
+    }
+
+    Ok(input)
+}
+
+fn write_board_cards(
+    transaction: &rusqlite::Transaction<'_>,
+    board_id: &str,
+    cards: &[BoardCardInput],
+) -> Result<()> {
+    for (position, card) in cards.iter().enumerate() {
+        transaction.execute(
+            "INSERT INTO board_cards(board_id, position, card_id, node_id, session, task, mode, pinned)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                board_id,
+                position as i64,
+                Uuid::new_v4().to_string(),
+                &card.node_id,
+                &card.session,
+                &card.task,
+                card.mode.as_str(),
+                card.pinned as i64
             ],
         )?;
     }
@@ -2210,6 +2395,99 @@ mod tests {
         assert_eq!(updated.members[0].session, "web");
         assert!(reopened.delete_workflow_group(&group.id).unwrap());
         assert!(!reopened.delete_workflow_group(&group.id).unwrap());
+    }
+
+    #[test]
+    fn boards_are_persisted_ordered_and_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(dir.path()).unwrap();
+        let board = store
+            .create_board(crate::protocol::BoardInput {
+                name: " Ops board ".to_string(),
+                cards: vec![
+                    crate::protocol::BoardCardInput {
+                        node_id: "worker-1".to_string(),
+                        session: "api".to_string(),
+                        task: "migrate".to_string(),
+                        mode: crate::protocol::BoardCardMode::Logs,
+                        pinned: true,
+                    },
+                    crate::protocol::BoardCardInput {
+                        node_id: "self".to_string(),
+                        session: "web".to_string(),
+                        task: "dev".to_string(),
+                        mode: crate::protocol::BoardCardMode::Metrics,
+                        pinned: false,
+                    },
+                ],
+            })
+            .unwrap();
+        assert_eq!(board.name, "Ops board");
+        assert_eq!(board.cards[0].mode, crate::protocol::BoardCardMode::Logs);
+        assert!(board.cards[0].pinned);
+        assert_eq!(board.cards[1].mode, crate::protocol::BoardCardMode::Metrics);
+        assert!(!board.cards[1].pinned);
+
+        let reopened = StateStore::open(dir.path()).unwrap();
+        let restored = reopened.board(&board.id).unwrap().unwrap();
+        assert_eq!(restored.cards.len(), board.cards.len());
+        assert_eq!(restored.cards[0].node_id, "worker-1");
+        assert_ne!(restored.cards[0].id, restored.cards[1].id);
+        assert!(
+            reopened
+                .create_board(crate::protocol::BoardInput {
+                    name: "Ops board".to_string(),
+                    cards: Vec::new(),
+                })
+                .is_err()
+        );
+        assert!(
+            reopened
+                .create_board(crate::protocol::BoardInput {
+                    name: " ".to_string(),
+                    cards: Vec::new(),
+                })
+                .is_err()
+        );
+        assert!(
+            reopened
+                .create_board(crate::protocol::BoardInput {
+                    name: "Bad card".to_string(),
+                    cards: vec![crate::protocol::BoardCardInput {
+                        node_id: "self".to_string(),
+                        session: "web".to_string(),
+                        task: " ".to_string(),
+                        mode: crate::protocol::BoardCardMode::Status,
+                        pinned: false,
+                    }],
+                })
+                .is_err()
+        );
+        let updated = reopened
+            .update_board(
+                &board.id,
+                crate::protocol::BoardInput {
+                    name: "Updated".to_string(),
+                    cards: vec![crate::protocol::BoardCardInput {
+                        node_id: "self".to_string(),
+                        session: "web".to_string(),
+                        task: "dev".to_string(),
+                        mode: crate::protocol::BoardCardMode::Status,
+                        pinned: true,
+                    }],
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.name, "Updated");
+        assert_eq!(updated.cards.len(), 1);
+        assert_eq!(
+            updated.cards[0].mode,
+            crate::protocol::BoardCardMode::Status
+        );
+        assert!(updated.cards[0].pinned);
+        assert!(reopened.delete_board(&board.id).unwrap());
+        assert!(!reopened.delete_board(&board.id).unwrap());
+        assert!(reopened.board(&board.id).unwrap().is_none());
     }
 
     #[test]
