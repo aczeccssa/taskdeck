@@ -276,10 +276,22 @@ GET  /api/sessions/{session}/tasks/{task}/logs?node=NODE_ID
 GET  /api/sessions/{session}/tasks/{task}/metrics?node=NODE_ID
 GET  /api/sessions/{session}/config?node=NODE_ID
 PUT  /api/sessions/{session}/config?node=NODE_ID
+GET  /api/boards
+POST /api/boards               { name, cards }
+GET  /api/boards/{board}
+PUT  /api/boards/{board}       { name, cards }
+DELETE /api/boards/{board}
 POST /api/action              { node, session, task, action }
 GET  /api/task-runs?node=&session=&task=
 GET  /api/events
 ```
+
+Boards are a leader-level panel that tiles task cards across nodes and
+workspaces. Each card targets one `node`/`session`/`task` triple and shows
+status, logs, or performance; the view is toggled per card and persisted with
+the board. Cards can be pinned, and the pinned strip gives a quick status view
+of every pinned target. Like workflow groups, boards are stored in the
+leader's state database and audited on writes.
 
 Task runs, events, and MCP calls are durably stored in each executor/control
 node's SQLite database. Logs remain in memory only.
