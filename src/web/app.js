@@ -779,7 +779,10 @@ async function saveBoardCards(board, cards) {
 function mutateBoardCard(cardId, transform) {
   const found = findBoardCard(cardId);
   if (!found) return;
-  saveBoardCards(found.board, found.board.cards.map((card) => transform({ ...card })));
+  saveBoardCards(
+    found.board,
+    found.board.cards.map((card) => (card.id === cardId ? transform({ ...card }) : card)),
+  );
 }
 
 function setBoardCardMode(cardId, mode) {
