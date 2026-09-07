@@ -24,25 +24,31 @@
         <div class="nav-label">Workspace</div>
         <nav class="nav" aria-label="Primary navigation">
           <button class="nav-button active" type="button" data-view="tasks" aria-label="Tasks" title="Tasks">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h9M5 17h6"/></svg><span>Tasks</span>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h9M5 17h6"/></svg><span data-i18n="nav.tasks">Tasks</span>
+          </button>
+          <button class="nav-button" type="button" data-view="dashboard" aria-label="Dashboard" title="Dashboard">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13h6V4H4zM14 9h6V4h-6zM14 20h6v-7h-6zM4 20h6v-3H4z"/></svg><span data-i18n="nav.dashboard">Dashboard</span>
           </button>
           <button class="nav-button" type="button" data-view="workflows" aria-label="Workflows" title="Workflows">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6h5v5H6zM13 13h5v5h-5zM11 8h3a2 2 0 0 1 2 2v3M13 16h-3a2 2 0 0 1-2-2v-3"/></svg><span>Workflows</span>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6h5v5H6zM13 13h5v5h-5zM11 8h3a2 2 0 0 1 2 2v3M13 16h-3a2 2 0 0 1-2-2v-3"/></svg><span data-i18n="nav.workflows">Workflows</span>
           </button>
           <button class="nav-button" type="button" data-view="boards" aria-label="Boards" title="Boards">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h7v14H3zM14 5h7v6h-7zM14 15h7v4h-7z"/></svg><span>Boards</span>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h7v14H3zM14 5h7v6h-7zM14 15h7v4h-7z"/></svg><span data-i18n="nav.boards">Boards</span>
+          </button>
+          <button class="nav-button" type="button" data-view="alerts" aria-label="Alerts" title="Alerts">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9a6 6 0 1 1 12 0c0 5 2 6 2 6H4s2-1 2-6M10 20a2 2 0 0 0 4 0"/></svg><span data-i18n="nav.alerts">Alerts</span>
           </button>
           <button class="nav-button" type="button" data-view="calls" aria-label="MCP Calls" title="MCP Calls">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 4h8v4H8zM5 14h4m6 0h4M7 8v3h10V8M7 11v3m10-3v3"/></svg><span>MCP Calls</span>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 4h8v4H8zM5 14h4m6 0h4M7 8v3h10V8M7 11v3m10-3v3"/></svg><span data-i18n="nav.calls">MCP Calls</span>
           </button>
           <button class="nav-button" type="button" data-view="audit" aria-label="Audit Log" title="Audit Log">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v14H5zM8 9h8M8 13h5M8 17h7"/></svg><span>Audit Log</span>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v14H5zM8 9h8M8 13h5M8 17h7"/></svg><span data-i18n="nav.audit">Audit Log</span>
           </button>
           <button class="nav-button" type="button" data-view="docs" aria-label="MCP Guide" title="MCP Guide">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h8l4 4v14H7zM15 3v5h4M10 12h6M10 16h6"/></svg><span>MCP Guide</span>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h8l4 4v14H7zM15 3v5h4M10 12h6M10 16h6"/></svg><span data-i18n="nav.docs">MCP Guide</span>
           </button>
           <button class="nav-button" type="button" data-view="settings" aria-label="Settings" title="Settings">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.4-2.4 1A7 7 0 0 0 15 6l-.3-2.6h-4L10.4 6A7 7 0 0 0 9 7.1l-2.4-1-2 3.4 2 1.5a7 7 0 0 0 0 2l-2 1.5 2 3.4 2.4-1A7 7 0 0 0 10.4 18l.3 2.6h4L15 18a7 7 0 0 0 1.5-1.1l2.4 1 2-3.4-2-1.5a7 7 0 0 0 .1-1z"/></svg><span>Settings</span>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.4-2.4 1A7 7 0 0 0 15 6l-.3-2.6h-4L10.4 6A7 7 0 0 0 9 7.1l-2.4-1-2 3.4 2 1.5a7 7 0 0 0 0 2l-2 1.5 2 3.4 2.4-1A7 7 0 0 0 10.4 18l.3 2.6h4L15 18a7 7 0 0 0 1.5-1.1l2.4 1 2-3.4-2-1.5a7 7 0 0 0 .1-1z"/></svg><span data-i18n="nav.settings">Settings</span>
           </button>
         </nav>
 
@@ -55,6 +61,11 @@
           <div class="topbar-title"><strong id="page-title">Task workspace</strong><span id="meta">No sessions registered</span></div>
           <select class="node-select" id="nodes" aria-label="Taskdeck node"><option value="">No nodes</option></select>
           <select class="session-select" id="sessions" aria-label="Registered session"><option value="">No sessions</option></select>
+          <button class="icon-button alerts-bell" id="alerts-bell" type="button" aria-label="Alerts" title="Alerts" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9a6 6 0 1 1 12 0c0 5 2 6 2 6H4s2-1 2-6M10 20a2 2 0 0 0 4 0"/></svg>
+            <span class="alerts-unread" id="alerts-unread" hidden>0</span>
+          </button>
+          <button class="icon-button lang-toggle" id="lang" type="button" aria-label="Switch language" title="Switch language">中/EN</button>
           <button class="icon-button" id="theme" type="button" aria-label="Change color theme" title="Change color theme">
             <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v3M12 19v3M2 12h3m14 0h3M5 5l2 2m10 10 2 2M19 5l-2 2M7 17l-2 2"/></svg>
           </button>
@@ -67,6 +78,38 @@
           </div>
         </section>
 
+        <section class="view dashboard-view" id="dashboard-view" hidden>
+          <div class="dashboard">
+            <header class="section-heading">
+              <div><h1 data-i18n="dashboard.title">Dashboard</h1><p id="dashboard-summary" data-i18n="dashboard.subtitle">Live node and task resources.</p></div>
+              <div class="settings-actions"><button class="button" id="refresh-dashboard" type="button" data-i18n="action.refresh">Refresh</button></div>
+            </header>
+            <div class="dashboard-status" id="dashboard-status"></div>
+            <div class="dashboard-nodes" id="dashboard-nodes"></div>
+            <section class="workflow-card" aria-labelledby="scaling-title">
+              <header><div><h2 id="scaling-title" data-i18n="dashboard.scalingTitle">Auto-scaling policies</h2><p data-i18n="dashboard.scalingHint">Start or stop a replica task when a watched task stays above or below thresholds.</p></div></header>
+              <div class="scaling-list" id="scaling-list"></div>
+              <form class="settings-form" id="scaling-form">
+                <div class="field-grid">
+                  <label class="field"><span data-i18n="field.policyName">Policy name</span><input id="scaling-name" type="text" placeholder="api autoscale" autocomplete="off"></label>
+                  <label class="field"><span data-i18n="field.watchNode">Watch node</span><select id="scaling-watch-node"></select></label>
+                  <label class="field"><span data-i18n="field.watchWorkspace">Watch workspace</span><select id="scaling-watch-session"></select></label>
+                  <label class="field"><span data-i18n="field.watchTask">Watch task</span><select id="scaling-watch-task"></select></label>
+                  <label class="field"><span data-i18n="field.metric">Metric</span><select id="scaling-metric"><option value="cpu_percent">CPU %</option><option value="memory_bytes">Memory (bytes)</option></select></label>
+                  <label class="field"><span data-i18n="field.scaleOutAbove">Scale out above</span><input id="scaling-out-threshold" type="number" step="any" min="0"></label>
+                  <label class="field"><span data-i18n="field.scaleInBelow">Scale in below</span><input id="scaling-in-threshold" type="number" step="any" min="0"></label>
+                  <label class="field"><span data-i18n="field.replicaNode">Replica node</span><select id="scaling-out-node"></select></label>
+                  <label class="field"><span data-i18n="field.replicaWorkspace">Replica workspace</span><select id="scaling-out-session"></select></label>
+                  <label class="field"><span data-i18n="field.replicaTask">Replica task</span><select id="scaling-out-task"></select></label>
+                  <label class="field"><span data-i18n="field.cooldown">Cooldown (seconds)</span><input id="scaling-cooldown" type="number" min="0" value="300"></label>
+                </div>
+                <div class="settings-message" id="scaling-message" role="status"></div>
+                <footer class="settings-footer"><span class="muted" data-i18n="dashboard.scalingNote">The replica task is started or stopped as the scaled instance.</span><button class="button primary" type="submit" data-i18n="action.addPolicy">Add policy</button></footer>
+              </form>
+            </section>
+          </div>
+        </section>
+
         <section class="view workflows-view" id="workflows-view" hidden>
           <div class="workflow-layout">
             <div class="workflow-main">
@@ -76,8 +119,44 @@
               </header>
               <div class="workflow-groups" id="workflow-groups"><div class="empty-state compact"><div><h1>No workflow groups</h1><p>Create a group to organize tasks across workspaces and nodes.</p></div></div></div>
               <section class="workflow-ungrouped" aria-labelledby="ungrouped-title">
-                <header><h2 id="ungrouped-title">Ungrouped workspaces</h2><p>Visible workspaces not assigned to any workflow group.</p></header>
+                <header><h2 id="ungrouped-title" data-i18n="workflows.ungrouped">Ungrouped workspaces</h2><p data-i18n="workflows.ungroupedHint">Visible workspaces not assigned to any workflow group.</p></header>
                 <div class="workflow-targets" id="ungrouped-workspaces"></div>
+              </section>
+              <section class="workflow-card orchestrator-card" aria-labelledby="orchestrator-title">
+                <header>
+                  <div><h2 id="orchestrator-title" data-i18n="workflows.orchestrator">Orchestrator</h2><p id="orchestrator-hint" data-i18n="workflows.orchestratorHint">Drag cards to arrange steps, connect cards to define execution order, then run the flow.</p></div>
+                  <div class="settings-actions">
+                    <button class="button" id="orchestrator-connect" type="button" data-i18n="action.connect">Connect</button>
+                    <button class="button" id="orchestrator-save" type="button" data-i18n="action.saveLayout">Save layout</button>
+                    <button class="button" id="orchestrator-history" type="button" data-i18n="action.history">History</button>
+                    <button class="button primary" id="orchestrator-run" type="button" data-i18n="action.runInOrder">Run in order</button>
+                  </div>
+                </header>
+                <div class="orchestrator" id="orchestrator">
+                  <svg class="orchestrator-edges" id="orchestrator-edges" aria-hidden="true"></svg>
+                  <div class="orchestrator-empty muted" id="orchestrator-empty" data-i18n="workflows.orchestratorEmpty">Select a workflow group to arrange its members.</div>
+                </div>
+                <div class="workflow-results" id="orchestrator-results"></div>
+                <div class="workflow-revisions" id="workflow-revisions" hidden></div>
+              </section>
+              <section class="workflow-card" aria-labelledby="dependencies-title">
+                <header>
+                  <div><h2 id="dependencies-title" data-i18n="workflows.dependencies">Task dependencies</h2><p data-i18n="workflows.dependenciesHint">Cross-workspace start gates: a task only starts while every dependency is running.</p></div>
+                  <button class="button" id="refresh-dependencies" type="button" data-i18n="action.refresh">Refresh</button>
+                </header>
+                <div class="dependencies-list" id="dependencies-list"></div>
+                <form class="settings-form" id="dependency-form">
+                  <div class="field-grid">
+                    <label class="field"><span data-i18n="field.taskNode">Task node</span><select id="dependency-node"></select></label>
+                    <label class="field"><span data-i18n="field.taskWorkspace">Task workspace</span><select id="dependency-session"></select></label>
+                    <label class="field"><span data-i18n="field.task">Task</span><select id="dependency-task"></select></label>
+                    <label class="field"><span data-i18n="field.dependsNode">Depends on node</span><select id="dependency-dep-node"></select></label>
+                    <label class="field"><span data-i18n="field.dependsWorkspace">Depends on workspace</span><select id="dependency-dep-session"></select></label>
+                    <label class="field"><span data-i18n="field.dependsTask">Depends on task</span><select id="dependency-dep-task"></select></label>
+                  </div>
+                  <div class="settings-message" id="dependency-message" role="status"></div>
+                  <footer class="settings-footer"><span class="muted" data-i18n="workflows.dependenciesNote">Required state: running.</span><button class="button primary" type="submit" data-i18n="action.addDependency">Add dependency</button></footer>
+                </form>
               </section>
             </div>
             <aside class="workflow-editor" aria-labelledby="workflow-editor-title">
@@ -111,12 +190,65 @@
               <div class="workflow-groups" id="board-list"></div>
             </div>
             <aside class="workflow-editor" aria-labelledby="board-editor-title">
-              <header><h2 id="board-editor-title">New board</h2><p>Pin tasks from any node and workspace, then choose what each card shows.</p></header>
-              <label class="field"><span>Name</span><input id="board-name" type="text" placeholder="Ops dashboard" autocomplete="off"></label>
-              <div class="workflow-member-list" id="board-cards"><div class="muted">Select a board to edit, or create a new one.</div></div>
-              <button class="button" id="add-board-card" type="button" disabled>Add card</button>
+              <header><h2 id="board-editor-title" data-i18n="boards.editorTitle">New board</h2><p data-i18n="boards.editorHint">Pin tasks from any node and workspace, then choose what each card shows.</p></header>
+              <label class="field"><span data-i18n="field.name">Name</span><input id="board-name" type="text" placeholder="Ops dashboard" autocomplete="off"></label>
+              <div class="workflow-member-list" id="board-cards"><div class="muted" data-i18n="boards.selectToEdit">Select a board to edit, or create a new one.</div></div>
+              <button class="button" id="add-board-card" type="button" disabled data-i18n="action.addCard">Add card</button>
               <div class="settings-message" id="board-message" role="status"></div>
-              <footer class="settings-footer"><button class="button" id="cancel-board" type="button" disabled>Cancel</button><button class="button primary" id="save-board" type="button" disabled>Save board</button></footer>
+              <footer class="settings-footer"><button class="button" id="cancel-board" type="button" disabled data-i18n="action.cancel">Cancel</button><button class="button primary" id="save-board" type="button" disabled data-i18n="action.saveBoard">Save board</button></footer>
+              <div class="board-templates">
+                <header><h3 data-i18n="boards.templates">Board templates</h3><p data-i18n="boards.templatesHint">Save a board as a template, clone it later, or share the JSON with other nodes.</p></header>
+                <div class="field-grid compact-grid">
+                  <label class="field"><span data-i18n="field.templateName">Template name</span><input id="template-name" type="text" placeholder="Ops template" autocomplete="off"></label>
+                  <label class="field"><span data-i18n="field.templateSource">From board</span><select id="template-source"></select></label>
+                </div>
+                <div class="settings-actions">
+                  <button class="button" id="save-template" type="button" data-i18n="action.saveTemplate">Save as template</button>
+                  <button class="button" id="apply-template" type="button" data-i18n="action.applyTemplate">Create board</button>
+                  <button class="button" id="export-template" type="button" data-i18n="action.exportTemplate">Export</button>
+                  <button class="button" id="import-template" type="button" data-i18n="action.importTemplate">Import</button>
+                  <input id="import-template-file" type="file" accept="application/json,.json" hidden>
+                  <button class="button" id="delete-template" type="button" data-i18n="action.deleteTemplate">Delete</button>
+                </div>
+                <div class="template-list" id="board-template-list"></div>
+                <div class="settings-message" id="template-message" role="status"></div>
+              </div>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view alerts-view" id="alerts-view" hidden>
+          <div class="alerts-layout">
+            <div class="alerts-main">
+              <header class="section-heading">
+                <div><h1 data-i18n="alerts.title">Alerts</h1><p id="alerts-summary" data-i18n="alerts.subtitle">0 unread notifications</p></div>
+                <div class="settings-actions">
+                  <button class="button" id="refresh-alerts" type="button" data-i18n="action.refresh">Refresh</button>
+                  <button class="button" id="mark-all-read" type="button" data-i18n="action.markAllRead">Mark all read</button>
+                </div>
+              </header>
+              <div class="notifications-list" id="notifications-list"></div>
+            </div>
+            <aside class="alerts-editor">
+              <header><h2 id="rules-title" data-i18n="alerts.rulesTitle">Alert rules</h2><p data-i18n="alerts.rulesHint">Notify on task transitions; optionally POST the event to a webhook.</p></header>
+              <div class="notification-rules" id="notification-rules"></div>
+              <form class="settings-form" id="rule-form">
+                <label class="field"><span data-i18n="field.ruleName">Rule name</span><input id="rule-name" type="text" placeholder="API failures" autocomplete="off"></label>
+                <fieldset class="rule-events"><legend data-i18n="alerts.events">Events</legend>
+                  <label class="check-field"><input type="checkbox" id="rule-task-started" checked><span data-i18n="event.taskStarted">Task started</span></label>
+                  <label class="check-field"><input type="checkbox" id="rule-task-exited"><span data-i18n="event.taskExited">Task exited</span></label>
+                  <label class="check-field"><input type="checkbox" id="rule-task-failed" checked><span data-i18n="event.taskFailed">Task failed</span></label>
+                  <label class="check-field"><input type="checkbox" id="rule-task-stopped"><span data-i18n="event.taskStopped">Task stopped</span></label>
+                </fieldset>
+                <div class="field-grid compact-grid">
+                  <label class="field"><span data-i18n="field.workspaceScope">Workspace (optional)</span><input id="rule-scope-session" type="text" placeholder="api" autocomplete="off"></label>
+                  <label class="field"><span data-i18n="field.taskScope">Task (optional)</span><input id="rule-scope-task" type="text" autocomplete="off"></label>
+                </div>
+                <label class="field"><span data-i18n="field.webhook">Webhook URL (optional)</span><input id="rule-webhook" type="url" placeholder="https://example.com/hook" autocomplete="off"></label>
+                <label class="check-field"><input id="rule-enabled" type="checkbox" checked><span data-i18n="field.enabled">Enabled</span></label>
+                <div class="settings-message" id="rule-message" role="status"></div>
+                <footer class="settings-footer"><button class="button" id="cancel-rule" type="button" hidden data-i18n="action.cancel">Cancel</button><button class="button primary" type="submit" id="save-rule" data-i18n="action.addRule">Add rule</button></footer>
+              </form>
             </aside>
           </div>
         </section>
@@ -176,6 +308,14 @@
             <header class="docs-header"><div class="eyebrow">Streamable HTTP</div><h1>MCP Guide</h1><p>Use the local endpoint to inspect and control registered sessions.</p><div class="endpoint"><i></i><code id="endpoint-label">127.0.0.1:9837/mcp</code></div></header>
             <section class="docs-section"><header><h2>Client configuration</h2></header><div class="code-block" data-copy><button class="icon-button copy" type="button" aria-label="Copy configuration" title="Copy configuration"><svg viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg></button><code id="client-config"></code></div></section>
             <section class="docs-section"><header><h2>Operations</h2></header><div class="operation-list"><div><code>sessions</code><span>List registered sessions</span></div><div><code>status</code><span>Inspect task state</span></div><div><code>logs</code><span>Read recent output</span></div><div><code>start</code><span>Start one or all tasks</span></div><div><code>pause</code><span>Pause a process group</span></div><div><code>resume</code><span>Resume a process group</span></div><div><code>restart</code><span>Restart one or all tasks</span></div><div><code>stop</code><span>Stop one or all tasks</span></div></div></section>
+            <section class="docs-section"><header><h2>External API</h2></header><p class="muted">Create an API token under Settings, then call the REST API with <code>Authorization: Bearer tdk_…</code>.</p><div class="code-block" data-copy><button class="icon-button copy" type="button" aria-label="Copy API examples" title="Copy"><svg viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg></button><code id="api-examples">curl -H "Authorization: Bearer tdk_..." \
+  http://127.0.0.1:9837/api/sessions
+curl -X POST -H "Authorization: Bearer tdk_..." \
+  -H "Content-Type: application/json" \
+  -d '{"session":"api","task":"dev","action":"start"}' \
+  http://127.0.0.1:9837/api/action
+curl -H "Authorization: Bearer tdk_..." \
+  http://127.0.0.1:9837/api/node-metrics</code></div></section>
           </article>
         </section>
         <section class="view settings-view" id="settings-view" hidden>
@@ -209,6 +349,32 @@
                 </div>
                 <div class="settings-message" id="alias-message" role="status"></div>
                 <footer class="settings-footer"><span class="muted">Leave the alias empty to use the session ID.</span><div class="settings-actions"><button class="button" type="button" id="clear-alias">Clear</button><button class="button primary" type="submit">Save alias</button></div></footer>
+              </form>
+            </section>
+
+            <section class="settings-panel" aria-labelledby="quotas-title">
+              <header><div><h2 id="quotas-title" data-i18n="settings.quotasTitle">Resource quotas</h2><p data-i18n="settings.quotasHint">Cap concurrent running tasks per workspace or node. Starts beyond the quota are rejected or skipped.</p></div><button class="button" id="reload-quotas" type="button" data-i18n="action.refresh">Refresh</button></header>
+              <div class="quotas-list" id="quotas-list"></div>
+              <form class="settings-form" id="quota-form">
+                <div class="field-grid compact-grid">
+                  <label class="field"><span data-i18n="field.workspaceScope">Workspace (empty = node)</span><input id="quota-session" type="text" placeholder="api" autocomplete="off" list="quota-session-options"></label>
+                  <label class="field"><span data-i18n="field.maxRunning">Max running tasks</span><input id="quota-max" type="number" min="1" value="2"></label>
+                </div>
+                <datalist id="quota-session-options"></datalist>
+                <div class="settings-message" id="quota-message" role="status"></div>
+                <footer class="settings-footer"><button class="button primary" type="submit" data-i18n="action.addQuota">Add quota</button></footer>
+              </form>
+            </section>
+
+            <section class="settings-panel" aria-labelledby="tokens-title">
+              <header><div><h2 id="tokens-title" data-i18n="settings.tokensTitle">API tokens</h2><p data-i18n="settings.tokensHint">Bearer tokens for external integrations. The secret is shown once at creation.</p></div><button class="button" id="reload-tokens" type="button" data-i18n="action.refresh">Refresh</button></header>
+              <div class="tokens-list" id="tokens-list"></div>
+              <form class="settings-form" id="token-form">
+                <div class="field-grid compact-grid">
+                  <label class="field"><span data-i18n="field.tokenName">Token name</span><input id="token-name" type="text" placeholder="ci pipeline" autocomplete="off"></label>
+                </div>
+                <div class="settings-message" id="token-message" role="status"></div>
+                <footer class="settings-footer"><button class="button primary" type="submit" data-i18n="action.createToken">Create token</button></footer>
               </form>
             </section>
 

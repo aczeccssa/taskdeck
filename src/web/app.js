@@ -91,6 +91,47 @@ const state = {
   suppressTabClick: false,
   seenExits: loadSeenExits(),
   toastTimer: null,
+
+  // Dashboard + auto-scaling
+  nodeMetrics: null,
+  nodeMetricsRequest: 0,
+  scalingPolicies: [],
+  scalingTargets: [],
+  scalingRequest: 0,
+  scalingEditingId: null,
+
+  // Alerts
+  notifications: [],
+  notificationsRequest: 0,
+  notificationsSignature: "",
+  unreadCount: 0,
+  notificationRules: [],
+  ruleEditingId: null,
+
+  // Workflow orchestrator + revisions + dependencies
+  orchestratorDraft: { positions: [], edges: [] },
+  orchestratorConnectMode: false,
+  orchestratorConnectFrom: null,
+  orchestratorDrag: null,
+  workflowRevisions: [],
+  revisionsVisible: false,
+  dependencies: [],
+  dependencyTargets: [],
+  dependencyRequest: 0,
+
+  // Board templates
+  boardTemplates: [],
+  selectedTemplateId: null,
+
+  // Quotas + API tokens
+  quotas: [],
+  quotaSessions: [],
+  quotaRequest: 0,
+  apiTokens: [],
+  apiTokenRequest: 0,
+
+  // i18n
+  lang: localStorage.getItem("taskdeck-lang") || "en",
 };
 
 const icons = {
@@ -196,16 +237,23 @@ function setView(view) {
   });
   $("#sessions").hidden = view !== "tasks";
   $("#nodes").hidden = false;
-  $("#page-title").textContent = view === "calls" ? "MCP Calls" : view === "audit" ? "Audit Log" : view === "runs" ? "Task Runs" : view === "docs" ? "MCP Guide" : view === "settings" ? "Settings" : view === "workflows" ? "Workflows" : view === "boards" ? "Boards" : "Task workspace";
+  $("#page-title").textContent = t(`view.${view}`, "Task workspace");
   if (view === "calls") loadMcpCalls();
   if (view === "audit") loadAudit();
   if (view === "runs") loadRuns().catch((error) => showToast(error.message || "Unable to load runs"));
   if (view === "workflows") loadWorkflowGroups().catch((error) => showToast(error.message || "Unable to load workflows"));
   if (view === "boards") loadBoards().catch((error) => showToast(error.message || "Unable to load boards"));
+  if (view === "dashboard") {
+    loadNodeMetrics();
+    loadScalingPolicies();
+  }
+  if (view === "alerts") loadAlerts();
   if (view === "settings") {
     loadNodeSettings().catch((error) => showToast(error.message || "Unable to load settings"));
     loadServiceStatus();
     renderAliasForm();
+    loadQuotas();
+    loadApiTokens();
   }
   updateMeta();
 }
@@ -321,18 +369,33 @@ function beginWorkflowEditor(group = null) {
     session: member.session,
     task: member.task,
   }));
+  state.orchestratorDraft = {
+    positions: (group?.graph?.positions || []).map((position) => ({ x: position.x, y: position.y })),
+    edges: (group?.graph?.edges || []).map((edge) => ({ from: edge.from, to: edge.to })),
+  };
+  state.orchestratorConnectFrom = null;
   $("#workflow-name").value = group?.name || "";
   $("#workflow-results").innerHTML = "";
+  $("#orchestrator-results").innerHTML = "";
+  state.revisionsVisible = false;
+  state.workflowRevisions = [];
+  renderWorkflowRevisions();
   renderWorkflowEditor();
+  renderOrchestrator();
 }
 
 function cancelWorkflowEditor() {
   state.workflowEditorActive = false;
   state.workflowEditingId = null;
   state.workflowDraftMembers = [];
+  state.orchestratorDraft = { positions: [], edges: [] };
+  state.orchestratorConnectFrom = null;
   $("#workflow-name").value = "";
   $("#workflow-results").innerHTML = "";
+  $("#orchestrator-results").innerHTML = "";
+  state.revisionsVisible = false;
   renderWorkflowEditor();
+  renderOrchestrator();
 }
 
 function workflowTargetForMember(member) {
@@ -354,6 +417,7 @@ function renderWorkflowEditor() {
   members.innerHTML = state.workflowDraftMembers.length
     ? state.workflowDraftMembers.map(renderWorkflowMemberEditor).join("")
     : '<div class="muted">Add at least one workspace task member.</div>';
+  renderOrchestrator();
 }
 
 function renderWorkflowMemberEditor(member, index) {
@@ -443,7 +507,10 @@ async function saveWorkflow() {
     showWorkflowMessage("Every member needs a workspace and task.", "error");
     return;
   }
-  const body = { name, members: state.workflowDraftMembers };
+  const body = { name, members: state.workflowDraftMembers, graph: {
+    positions: orchestratorGraph().positions.slice(0, state.workflowDraftMembers.length).map((position) => ({ x: position.x, y: position.y })),
+    edges: orchestratorGraph().edges.map((edge) => ({ from: edge.from, to: edge.to })),
+  } };
   const url = state.workflowEditingId ? `/api/workflow-groups/${encodeURIComponent(state.workflowEditingId)}` : "/api/workflow-groups";
   const method = state.workflowEditingId ? "PUT" : "POST";
   showWorkflowMessage("Saving workflow…");
@@ -453,8 +520,10 @@ async function saveWorkflow() {
     state.workflowEditorActive = false;
     state.workflowEditingId = null;
     state.workflowDraftMembers = [];
+    state.orchestratorDraft = { positions: [], edges: [] };
     $("#workflow-name").value = "";
     showWorkflowMessage("Workflow saved.", "success");
+    renderOrchestrator();
     await loadWorkflowGroups();
   } catch (error) {
     showWorkflowMessage(error.message || "Unable to save workflow", "error");
@@ -548,6 +617,7 @@ async function loadBoards() {
     state.boards = response.data?.boards || [];
     state.boardTargets = response.data?.targets || [];
     renderBoards();
+    renderBoardTemplates();
     setConnection(true);
     updateMeta();
     await refreshBoardLive();
@@ -2783,7 +2853,103 @@ function bindEvents() {
       updateFullscreenButton();
     }
   });
+  $("#orchestrator")?.addEventListener("pointerdown", handleOrchestratorPointerDown);
+  $("#orchestrator")?.addEventListener("pointermove", handleOrchestratorPointerMove);
+  $("#orchestrator")?.addEventListener("pointerup", handleOrchestratorPointerUp);
+  $("#orchestrator")?.addEventListener("click", handleOrchestratorEdgeClick);
+  $("#orchestrator-connect")?.addEventListener("click", () => {
+    state.orchestratorConnectMode = !state.orchestratorConnectMode;
+    state.orchestratorConnectFrom = null;
+    renderOrchestrator();
+  });
+  $("#orchestrator-save")?.addEventListener("click", saveOrchestratorLayout);
+  $("#orchestrator-run")?.addEventListener("click", runOrchestrator);
+  $("#orchestrator-history")?.addEventListener("click", async () => {
+    state.revisionsVisible = !state.revisionsVisible;
+    if (state.revisionsVisible) await loadWorkflowRevisions();
+    renderWorkflowRevisions();
+  });
+  $("#workflow-revisions")?.addEventListener("click", (event) => {
+    const restore = event.target.closest("[data-revision-restore]");
+    if (restore) restoreWorkflowRevision(Number(restore.dataset.revisionRestore));
+  });
+  $("#refresh-dependencies")?.addEventListener("click", loadDependencies);
+  $("#dependencies-list")?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-dependency-delete]");
+    if (button) deleteDependency(button.dataset.dependencyDelete);
+  });
+  $("#dependency-form")?.addEventListener("submit", submitDependency);
+  ["dependency", "dependency-dep"].forEach((prefix) => {
+    $(`#${prefix}-node`)?.addEventListener("change", () => syncTargetDependents(prefix, state.dependencyTargets));
+  });
+  $("#alerts-bell")?.addEventListener("click", () => setView("alerts"));
+  $("#refresh-alerts")?.addEventListener("click", loadAlerts);
+  $("#mark-all-read")?.addEventListener("click", () => markNotificationsRead(null));
+  $("#notifications-list")?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-notification-read]");
+    if (button) markNotificationsRead(Number(button.dataset.notificationRead));
+  });
+  $("#rule-form")?.addEventListener("submit", submitRule);
+  $("#cancel-rule")?.addEventListener("click", cancelRuleEditor);
+  $("#notification-rules")?.addEventListener("click", (event) => {
+    const edit = event.target.closest("[data-rule-edit]");
+    if (edit) {
+      beginRuleEditor(state.notificationRules.find((rule) => rule.id === edit.dataset.ruleEdit));
+      return;
+    }
+    const remove = event.target.closest("[data-rule-delete]");
+    if (remove && confirm("Delete rule?")) {
+      requestJson(`/api/notification-rules/${encodeURIComponent(remove.dataset.ruleDelete)}`, { method: "DELETE" })
+        .then((response) => { if (!response.ok) throw new Error(response.message); return loadAlerts(); })
+        .catch((error) => showRuleMessage(error.message || "Unable to delete rule", "error"));
+    }
+  });
+  $("#refresh-dashboard")?.addEventListener("click", () => { loadNodeMetrics(); loadScalingPolicies(); });
+  $("#scaling-form")?.addEventListener("submit", submitScalingPolicy);
+  $("#scaling-list")?.addEventListener("click", (event) => {
+    const remove = event.target.closest("[data-scaling-delete]");
+    if (remove) {
+      deleteScalingPolicy(remove.dataset.scalingDelete);
+      return;
+    }
+    const toggle = event.target.closest("[data-scaling-toggle]");
+    if (toggle) toggleScalingPolicy(toggle.dataset.scalingToggle);
+  });
+  ["scaling-watch", "scaling-out"].forEach((prefix) => {
+    $(`#${prefix}-node`)?.addEventListener("change", () => syncTargetDependents(prefix, state.scalingTargets));
+  });
+  $("#save-template")?.addEventListener("click", saveBoardTemplate);
+  $("#apply-template")?.addEventListener("click", applyBoardTemplate);
+  $("#export-template")?.addEventListener("click", exportBoardTemplate);
+  $("#import-template")?.addEventListener("click", () => $("#import-template-file")?.click());
+  $("#import-template-file")?.addEventListener("change", (event) => {
+    const file = event.target.files?.[0];
+    if (file) importBoardTemplate(file);
+    event.target.value = "";
+  });
+  $("#delete-template")?.addEventListener("click", deleteBoardTemplate);
+  $("#board-template-list")?.addEventListener("click", (event) => {
+    const row = event.target.closest("[data-template-select]");
+    if (row) {
+      state.selectedTemplateId = row.dataset.templateSelect;
+      renderBoardTemplates();
+    }
+  });
+  $("#reload-quotas")?.addEventListener("click", loadQuotas);
+  $("#quota-form")?.addEventListener("submit", submitQuota);
+  $("#quotas-list")?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-quota-delete]");
+    if (button) deleteQuota(button.dataset.quotaDelete);
+  });
+  $("#reload-tokens")?.addEventListener("click", loadApiTokens);
+  $("#token-form")?.addEventListener("submit", submitApiToken);
+  $("#tokens-list")?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-token-revoke]");
+    if (button) revokeApiToken(button.dataset.tokenRevoke);
+  });
+  $("#lang")?.addEventListener("click", () => setLanguage(state.lang === "en" ? "zh" : "en"));
   addEventListener("resize", applyWorkspaceMode);
+  addEventListener("resize", () => renderOrchestratorEdges());
 }
 
 function handleConfigInput(event) {
@@ -2822,6 +2988,1081 @@ function handleConfigButton(event) {
   state.configDirty = true;
 }
 
+// ---------------------------------------------------------------------------
+// i18n (EN / 中文)
+// ---------------------------------------------------------------------------
+
+const I18N = {
+  en: {
+    "nav.tasks": "Tasks", "nav.dashboard": "Dashboard", "nav.workflows": "Workflows",
+    "nav.boards": "Boards", "nav.alerts": "Alerts", "nav.calls": "MCP Calls",
+    "nav.audit": "Audit Log", "nav.docs": "MCP Guide", "nav.settings": "Settings",
+    "view.tasks": "Task workspace", "view.dashboard": "Dashboard", "view.workflows": "Workflows",
+    "view.boards": "Boards", "view.alerts": "Alerts", "view.calls": "MCP Calls",
+    "view.audit": "Audit Log", "view.docs": "MCP Guide", "view.settings": "Settings",
+    "action.refresh": "Refresh", "action.cancel": "Cancel", "action.delete": "Delete",
+    "action.edit": "Edit", "action.save": "Save", "action.restore": "Restore",
+    "action.connect": "Connect", "action.saveLayout": "Save layout",
+    "action.runInOrder": "Run in order", "action.history": "History",
+    "action.addDependency": "Add dependency", "action.addQuota": "Add quota",
+    "action.addRule": "Add rule", "action.addPolicy": "Add policy",
+    "action.markAllRead": "Mark all read", "action.createToken": "Create token",
+    "action.saveTemplate": "Save as template", "action.applyTemplate": "Create board",
+    "action.exportTemplate": "Export", "action.importTemplate": "Import",
+    "action.deleteTemplate": "Delete", "action.addCard": "Add card",
+    "action.saveBoard": "Save board",
+    "dashboard.title": "Dashboard", "dashboard.subtitle": "Live node and task resources.",
+    "dashboard.scalingTitle": "Auto-scaling policies",
+    "dashboard.scalingHint": "Start or stop a replica task when a watched task stays above or below thresholds.",
+    "dashboard.scalingNote": "The replica task is started or stopped as the scaled instance.",
+    "workflows.ungrouped": "Ungrouped workspaces",
+    "workflows.ungroupedHint": "Visible workspaces not assigned to any workflow group.",
+    "workflows.orchestrator": "Orchestrator",
+    "workflows.orchestratorHint": "Drag cards to arrange steps, connect cards to define execution order, then run the flow.",
+    "workflows.dependencies": "Task dependencies",
+    "workflows.dependenciesHint": "Cross-workspace start gates: a task only starts while every dependency is running.",
+    "workflows.dependenciesNote": "Required state: running.",
+    "boards.editorTitle": "New board",
+    "boards.editorHint": "Pin tasks from any node and workspace, then choose what each card shows.",
+    "boards.selectToEdit": "Select a board to edit, or create a new one.",
+    "boards.templates": "Board templates",
+    "boards.templatesHint": "Save a board as a template, clone it later, or share the JSON with other nodes.",
+    "alerts.title": "Alerts", "alerts.subtitle": "0 unread notifications",
+    "alerts.rulesTitle": "Alert rules",
+    "alerts.rulesHint": "Notify on task transitions; optionally POST the event to a webhook.",
+    "alerts.events": "Events",
+    "event.taskStarted": "Task started", "event.taskExited": "Task exited",
+    "event.taskFailed": "Task failed", "event.taskStopped": "Task stopped",
+    "field.name": "Name", "field.policyName": "Policy name",
+    "field.watchNode": "Watch node", "field.watchWorkspace": "Watch workspace", "field.watchTask": "Watch task",
+    "field.metric": "Metric", "field.scaleOutAbove": "Scale out above", "field.scaleInBelow": "Scale in below",
+    "field.replicaNode": "Replica node", "field.replicaWorkspace": "Replica workspace", "field.replicaTask": "Replica task",
+    "field.cooldown": "Cooldown (seconds)",
+    "field.taskNode": "Task node", "field.taskWorkspace": "Task workspace", "field.task": "Task",
+    "field.dependsNode": "Depends on node", "field.dependsWorkspace": "Depends on workspace", "field.dependsTask": "Depends on task",
+    "field.ruleName": "Rule name", "field.workspaceScope": "Workspace (optional)", "field.taskScope": "Task (optional)",
+    "field.webhook": "Webhook URL (optional)", "field.enabled": "Enabled",
+    "field.templateName": "Template name", "field.templateSource": "From board",
+    "field.maxRunning": "Max running tasks", "field.tokenName": "Token name",
+    "settings.quotasTitle": "Resource quotas",
+    "settings.quotasHint": "Cap concurrent running tasks per workspace or node. Starts beyond the quota are rejected or skipped.",
+    "settings.tokensTitle": "API tokens",
+    "settings.tokensHint": "Bearer tokens for external integrations. The secret is shown once at creation.",
+    "dashboard.statusCounts": "Task status across all nodes",
+    "dashboard.noMetrics": "Waiting for node metrics…",
+    "dashboard.cpu": "CPU", "dashboard.memory": "Memory", "dashboard.runningTasks": "running tasks",
+    "dashboard.sessions": "workspaces",
+    "dashboard.noPolicies": "No auto-scaling policies yet.",
+    "alerts.empty": "No notifications yet.",
+    "alerts.unreadSuffix": "unread notifications",
+    "alerts.noRules": "No alert rules yet.",
+    "workflows.orchestratorEmpty": "Select a workflow (Edit) to arrange its members.",
+    "workflows.noRevisions": "No revisions recorded yet.",
+    "workflows.noDependencies": "No task dependencies declared.",
+    "settings.noQuotas": "No quotas configured.",
+    "settings.noTokens": "No API tokens.",
+    "boards.noTemplates": "No templates saved.",
+  },
+  zh: {
+    "nav.tasks": "任务", "nav.dashboard": "仪表盘", "nav.workflows": "工作流",
+    "nav.boards": "看板", "nav.alerts": "告警", "nav.calls": "MCP 调用",
+    "nav.audit": "审计日志", "nav.docs": "MCP 指南", "nav.settings": "设置",
+    "view.tasks": "任务工作区", "view.dashboard": "仪表盘", "view.workflows": "工作流",
+    "view.boards": "看板", "view.alerts": "告警", "view.calls": "MCP 调用",
+    "view.audit": "审计日志", "view.docs": "MCP 指南", "view.settings": "设置",
+    "action.refresh": "刷新", "action.cancel": "取消", "action.delete": "删除",
+    "action.edit": "编辑", "action.save": "保存", "action.restore": "恢复",
+    "action.connect": "连接", "action.saveLayout": "保存布局",
+    "action.runInOrder": "按序运行", "action.history": "历史",
+    "action.addDependency": "添加依赖", "action.addQuota": "添加配额",
+    "action.addRule": "添加规则", "action.addPolicy": "添加策略",
+    "action.markAllRead": "全部已读", "action.createToken": "创建令牌",
+    "action.saveTemplate": "存为模板", "action.applyTemplate": "创建看板",
+    "action.exportTemplate": "导出", "action.importTemplate": "导入",
+    "action.deleteTemplate": "删除", "action.addCard": "添加卡片",
+    "action.saveBoard": "保存看板",
+    "dashboard.title": "仪表盘", "dashboard.subtitle": "实时节点与任务资源。",
+    "dashboard.scalingTitle": "自动扩缩容策略",
+    "dashboard.scalingHint": "当被观察任务持续高于或低于阈值时，自动启动或停止副本任务。",
+    "dashboard.scalingNote": "副本任务会作为扩缩容实例被启动或停止。",
+    "workflows.ungrouped": "未分组工作区",
+    "workflows.ungroupedHint": "尚未分配到任何工作流组的可见工作区。",
+    "workflows.orchestrator": "编排器",
+    "workflows.orchestratorHint": "拖拽卡片安排步骤，连接卡片定义执行顺序，然后按序运行。",
+    "workflows.dependencies": "任务依赖",
+    "workflows.dependenciesHint": "跨工作区启动闸门：仅当所有依赖都在运行时任务才会启动。",
+    "workflows.dependenciesNote": "要求状态：运行中。",
+    "boards.editorTitle": "新建看板",
+    "boards.editorHint": "从任意节点和工作区固定任务卡片，并选择每张卡片展示的内容。",
+    "boards.selectToEdit": "选择要编辑的看板，或新建一个。",
+    "boards.templates": "看板模板",
+    "boards.templatesHint": "将看板保存为模板，之后克隆，或通过 JSON 在节点间分享。",
+    "alerts.title": "告警", "alerts.subtitle": "0 条未读通知",
+    "alerts.rulesTitle": "告警规则",
+    "alerts.rulesHint": "在任务状态变化时通知；可选通过 webhook 推送事件。",
+    "alerts.events": "事件",
+    "event.taskStarted": "任务启动", "event.taskExited": "任务退出",
+    "event.taskFailed": "任务失败", "event.taskStopped": "任务停止",
+    "field.name": "名称", "field.policyName": "策略名称",
+    "field.watchNode": "观察节点", "field.watchWorkspace": "观察工作区", "field.watchTask": "观察任务",
+    "field.metric": "指标", "field.scaleOutAbove": "扩容阈值（高于）", "field.scaleInBelow": "缩容阈值（低于）",
+    "field.replicaNode": "副本节点", "field.replicaWorkspace": "副本工作区", "field.replicaTask": "副本任务",
+    "field.cooldown": "冷却时间（秒）",
+    "field.taskNode": "任务节点", "field.taskWorkspace": "任务工作区", "field.task": "任务",
+    "field.dependsNode": "依赖节点", "field.dependsWorkspace": "依赖工作区", "field.dependsTask": "依赖任务",
+    "field.ruleName": "规则名称", "field.workspaceScope": "工作区（可选）", "field.taskScope": "任务（可选）",
+    "field.webhook": "Webhook URL（可选）", "field.enabled": "启用",
+    "field.templateName": "模板名称", "field.templateSource": "来源看板",
+    "field.maxRunning": "最大并发任务数", "field.tokenName": "令牌名称",
+    "settings.quotasTitle": "资源配额",
+    "settings.quotasHint": "限制每个工作区或节点的并发任务数，超出配额的启动会被拒绝或跳过。",
+    "settings.tokensTitle": "API 令牌",
+    "settings.tokensHint": "用于外部集成的 Bearer 令牌，密钥仅在创建时显示一次。",
+    "dashboard.statusCounts": "所有节点的任务状态",
+    "dashboard.noMetrics": "等待节点指标…",
+    "dashboard.cpu": "CPU", "dashboard.memory": "内存", "dashboard.runningTasks": "个运行中任务",
+    "dashboard.sessions": "个工作区",
+    "dashboard.noPolicies": "暂无自动扩缩容策略。",
+    "alerts.empty": "暂无通知。",
+    "alerts.unreadSuffix": "条未读通知",
+    "alerts.noRules": "暂无告警规则。",
+    "workflows.orchestratorEmpty": "选择一个工作流（编辑）来编排成员。",
+    "workflows.noRevisions": "暂无修订记录。",
+    "workflows.noDependencies": "未声明任务依赖。",
+    "settings.noQuotas": "未配置配额。",
+    "settings.noTokens": "暂无 API 令牌。",
+    "boards.noTemplates": "暂无模板。",
+  },
+};
+
+function t(key, fallback) {
+  const table = I18N[state.lang] || I18N.en;
+  return table[key] ?? I18N.en[key] ?? fallback ?? key;
+}
+
+function applyI18n() {
+  $$("[data-i18n]").forEach((element) => {
+    const value = I18N[state.lang]?.[element.dataset.i18n];
+    if (value != null) element.textContent = value;
+  });
+  $("#lang").textContent = state.lang === "en" ? "中/EN" : "EN/中文";
+  document.documentElement.lang = state.lang === "zh" ? "zh-CN" : "en";
+  setView(state.view);
+}
+
+function setLanguage(lang) {
+  state.lang = lang === "zh" ? "zh" : "en";
+  localStorage.setItem("taskdeck-lang", state.lang);
+  applyI18n();
+  showToast(state.lang === "zh" ? "语言：中文" : "Language: English");
+}
+
+function formatTimestamp(ms) {
+  if (!ms) return "";
+  const date = new Date(Number(ms));
+  return date.toLocaleString(state.lang === "zh" ? "zh-CN" : "en");
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard: node metrics + auto-scaling policies
+// ---------------------------------------------------------------------------
+
+async function loadNodeMetrics() {
+  const requestId = ++state.nodeMetricsRequest;
+  try {
+    const response = await requestJson("/api/node-metrics");
+    if (requestId !== state.nodeMetricsRequest) return;
+    if (!response.ok) throw new Error(response.message);
+    state.nodeMetrics = response.data;
+    renderDashboard();
+    setConnection(true);
+  } catch (error) {
+    if (requestId === state.nodeMetricsRequest) console.warn("node metrics unavailable", error);
+  }
+}
+
+function statusChips(counts) {
+  return Object.entries(counts || {})
+    .map(([status, count]) => `<span class="status-pill ${escapeAttr(status)}">${escapeHtml(status)} ${count}</span>`)
+    .join("");
+}
+
+function drawSparkline(canvas, samples) {
+  if (!canvas) return;
+  const width = canvas.clientWidth || 220;
+  const height = canvas.clientHeight || 48;
+  const ratio = window.devicePixelRatio || 1;
+  if (canvas.width !== width * ratio) canvas.width = width * ratio;
+  if (canvas.height !== height * ratio) canvas.height = height * ratio;
+  const context = canvas.getContext("2d");
+  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  context.clearRect(0, 0, width, height);
+  if (!samples || samples.length < 2) return;
+  const values = samples.map((sample) => sample.cpu_percent ?? 0);
+  const max = Math.max(100, ...values);
+  const styles = getComputedStyle(document.documentElement);
+  context.strokeStyle = styles.getPropertyValue("--accent").trim() || "#4a7dff";
+  context.lineWidth = 1.6;
+  context.beginPath();
+  values.forEach((value, index) => {
+    const x = (index / (values.length - 1)) * width;
+    const y = height - (value / max) * (height - 4) - 2;
+    if (index === 0) context.moveTo(x, y);
+    else context.lineTo(x, y);
+  });
+  context.stroke();
+}
+
+function renderDashboard() {
+  const status = $("#dashboard-status");
+  const nodes = $("#dashboard-nodes");
+  if (!status || !nodes) return;
+  const data = state.nodeMetrics;
+  if (!data) {
+    status.innerHTML = `<div class="muted">${t("dashboard.noMetrics")}</div>`;
+    return;
+  }
+  status.innerHTML = `<h3>${t("dashboard.statusCounts")}</h3><div class="dashboard-chips">${statusChips(data.task_status_counts) || `<span class="muted">${t("dashboard.noMetrics")}</span>`}</div>`;
+  nodes.innerHTML = (data.nodes || []).map((node) => {
+    const current = node.current;
+    const cpu = current ? Math.round(current.cpu_percent) : null;
+    const used = current ? current.memory_bytes : 0;
+    const total = current ? current.memory_total_bytes : 0;
+    const memPercent = total ? Math.round((used / total) * 100) : 0;
+    const memLabel = `${formatBytes(used)} / ${formatBytes(total)}`;
+    return `<article class="dashboard-node ${node.online ? "" : "offline"}">
+      <header><strong>${escapeHtml(node.node_name || node.node_id)}</strong><span class="status-pill ${node.online ? "" : "error"}">${node.online ? "online" : "offline"}</span></header>
+      <div class="gauge"><span>${t("dashboard.cpu")}</span><div class="gauge-bar"><i style="width:${cpu ?? 0}%"></i></div><em>${cpu ?? "–"}%</em></div>
+      <div class="gauge"><span>${t("dashboard.memory")}</span><div class="gauge-bar memory"><i style="width:${memPercent}%"></i></div><em>${memLabel}</em></div>
+      <div class="dashboard-node-stats"><span>${current?.running_tasks ?? 0} ${t("dashboard.runningTasks")}</span><span>${node.session_count} ${t("dashboard.sessions")}</span>${statusChips(node.task_status_counts)}</div>
+      <canvas class="sparkline" aria-hidden="true"></canvas>
+    </article>`;
+  }).join("") || `<div class="muted">${t("dashboard.noMetrics")}</div>`;
+  $$("#dashboard-nodes .sparkline").forEach((canvas, index) => drawSparkline(canvas, data.nodes?.[index]?.samples));
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes) || 0;
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let scaled = value;
+  let unit = 0;
+  while (scaled >= 1024 && unit < units.length - 1) { scaled /= 1024; unit += 1; }
+  return `${scaled.toFixed(scaled >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+async function loadScalingPolicies() {
+  const requestId = ++state.scalingRequest;
+  try {
+    const response = await requestJson("/api/scaling-policies");
+    if (requestId !== state.scalingRequest) return;
+    if (!response.ok) throw new Error(response.message);
+    state.scalingPolicies = response.data?.policies || [];
+    state.scalingTargets = response.data?.targets || [];
+    renderScalingPanel();
+  } catch (error) {
+    if (requestId === state.scalingRequest) console.warn("scaling policies unavailable", error);
+  }
+}
+
+function populateTargetSelects(prefix, targets, selected) {
+  const nodeSelect = $(`#${prefix}-node`);
+  const sessionSelect = $(`#${prefix}-session`);
+  const taskSelect = $(`#${prefix}-task`);
+  if (!nodeSelect || !sessionSelect || !taskSelect) return;
+  const nodes = uniqueStrings(targets.map((target) => target.node_id));
+  if (nodeSelect.dataset.built !== "targets") {
+    nodeSelect.innerHTML = nodes.map((node) => {
+      const summary = state.nodes.find((item) => item.id === node);
+      return `<option value="${escapeAttr(node)}">${escapeHtml(summary?.name || node)}</option>`;
+    }).join("");
+    nodeSelect.dataset.built = "targets";
+  }
+  if (!nodes.includes(nodeSelect.value) && nodes.length) nodeSelect.value = nodes[0];
+  syncTargetDependents(prefix, targets, selected);
+  void sessionSelect; void taskSelect;
+}
+
+function syncTargetDependents(prefix, targets, selected) {
+  const nodeSelect = $(`#${prefix}-node`);
+  const sessionSelect = $(`#${prefix}-session`);
+  const taskSelect = $(`#${prefix}-task`);
+  if (!nodeSelect || !sessionSelect || !taskSelect) return;
+  const nodeTargets = targets.filter((target) => target.node_id === nodeSelect.value);
+  const sessions = uniqueStrings(nodeTargets.map((target) => target.session));
+  sessionSelect.innerHTML = sessions.length
+    ? sessions.map((session) => {
+      const target = nodeTargets.find((item) => item.session === session);
+      return `<option value="${escapeAttr(session)}">${escapeHtml(target?.workspace_display_name || session)}</option>`;
+    }).join("")
+    : '<option value="">–</option>';
+  if (selected?.session && sessions.includes(selected.session)) sessionSelect.value = selected.session;
+  const activeTarget = nodeTargets.find((target) => target.session === sessionSelect.value);
+  const tasks = activeTarget?.tasks || [];
+  taskSelect.innerHTML = tasks.length
+    ? tasks.map((task) => `<option value="${escapeAttr(task)}">${escapeHtml(task)}</option>`).join("")
+    : '<option value="">–</option>';
+  if (selected?.task && tasks.includes(selected.task)) taskSelect.value = selected.task;
+}
+
+function renderScalingPanel() {
+  const list = $("#scaling-list");
+  if (!list) return;
+  list.innerHTML = state.scalingPolicies.length
+    ? state.scalingPolicies.map((policy) => `<article class="policy-card ${policy.enabled ? "" : "disabled"}" data-policy-id="${escapeAttr(policy.id)}">
+        <header><strong>${escapeHtml(policy.name)}</strong>
+          <span class="status-pill ${policy.enabled ? "" : "muted-pill"}">${policy.enabled ? "enabled" : "disabled"}</span>
+          <div class="workflow-card-actions">
+            <button class="button compact" type="button" data-scaling-toggle="${escapeAttr(policy.id)}">${policy.enabled ? "Disable" : "Enable"}</button>
+            <button class="button compact danger" type="button" data-scaling-delete="${escapeAttr(policy.id)}">${t("action.delete")}</button>
+          </div>
+        </header>
+        <p>${escapeHtml(policy.watch_node_id)}/${escapeHtml(policy.watch_session)}/${escapeHtml(policy.watch_task)} · ${escapeHtml(policy.metric)} &gt; ${policy.scale_out_threshold} / &lt; ${policy.scale_in_threshold} → ${escapeHtml(policy.scale_out_node_id)}/${escapeHtml(policy.scale_out_session)}/${escapeHtml(policy.scale_out_task)}</p>
+        ${policy.last_action ? `<p class="muted">last: ${escapeHtml(policy.last_action)} · ${escapeHtml(formatTimestamp(policy.last_action_ms))}</p>` : ""}
+      </article>`).join("")
+    : `<div class="muted">${t("dashboard.noPolicies")}</div>`;
+  populateTargetSelects("scaling-watch", state.scalingTargets);
+  populateTargetSelects("scaling-out", state.scalingTargets);
+}
+
+function showScalingMessage(message, type = "") {
+  const element = $("#scaling-message");
+  if (!element) return;
+  element.textContent = message || "";
+  element.classList.remove("error", "success", "warning");
+  if (type) element.classList.add(type);
+}
+
+async function submitScalingPolicy(event) {
+  event.preventDefault();
+  const body = {
+    name: $("#scaling-name").value.trim(),
+    enabled: true,
+    watch_node_id: $("#scaling-watch-node").value,
+    watch_session: $("#scaling-watch-session").value,
+    watch_task: $("#scaling-watch-task").value,
+    metric: $("#scaling-metric").value,
+    scale_out_threshold: Number($("#scaling-out-threshold").value),
+    scale_in_threshold: Number($("#scaling-in-threshold").value),
+    scale_out_node_id: $("#scaling-out-node").value,
+    scale_out_session: $("#scaling-out-session").value,
+    scale_out_task: $("#scaling-out-task").value,
+    cooldown_seconds: Number($("#scaling-cooldown").value) || 300,
+  };
+  try {
+    const url = state.scalingEditingId ? `/api/scaling-policies/${encodeURIComponent(state.scalingEditingId)}` : "/api/scaling-policies";
+    const response = await requestJson(url, { method: state.scalingEditingId ? "PUT" : "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    if (!response.ok) throw new Error(response.message);
+    showScalingMessage("Policy saved.", "success");
+    state.scalingEditingId = null;
+    $("#scaling-name").value = "";
+    await loadScalingPolicies();
+  } catch (error) {
+    showScalingMessage(error.message || "Unable to save policy", "error");
+  }
+}
+
+async function deleteScalingPolicy(id) {
+  if (!confirm("Delete scaling policy?")) return;
+  try {
+    const response = await requestJson(`/api/scaling-policies/${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (!response.ok) throw new Error(response.message);
+    await loadScalingPolicies();
+  } catch (error) {
+    showScalingMessage(error.message || "Unable to delete policy", "error");
+  }
+}
+
+async function toggleScalingPolicy(id) {
+  const policy = state.scalingPolicies.find((item) => item.id === id);
+  if (!policy) return;
+  try {
+    const response = await requestJson(`/api/scaling-policies/${encodeURIComponent(id)}`, {
+      method: "PUT", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...policy, enabled: !policy.enabled }),
+    });
+    if (!response.ok) throw new Error(response.message);
+    await loadScalingPolicies();
+  } catch (error) {
+    showScalingMessage(error.message || "Unable to update policy", "error");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Alerts: notifications + rules
+// ---------------------------------------------------------------------------
+
+async function loadAlerts() {
+  const requestId = ++state.notificationsRequest;
+  try {
+    const [notifications, rules] = await Promise.all([
+      requestJson("/api/notifications?limit=200"),
+      requestJson("/api/notification-rules"),
+    ]);
+    if (requestId !== state.notificationsRequest) return;
+    if (!notifications.ok) throw new Error(notifications.message);
+    state.notifications = notifications.data?.notifications || [];
+    state.unreadCount = notifications.data?.unread_count || 0;
+    state.notificationRules = rules.ok ? rules.data || [] : [];
+    renderAlerts();
+    updateAlertsBell();
+    setConnection(true);
+  } catch (error) {
+    if (requestId === state.notificationsRequest) console.warn("alerts unavailable", error);
+  }
+}
+
+async function updateUnreadBadge() {
+  try {
+    const response = await requestJson("/api/notifications?limit=1");
+    if (!response.ok) return;
+    updateAlertsBell(response.data?.unread_count || 0);
+  } catch (_) { /* badge is best-effort */ }
+}
+
+function updateAlertsBell(unread) {
+  if (unread != null) state.unreadCount = unread;
+  const bell = $("#alerts-bell");
+  const badge = $("#alerts-unread");
+  if (!bell || !badge) return;
+  bell.hidden = false;
+  badge.hidden = state.unreadCount === 0;
+  badge.textContent = String(state.unreadCount);
+}
+
+function severityClass(severity) {
+  return severity === "critical" ? "error" : severity === "warning" ? "warning" : "";
+}
+
+function renderAlerts() {
+  const summary = $("#alerts-summary");
+  const list = $("#notifications-list");
+  const rules = $("#notification-rules");
+  if (summary) summary.textContent = `${state.unreadCount} ${t("alerts.unreadSuffix")}`;
+  if (list) {
+    list.innerHTML = state.notifications.length
+      ? state.notifications.map((item) => `<article class="notification ${item.read ? "read" : "unread"}">
+          <header>
+            <span class="status-pill ${severityClass(item.severity)}">${escapeHtml(item.event_type)}</span>
+            <strong>${escapeHtml(item.title)}</strong>
+            <span class="muted">${escapeHtml(formatTimestamp(item.created_at_ms))}</span>
+            ${item.read ? "" : `<button class="button compact" type="button" data-notification-read="${item.id}">${t("action.save") === "Save" ? "Mark read" : "标为已读"}</button>`}
+          </header>
+          <p>${escapeHtml(item.message)}</p>
+          ${item.session ? `<p class="muted">${escapeHtml(item.session)} · ${escapeHtml(item.task || "")}</p>` : ""}
+        </article>`).join("")
+      : `<div class="empty-state compact"><div><h1>${t("alerts.empty")}</h1></div></div>`;
+  }
+  if (rules) {
+    rules.innerHTML = state.notificationRules.length
+      ? state.notificationRules.map((rule) => `<article class="rule-card ${rule.enabled ? "" : "disabled"}">
+          <header><strong>${escapeHtml(rule.name)}</strong>
+            <span class="status-pill ${rule.enabled ? "" : "muted-pill"}">${rule.enabled ? "enabled" : "disabled"}</span>
+            <div class="workflow-card-actions">
+              <button class="button compact" type="button" data-rule-edit="${escapeAttr(rule.id)}">${t("action.edit")}</button>
+              <button class="button compact danger" type="button" data-rule-delete="${escapeAttr(rule.id)}">${t("action.delete")}</button>
+            </div>
+          </header>
+          <p class="muted">${rule.event_types.map((event) => escapeHtml(event)).join(" · ")}${rule.scope_session ? ` · ${escapeHtml(rule.scope_session)}` : ""}${rule.webhook_url ? ` · webhook` : ""}</p>
+        </article>`).join("")
+      : `<div class="muted">${t("alerts.noRules")}</div>`;
+  }
+}
+
+function beginRuleEditor(rule = null) {
+  state.ruleEditingId = rule?.id || null;
+  $("#rule-name").value = rule?.name || "";
+  $("#rule-task-started").checked = rule ? rule.event_types.includes("task_started") : true;
+  $("#rule-task-exited").checked = rule ? rule.event_types.includes("task_exited") : false;
+  $("#rule-task-failed").checked = rule ? rule.event_types.includes("task_failed") : true;
+  $("#rule-task-stopped").checked = rule ? rule.event_types.includes("task_stopped") : false;
+  $("#rule-scope-session").value = rule?.scope_session || "";
+  $("#rule-scope-task").value = rule?.scope_task || "";
+  $("#rule-webhook").value = rule?.webhook_url || "";
+  $("#rule-enabled").checked = rule ? rule.enabled : true;
+  $("#cancel-rule").hidden = !state.ruleEditingId;
+  $("#save-rule").textContent = state.ruleEditingId ? t("action.save") : t("action.addRule");
+}
+
+function cancelRuleEditor() {
+  state.ruleEditingId = null;
+  beginRuleEditor(null);
+  $("#cancel-rule").hidden = true;
+  showRuleMessage("", "");
+}
+
+function showRuleMessage(message, type = "") {
+  const element = $("#rule-message");
+  if (!element) return;
+  element.textContent = message || "";
+  element.classList.remove("error", "success", "warning");
+  if (type) element.classList.add(type);
+}
+
+async function submitRule(event) {
+  event.preventDefault();
+  const eventTypes = [];
+  if ($("#rule-task-started").checked) eventTypes.push("task_started");
+  if ($("#rule-task-exited").checked) eventTypes.push("task_exited");
+  if ($("#rule-task-failed").checked) eventTypes.push("task_failed");
+  if ($("#rule-task-stopped").checked) eventTypes.push("task_stopped");
+  const body = {
+    name: $("#rule-name").value.trim(),
+    event_types: eventTypes,
+    scope_session: $("#rule-scope-session").value.trim() || null,
+    scope_task: $("#rule-scope-task").value.trim() || null,
+    webhook_url: $("#rule-webhook").value.trim() || null,
+    enabled: $("#rule-enabled").checked,
+  };
+  try {
+    const url = state.ruleEditingId ? `/api/notification-rules/${encodeURIComponent(state.ruleEditingId)}` : "/api/notification-rules";
+    const response = await requestJson(url, { method: state.ruleEditingId ? "PUT" : "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    if (!response.ok) throw new Error(response.message);
+    showRuleMessage("Rule saved.", "success");
+    cancelRuleEditor();
+    await loadAlerts();
+  } catch (error) {
+    showRuleMessage(error.message || "Unable to save rule", "error");
+  }
+}
+
+async function markNotificationsRead(id) {
+  try {
+    const body = id != null ? { id } : { all: true };
+    const response = await requestJson("/api/notifications/read", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    if (!response.ok) throw new Error(response.message);
+    await loadAlerts();
+  } catch (error) {
+    showToast(error.message || "Unable to mark notifications read");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Workflow orchestrator: drag canvas, edges, ordered runs, revisions
+// ---------------------------------------------------------------------------
+
+function orchestratorGraph() {
+  return state.orchestratorDraft || (state.orchestratorDraft = { positions: [], edges: [] });
+}
+
+function orchestratorNodePosition(index) {
+  const positions = orchestratorGraph().positions;
+  if (!positions[index]) positions[index] = {
+    x: 40 + (index % 3) * 230,
+    y: 30 + Math.floor(index / 3) * 110,
+  };
+  return positions[index];
+}
+
+function renderOrchestrator() {
+  const canvas = $("#orchestrator");
+  const empty = $("#orchestrator-empty");
+  if (!canvas || !empty) return;
+  const active = state.workflowEditorActive;
+  empty.hidden = active && state.workflowDraftMembers.length > 0;
+  $$(".orchestrator-node", canvas).forEach((node) => node.remove());
+  const members = state.workflowDraftMembers;
+  canvas.classList.toggle("connect-mode", state.orchestratorConnectMode);
+  members.forEach((member, index) => {
+    const position = orchestratorNodePosition(index);
+    const view = workflowTargetForMember(member);
+    const element = document.createElement("div");
+    element.className = `orchestrator-node ${member.node_id && member.session && member.task ? "" : "incomplete"}${state.orchestratorConnectFrom === index ? " selected" : ""}`;
+    element.style.left = `${position.x}px`;
+    element.style.top = `${position.y}px`;
+    element.dataset.orchIndex = String(index);
+    element.innerHTML = `<strong>${escapeHtml(member.task || "?")}</strong><span>${escapeHtml(view?.node_name || member.node_id || "–")} · ${escapeHtml(view?.workspace_display_name || member.session || "–")}</span>`;
+    canvas.appendChild(element);
+  });
+  renderOrchestratorEdges();
+  $("#orchestrator-save").disabled = !state.workflowEditingId;
+  $("#orchestrator-run").disabled = !state.workflowEditingId;
+  $("#orchestrator-connect").classList.toggle("active", state.orchestratorConnectMode);
+  $("#orchestrator-connect").textContent = state.orchestratorConnectMode
+    ? (state.lang === "zh" ? "连接中…" : "Connecting…")
+    : t("action.connect");
+}
+
+function renderOrchestratorEdges() {
+  const svg = $("#orchestrator-edges");
+  if (!svg) return;
+  const canvas = $("#orchestrator");
+  svg.setAttribute("width", String(canvas.clientWidth || 800));
+  svg.setAttribute("height", String(Math.max(240, canvas.clientHeight || 240)));
+  const nodes = $$(".orchestrator-node", canvas);
+  const edges = orchestratorGraph().edges;
+  svg.innerHTML = edges.map((edge, index) => {
+    const from = nodes[edge.from];
+    const to = nodes[edge.to];
+    if (!from || !to) return "";
+    const x1 = from.offsetLeft + from.offsetWidth / 2;
+    const y1 = from.offsetTop + from.offsetHeight / 2;
+    const x2 = to.offsetLeft + to.offsetWidth / 2;
+    const y2 = to.offsetTop + to.offsetHeight / 2;
+    return `<line data-orch-edge="${index}" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}"><title>${edge.from} → ${edge.to}</title></line>`;
+  }).join("");
+}
+
+function handleOrchestratorPointerDown(event) {
+  const node = event.target.closest(".orchestrator-node");
+  if (!node) return;
+  const index = Number(node.dataset.orchIndex);
+  if (state.orchestratorConnectMode) {
+    if (state.orchestratorConnectFrom == null) {
+      state.orchestratorConnectFrom = index;
+    } else if (state.orchestratorConnectFrom !== index) {
+      const edges = orchestratorGraph().edges;
+      const exists = edges.some((edge) => edge.from === state.orchestratorConnectFrom && edge.to === index);
+      if (!exists) edges.push({ from: state.orchestratorConnectFrom, to: index });
+      state.orchestratorConnectFrom = null;
+    } else {
+      state.orchestratorConnectFrom = null;
+    }
+    renderOrchestrator();
+    return;
+  }
+  const position = orchestratorNodePosition(index);
+  state.orchestratorDrag = {
+    index,
+    startX: event.clientX,
+    startY: event.clientY,
+    originX: position.x,
+    originY: position.y,
+    moved: false,
+  };
+  event.preventDefault();
+}
+
+function handleOrchestratorPointerMove(event) {
+  const drag = state.orchestratorDrag;
+  if (!drag) return;
+  const dx = event.clientX - drag.startX;
+  const dy = event.clientY - drag.startY;
+  if (Math.abs(dx) > 4 || Math.abs(dy) > 4) drag.moved = true;
+  const position = orchestratorNodePosition(drag.index);
+  position.x = Math.max(0, drag.originX + dx);
+  position.y = Math.max(0, drag.originY + dy);
+  const node = $(`.orchestrator-node[data-orch-index="${drag.index}"]`);
+  if (node) {
+    node.style.left = `${position.x}px`;
+    node.style.top = `${position.y}px`;
+    renderOrchestratorEdges();
+  }
+}
+
+function handleOrchestratorPointerUp() {
+  state.orchestratorDrag = null;
+}
+
+function handleOrchestratorEdgeClick(event) {
+  const line = event.target.closest("[data-orch-edge]");
+  if (!line || !state.orchestratorConnectMode) return;
+  const edges = orchestratorGraph().edges;
+  edges.splice(Number(line.dataset.orchEdge), 1);
+  renderOrchestratorEdges();
+}
+
+async function saveOrchestratorLayout() {
+  if (!state.workflowEditingId) return;
+  const group = state.workflowGroups.find((item) => item.id === state.workflowEditingId);
+  if (!group) return;
+  const graph = {
+    positions: orchestratorGraph().positions.slice(0, state.workflowDraftMembers.length).map((p) => ({ x: p.x, y: p.y })),
+    edges: orchestratorGraph().edges.map((edge) => ({ from: edge.from, to: edge.to })),
+  };
+  try {
+    const response = await requestJson(`/api/workflow-groups/${encodeURIComponent(state.workflowEditingId)}`, {
+      method: "PUT", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: group.name, members: state.workflowDraftMembers, graph }),
+    });
+    if (!response.ok) throw new Error(response.message);
+    showWorkflowMessage("Layout saved.", "success");
+    await loadWorkflowGroups();
+    if (state.revisionsVisible) await loadWorkflowRevisions();
+  } catch (error) {
+    showWorkflowMessage(error.message || "Unable to save layout", "error");
+  }
+}
+
+async function runOrchestrator() {
+  if (!state.workflowEditingId) return;
+  try {
+    const response = await requestJson(`/api/workflow-groups/${encodeURIComponent(state.workflowEditingId)}/run`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({}),
+    });
+    if (!response.ok) throw new Error(response.message);
+    renderWorkflowResultsInto("#orchestrator-results", response.data);
+    if (state.revisionsVisible) await loadWorkflowRevisions();
+  } catch (error) {
+    showWorkflowMessage(error.message || "Workflow run failed", "error");
+  }
+}
+
+function renderWorkflowResultsInto(selector, summary) {
+  const target = $(selector);
+  if (!target || !summary) return;
+  target.innerHTML = `<h3>${escapeHtml(summary.group_name)} · run</h3><p>${summary.success_count} ok · ${summary.failed_count} failed · ${summary.skipped_count} skipped</p><div class="workflow-result-list">${(summary.results || []).map((item, index) => `<div class="workflow-result ${escapeAttr(item.status)}"><strong>#${index + 1} ${escapeHtml(item.workspace_display_name)} / ${escapeHtml(item.task)}</strong><span>${escapeHtml(item.status)} · ${escapeHtml(item.message)}</span></div>`).join("")}</div>`;
+}
+
+async function loadWorkflowRevisions() {
+  if (!state.workflowEditingId) return;
+  try {
+    const response = await requestJson(`/api/workflow-groups/${encodeURIComponent(state.workflowEditingId)}/revisions`);
+    if (!response.ok) throw new Error(response.message);
+    state.workflowRevisions = response.data?.revisions || [];
+    renderWorkflowRevisions();
+  } catch (error) {
+    showToast(error.message || "Unable to load revisions");
+  }
+}
+
+function renderWorkflowRevisions() {
+  const target = $("#workflow-revisions");
+  if (!target) return;
+  target.hidden = !state.revisionsVisible;
+  if (!state.revisionsVisible) return;
+  target.innerHTML = `<h3>${t("action.history")}</h3>` + (state.workflowRevisions.length
+    ? `<div class="revision-list">${state.workflowRevisions.map((revision) => `<div class="revision-row">
+        <span class="revision-number">#${revision.revision}</span>
+        <span>${escapeHtml(revision.name)}</span>
+        <span class="muted">${escapeHtml(formatTimestamp(revision.created_at_ms))}${revision.note ? ` · ${escapeHtml(revision.note)}` : ""}</span>
+        <button class="button compact" type="button" data-revision-restore="${revision.revision}">${t("action.restore")}</button>
+      </div>`).join("")}</div>`
+    : `<div class="muted">${t("workflows.noRevisions")}</div>`);
+}
+
+async function restoreWorkflowRevision(revision) {
+  if (!state.workflowEditingId) return;
+  try {
+    const response = await requestJson(`/api/workflow-groups/${encodeURIComponent(state.workflowEditingId)}/revisions/${revision}/restore`, { method: "POST" });
+    if (!response.ok) throw new Error(response.message);
+    showToast(`Restored revision ${revision}`);
+    await loadWorkflowGroups();
+    const group = state.workflowGroups.find((item) => item.id === state.workflowEditingId);
+    if (group) beginWorkflowEditor(group);
+    await loadWorkflowRevisions();
+  } catch (error) {
+    showToast(error.message || "Unable to restore revision");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-workspace task dependencies
+// ---------------------------------------------------------------------------
+
+async function loadDependencies() {
+  const requestId = ++state.dependencyRequest;
+  try {
+    const response = await requestJson("/api/dependencies");
+    if (requestId !== state.dependencyRequest) return;
+    if (!response.ok) throw new Error(response.message);
+    state.dependencies = response.data?.dependencies || [];
+    state.dependencyTargets = response.data?.targets || [];
+    renderDependencies();
+  } catch (error) {
+    if (requestId === state.dependencyRequest) console.warn("dependencies unavailable", error);
+  }
+}
+
+function renderDependencies() {
+  const list = $("#dependencies-list");
+  if (!list) return;
+  list.innerHTML = state.dependencies.length
+    ? state.dependencies.map((dependency) => `<article class="dependency-row">
+        <span class="status-pill ${dependency.target_available ? "" : "error"}">${dependency.target_available ? "ready" : "missing"}</span>
+        <strong>${escapeHtml(dependency.node_id)}/${escapeHtml(dependency.session)}/${escapeHtml(dependency.task)}</strong>
+        <span class="dependency-arrow">← depends on →</span>
+        <strong>${escapeHtml(dependency.depends_node_id)}/${escapeHtml(dependency.depends_session)}/${escapeHtml(dependency.depends_task)}</strong>
+        <button class="button compact danger" type="button" data-dependency-delete="${escapeAttr(dependency.id)}">${t("action.delete")}</button>
+      </article>`).join("")
+    : `<div class="muted">${t("workflows.noDependencies")}</div>`;
+  populateTargetSelects("dependency", state.dependencyTargets);
+  populateTargetSelects("dependency-dep", state.dependencyTargets);
+}
+
+function showDependencyMessage(message, type = "") {
+  const element = $("#dependency-message");
+  if (!element) return;
+  element.textContent = message || "";
+  element.classList.remove("error", "success", "warning");
+  if (type) element.classList.add(type);
+}
+
+async function submitDependency(event) {
+  event.preventDefault();
+  const body = {
+    node_id: $("#dependency-node").value,
+    session: $("#dependency-session").value,
+    task: $("#dependency-task").value,
+    depends_node_id: $("#dependency-dep-node").value,
+    depends_session: $("#dependency-dep-session").value,
+    depends_task: $("#dependency-dep-task").value,
+  };
+  try {
+    const response = await requestJson("/api/dependencies", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    if (!response.ok) throw new Error(response.message);
+    showDependencyMessage("Dependency added.", "success");
+    await loadDependencies();
+  } catch (error) {
+    showDependencyMessage(error.message || "Unable to add dependency", "error");
+  }
+}
+
+async function deleteDependency(id) {
+  try {
+    const response = await requestJson(`/api/dependencies/${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (!response.ok) throw new Error(response.message);
+    await loadDependencies();
+  } catch (error) {
+    showToast(error.message || "Unable to delete dependency");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Board templates
+// ---------------------------------------------------------------------------
+
+async function loadBoardTemplates() {
+  try {
+    const response = await requestJson("/api/board-templates");
+    if (!response.ok) throw new Error(response.message);
+    state.boardTemplates = response.data?.templates || [];
+    renderBoardTemplates();
+  } catch (error) {
+    console.warn("board templates unavailable", error);
+  }
+}
+
+function renderBoardTemplates() {
+  const list = $("#board-template-list");
+  const source = $("#template-source");
+  if (!list || !source) return;
+  if (source.options.length !== state.boards.length + 1) {
+    source.innerHTML = `<option value="">—</option>` + state.boards.map((board) => `<option value="${escapeAttr(board.id)}">${escapeHtml(board.name)}</option>`).join("");
+  }
+  list.innerHTML = state.boardTemplates.length
+    ? state.boardTemplates.map((template) => `<button class="template-row ${state.selectedTemplateId === template.id ? "selected" : ""}" type="button" data-template-select="${escapeAttr(template.id)}">
+        <strong>${escapeHtml(template.name)}</strong>
+        <span class="muted">${template.cards?.length || 0} cards${template.description ? ` · ${escapeHtml(template.description)}` : ""}</span>
+      </button>`).join("")
+    : `<div class="muted">${t("boards.noTemplates")}</div>`;
+}
+
+function showTemplateMessage(message, type = "") {
+  const element = $("#template-message");
+  if (!element) return;
+  element.textContent = message || "";
+  element.classList.remove("error", "success", "warning");
+  if (type) element.classList.add(type);
+}
+
+async function saveBoardTemplate() {
+  const name = $("#template-name").value.trim();
+  if (!name) {
+    showTemplateMessage("Template name is required.", "error");
+    return;
+  }
+  const sourceBoardId = $("#template-source").value || null;
+  const body = { name, description: null, cards: [], source_board_id: sourceBoardId };
+  if (!sourceBoardId) {
+    const cards = state.boardDraftCards || [];
+    if (!cards.length) {
+      showTemplateMessage("Pick a source board or add cards in the editor first.", "error");
+      return;
+    }
+    body.cards = cards;
+  }
+  try {
+    const response = await requestJson("/api/board-templates", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    if (!response.ok) throw new Error(response.message);
+    showTemplateMessage("Template saved.", "success");
+    state.selectedTemplateId = response.data?.id || null;
+    await loadBoardTemplates();
+  } catch (error) {
+    showTemplateMessage(error.message || "Unable to save template", "error");
+  }
+}
+
+async function applyBoardTemplate() {
+  if (!state.selectedTemplateId) {
+    showTemplateMessage("Select a template first.", "error");
+    return;
+  }
+  const name = $("#board-name").value.trim() || `Board ${new Date().toISOString().slice(0, 10)}`;
+  try {
+    const response = await requestJson(`/api/board-templates/${encodeURIComponent(state.selectedTemplateId)}/apply`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name }) });
+    if (!response.ok) throw new Error(response.message);
+    showTemplateMessage("Board created from template.", "success");
+    await loadBoards();
+  } catch (error) {
+    showTemplateMessage(error.message || "Unable to apply template", "error");
+  }
+}
+
+async function exportBoardTemplate() {
+  if (!state.selectedTemplateId) {
+    showTemplateMessage("Select a template first.", "error");
+    return;
+  }
+  try {
+    const response = await requestJson(`/api/board-templates/${encodeURIComponent(state.selectedTemplateId)}/export`);
+    if (!response.ok) throw new Error(response.message);
+    const blob = new Blob([JSON.stringify(response.data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `taskdeck-board-template-${response.data?.name || "export"}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+    showTemplateMessage("Template exported.", "success");
+  } catch (error) {
+    showTemplateMessage(error.message || "Unable to export template", "error");
+  }
+}
+
+async function importBoardTemplate(file) {
+  try {
+    const text = await file.text();
+    const exportData = JSON.parse(text);
+    const response = await requestJson("/api/board-templates/import", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(exportData) });
+    if (!response.ok) throw new Error(response.message);
+    showTemplateMessage("Template imported.", "success");
+    state.selectedTemplateId = response.data?.id || null;
+    await loadBoardTemplates();
+  } catch (error) {
+    showTemplateMessage(error.message || "Unable to import template", "error");
+  }
+}
+
+async function deleteBoardTemplate() {
+  if (!state.selectedTemplateId) {
+    showTemplateMessage("Select a template first.", "error");
+    return;
+  }
+  if (!confirm("Delete template?")) return;
+  try {
+    const response = await requestJson(`/api/board-templates/${encodeURIComponent(state.selectedTemplateId)}`, { method: "DELETE" });
+    if (!response.ok) throw new Error(response.message);
+    state.selectedTemplateId = null;
+    await loadBoardTemplates();
+  } catch (error) {
+    showTemplateMessage(error.message || "Unable to delete template", "error");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Resource quotas
+// ---------------------------------------------------------------------------
+
+async function loadQuotas() {
+  const requestId = ++state.quotaRequest;
+  try {
+    const response = await requestJson("/api/quotas");
+    if (requestId !== state.quotaRequest) return;
+    if (!response.ok) throw new Error(response.message);
+    state.quotas = response.data?.quotas || [];
+    state.quotaSessions = response.data?.sessions || [];
+    renderQuotas();
+  } catch (error) {
+    if (requestId === state.quotaRequest) console.warn("quotas unavailable", error);
+  }
+}
+
+function renderQuotas() {
+  const list = $("#quotas-list");
+  if (!list) return;
+  list.innerHTML = state.quotas.length
+    ? state.quotas.map((quota) => `<article class="quota-row">
+        <strong>${quota.session ? escapeHtml(quota.session) : "node"}</strong>
+        <span class="muted">max ${quota.max_running_tasks} running</span>
+        <button class="button compact danger" type="button" data-quota-delete="${escapeAttr(quota.id)}">${t("action.delete")}</button>
+      </article>`).join("")
+    : `<div class="muted">${t("settings.noQuotas")}</div>`;
+  const datalist = $("#quota-session-options");
+  if (datalist) datalist.innerHTML = state.quotaSessions.map((session) => `<option value="${escapeAttr(session)}"></option>`).join("");
+}
+
+async function submitQuota(event) {
+  event.preventDefault();
+  const session = $("#quota-session").value.trim();
+  const body = { session: session || null, max_running_tasks: Number($("#quota-max").value) };
+  try {
+    const response = await requestJson("/api/quotas", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    if (!response.ok) throw new Error(response.message);
+    showSettingsMessage("#quota-message", "Quota added.", "success");
+    $("#quota-session").value = "";
+    await loadQuotas();
+  } catch (error) {
+    showSettingsMessage("#quota-message", error.message || "Unable to add quota", "error");
+  }
+}
+
+async function deleteQuota(id) {
+  try {
+    const response = await requestJson(`/api/quotas/${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (!response.ok) throw new Error(response.message);
+    await loadQuotas();
+  } catch (error) {
+    showToast(error.message || "Unable to delete quota");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// API tokens
+// ---------------------------------------------------------------------------
+
+async function loadApiTokens() {
+  const requestId = ++state.apiTokenRequest;
+  try {
+    const response = await requestJson("/api/tokens");
+    if (requestId !== state.apiTokenRequest) return;
+    if (!response.ok) throw new Error(response.message);
+    state.apiTokens = response.data?.tokens || [];
+    renderApiTokens();
+  } catch (error) {
+    if (requestId === state.apiTokenRequest) console.warn("tokens unavailable", error);
+  }
+}
+
+function renderApiTokens() {
+  const list = $("#tokens-list");
+  if (!list) return;
+  list.innerHTML = state.apiTokens.length
+    ? state.apiTokens.map((token) => `<article class="token-row ${token.revoked ? "revoked" : ""}">
+        <strong>${escapeHtml(token.name)}</strong>
+        <code class="muted">${escapeHtml(token.token_prefix)}…</code>
+        <span class="muted">created ${escapeHtml(formatTimestamp(token.created_at_ms))}</span>
+        ${token.last_used_at_ms ? `<span class="muted">used ${escapeHtml(formatTimestamp(token.last_used_at_ms))}</span>` : ""}
+        ${token.revoked ? '<span class="status-pill error">revoked</span>' : `<button class="button compact danger" type="button" data-token-revoke="${escapeAttr(token.id)}">Revoke</button>`}
+      </article>`).join("")
+    : `<div class="muted">${t("settings.noTokens")}</div>`;
+}
+
+async function submitApiToken(event) {
+  event.preventDefault();
+  const name = $("#token-name").value.trim();
+  if (!name) return;
+  try {
+    const response = await requestJson("/api/tokens", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name }) });
+    if (!response.ok) throw new Error(response.message);
+    const secret = response.data?.secret || "";
+    showSettingsMessage("#token-message", `Token created. Copy the secret now — it is shown only once: ${secret}`, "success");
+    $("#token-name").value = "";
+    await loadApiTokens();
+  } catch (error) {
+    showSettingsMessage("#token-message", error.message || "Unable to create token", "error");
+  }
+}
+
+async function revokeApiToken(id) {
+  try {
+    const response = await requestJson(`/api/tokens/${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (!response.ok) throw new Error(response.message);
+    await loadApiTokens();
+  } catch (error) {
+    showToast(error.message || "Unable to revoke token");
+  }
+}
+
 function updateEndpoint() {
   const endpoint = `${location.origin}/mcp`;
   $("#endpoint-label").textContent = endpoint.replace(/^https?:\/\//, "");
@@ -2844,15 +4085,23 @@ function tick() {
     loadWorkspaces().catch(() => {});
   } else if (state.view === "workflows") {
     loadWorkflowGroups().catch(() => {});
+    loadDependencies().catch(() => {});
   } else if (state.view === "boards") {
     loadBoards().catch(() => {});
+  } else if (state.view === "dashboard") {
+    loadNodeMetrics();
+  } else if (state.view === "alerts") {
+    loadAlerts().catch(() => {});
   }
 }
 
 applySavedPreferences();
+applyI18n();
 bindEvents();
 updateEndpoint();
 setView("tasks");
 loadNodes();
 setInterval(tick, 1000);
 setInterval(loadNodes, 5000);
+setInterval(updateUnreadBadge, 5000);
+updateUnreadBadge();

@@ -164,7 +164,31 @@ pub struct WorkflowGroupMember {
     pub task: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowGraphNodePosition {
+    #[serde(default)]
+    pub x: f64,
+    #[serde(default)]
+    pub y: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowGraphEdge {
+    #[serde(default)]
+    pub from: usize,
+    #[serde(default)]
+    pub to: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowGraph {
+    #[serde(default)]
+    pub positions: Vec<WorkflowGraphNodePosition>,
+    #[serde(default)]
+    pub edges: Vec<WorkflowGraphEdge>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkflowGroup {
     pub id: String,
     pub name: String,
@@ -172,13 +196,17 @@ pub struct WorkflowGroup {
     pub updated_at_ms: u64,
     #[serde(default)]
     pub members: Vec<WorkflowGroupMember>,
+    #[serde(default)]
+    pub graph: WorkflowGraph,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkflowGroupInput {
     pub name: String,
     #[serde(default)]
     pub members: Vec<WorkflowGroupMember>,
+    #[serde(default)]
+    pub graph: WorkflowGraph,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -214,7 +242,7 @@ pub struct WorkflowGroupMemberView {
     pub skip_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkflowGroupView {
     pub id: String,
     pub name: String,
@@ -222,9 +250,11 @@ pub struct WorkflowGroupView {
     pub updated_at_ms: u64,
     #[serde(default)]
     pub members: Vec<WorkflowGroupMemberView>,
+    #[serde(default)]
+    pub graph: WorkflowGraph,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkflowGroupsView {
     #[serde(default)]
     pub groups: Vec<WorkflowGroupView>,
@@ -359,6 +389,354 @@ pub struct WorkflowGroupActionSummary {
     pub success_count: usize,
     pub failed_count: usize,
     pub skipped_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowRevision {
+    pub group_id: String,
+    pub revision: u64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub members: Vec<WorkflowGroupMember>,
+    #[serde(default)]
+    pub graph: WorkflowGraph,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowRevisionsView {
+    pub group_id: String,
+    pub group_name: String,
+    #[serde(default)]
+    pub revisions: Vec<WorkflowRevision>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceQuota {
+    pub id: String,
+    pub node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    pub max_running_tasks: u32,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceQuotaInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    pub max_running_tasks: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceQuotasView {
+    #[serde(default)]
+    pub quotas: Vec<WorkspaceQuota>,
+    #[serde(default)]
+    pub sessions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotificationRule {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub event_types: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotificationRuleInput {
+    pub name: String,
+    #[serde(default)]
+    pub event_types: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Notification {
+    pub id: u64,
+    pub node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_name: Option<String>,
+    pub event_type: String,
+    pub severity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    pub title: String,
+    pub message: String,
+    #[serde(default)]
+    pub read: bool,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotificationsView {
+    #[serde(default)]
+    pub notifications: Vec<Notification>,
+    #[serde(default)]
+    pub unread_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotificationMarkReadInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
+    #[serde(default)]
+    pub all: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiToken {
+    pub id: String,
+    pub name: String,
+    pub token_prefix: String,
+    pub created_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at_ms: Option<u64>,
+    #[serde(default)]
+    pub revoked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiTokenInput {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiTokenCreated {
+    #[serde(flatten)]
+    pub token: ApiToken,
+    pub secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiTokensView {
+    #[serde(default)]
+    pub tokens: Vec<ApiToken>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BoardTemplate {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub cards: Vec<BoardCardInput>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BoardTemplateInput {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub cards: Vec<BoardCardInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_board_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BoardTemplateApplyInput {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BoardTemplateExport {
+    pub kind: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub cards: Vec<BoardCardInput>,
+    pub exported_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BoardTemplatesView {
+    #[serde(default)]
+    pub templates: Vec<BoardTemplate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskDependency {
+    pub id: String,
+    pub node_id: String,
+    pub session: String,
+    pub task: String,
+    pub depends_node_id: String,
+    pub depends_session: String,
+    pub depends_task: String,
+    #[serde(default = "default_required_state")]
+    pub required_state: String,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskDependencyInput {
+    pub node_id: String,
+    pub session: String,
+    pub task: String,
+    pub depends_node_id: String,
+    pub depends_session: String,
+    pub depends_task: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_state: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskDependencyView {
+    #[serde(flatten)]
+    pub dependency: TaskDependency,
+    pub target_exists: bool,
+    pub target_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskDependenciesView {
+    #[serde(default)]
+    pub dependencies: Vec<TaskDependencyView>,
+    #[serde(default)]
+    pub targets: Vec<WorkflowTargetView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NodeMetricsSample {
+    pub timestamp_ms: u64,
+    pub cpu_percent: f32,
+    pub memory_bytes: u64,
+    pub memory_total_bytes: u64,
+    #[serde(default)]
+    pub running_tasks: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct NodeMetricsEntryView {
+    pub node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_name: Option<String>,
+    pub online: bool,
+    pub is_self: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<NodeMetricsSample>,
+    #[serde(default)]
+    pub samples: Vec<NodeMetricsSample>,
+    #[serde(default)]
+    pub session_count: usize,
+    #[serde(default)]
+    pub task_status_counts: std::collections::BTreeMap<String, u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct NodeMetricsView {
+    #[serde(default)]
+    pub nodes: Vec<NodeMetricsEntryView>,
+    #[serde(default)]
+    pub task_status_counts: std::collections::BTreeMap<String, u32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScalingMetric {
+    CpuPercent,
+    MemoryBytes,
+}
+
+impl ScalingMetric {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ScalingMetric::CpuPercent => "cpu_percent",
+            ScalingMetric::MemoryBytes => "memory_bytes",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScalingPolicy {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub watch_node_id: String,
+    pub watch_session: String,
+    pub watch_task: String,
+    pub metric: ScalingMetric,
+    pub scale_out_threshold: f64,
+    pub scale_in_threshold: f64,
+    pub scale_out_node_id: String,
+    pub scale_out_session: String,
+    pub scale_out_task: String,
+    pub cooldown_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_action_ms: Option<u64>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScalingPolicyInput {
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub watch_node_id: String,
+    pub watch_session: String,
+    pub watch_task: String,
+    pub metric: ScalingMetric,
+    pub scale_out_threshold: f64,
+    pub scale_in_threshold: f64,
+    pub scale_out_node_id: String,
+    pub scale_out_session: String,
+    pub scale_out_task: String,
+    #[serde(default = "default_cooldown_seconds")]
+    pub cooldown_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScalingPoliciesView {
+    #[serde(default)]
+    pub policies: Vec<ScalingPolicy>,
+    #[serde(default)]
+    pub targets: Vec<WorkflowTargetView>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_required_state() -> String {
+    "running".to_string()
+}
+
+fn default_cooldown_seconds() -> u64 {
+    300
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize, PartialEq, Eq)]

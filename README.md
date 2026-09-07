@@ -296,6 +296,94 @@ leader's state database and audited on writes.
 Task runs, events, and MCP calls are durably stored in each executor/control
 node's SQLite database. Logs remain in memory only.
 
+## Orchestration, quotas, alerts, and scaling
+
+Taskdeck closes several operational gaps with leader/node-local features that
+follow the same patterns as workflow groups and boards.
+
+**Workflow version history.** Every create and update of a workflow group is
+snapshotted into a revision history (the latest 50 revisions are kept per
+group). `GET /api/workflow-groups/{group}/revisions` lists revisions with
+name, members, orchestration graph, timestamp, and note; restoring an old
+revision (`POST .../revisions/{revision}/restore`) writes it back as a new
+revision tagged `restored from revision N`, so history is never rewritten.
+
+**Drag-and-drop orchestrator.** Workflow groups carry an orchestration graph:
+member card positions plus directed edges. The Workflows view renders the
+group as a canvas — drag cards to arrange steps, toggle Connect mode and click
+two cards to draw an execution edge (click an edge to remove it), then save
+the layout. `POST /api/workflow-groups/{group}/run` executes the members in
+topological order (ties break by member position), stopping on the first
+failure or skip unless the body sets `"stop_on_failure": false`. Cycles are
+rejected when saving and before running.
+
+**Resource quotas.** Quotas cap concurrent running tasks per workspace or
+node-wide (`session: null`):
+`GET/POST /api/quotas`, `PUT/DELETE /api/quotas/{id}`. They are enforced on
+the node that stores them: manual starts beyond the quota are rejected with
+`start blocked: … quota reached …`, and the cron scheduler skips due starts
+with a recorded event. A task restart does not consume quota headroom.
+
+**Notifications and alert rules.** Alert rules subscribe to task lifecycle
+events (`task_started`, `task_exited`, `task_failed`, `task_stopped`) with
+optional workspace/task scope and an optional webhook URL. Matching
+transitions are recorded as notifications (retained up to 1000) and delivered
+to the webhook as a JSON POST with a 5 second timeout. The Alerts view lists
+notifications with read state and manages rules; the topbar bell shows the
+unread count. Endpoints: `GET /api/notifications`,
+`POST /api/notifications/read`, and CRUD under `/api/notification-rules`.
+
+**API tokens for external integrations.** Create scoped bearer tokens from the
+Settings view or `POST /api/tokens` (the `tdk_…` secret is shown once). Calls
+with `Authorization: Bearer tdk_…` authenticate against the stored hash and
+update last-used time; revoked tokens stop working immediately. Combine with
+the existing REST surface for CI or other automation:
+
+```bash
+curl -H "Authorization: Bearer tdk_..." http://127.0.0.1:9837/api/sessions
+curl -X POST -H "Authorization: Bearer tdk_..." -H "Content-Type: application/json" \
+  -d '{"node":"self","session":"api","task":"dev","action":"start"}' \
+  http://127.0.0.1:9837/api/action
+```
+
+**Board templates.** Save any board as a reusable template
+(`POST /api/board-templates` with `source_board_id`), clone it back into a
+new board (`POST /api/board-templates/{id}/apply`), and share templates
+between nodes via `GET /api/board-templates/{id}/export` and
+`POST /api/board-templates/import` (JSON, `kind:
+"taskdeck_board_template"`).
+
+**Cross-workspace dependencies.** A task can declare start-gate dependencies
+on tasks in other workspaces or nodes
+(`POST /api/dependencies` with `node_id/session/task` and
+`depends_node_id/depends_session/depends_task`; cycles are rejected). Before
+a manual or scheduled start, every dependency must currently be `running`.
+Dependencies on remote nodes are evaluated from the leader's cached
+inventories; a worker can only observe dependencies on its own node, and
+cross-node gating should be dispatched through the leader.
+
+**Node dashboard.** Each daemon samples system CPU/memory plus running-task
+counts every second; workers include a sample with every inventory push.
+`GET /api/node-metrics` returns per-node ring buffers (up to 300 samples),
+current gauges, session counts, and task status totals. The Dashboard view
+renders gauges and sparklines per node, aggregate task status chips, and the
+auto-scaling policy panel.
+
+**Auto-scaling policies.** A policy watches one task's metric (`cpu_percent`
+or `memory_bytes`) on any visible node and starts or stops a designated
+replica task when the value stays above `scale_out_threshold` or below
+`scale_in_threshold` for three consecutive evaluations (5 second interval),
+respecting a cooldown. Actions go through the normal node dispatch (local or
+remote), are audited, recorded as events/notifications, and stored on the
+policy (`last_action`). CRUD lives under `/api/scaling-policies`.
+
+**Multi-language and small screens.** The Web UI ships with an EN/中文 toggle
+in the topbar (persisted per browser) covering navigation, dashboard,
+workflow/dependency, template, quota, token, and alert surfaces, and a
+responsive layout that collapses the sidebar to an icon rail and stacks
+panels on narrow viewports and touch devices. CLI, TUI, Web, and MCP all
+remain first-class terminals against the same daemon.
+
 ## MCP scope
 
 Configure an MCP client with:

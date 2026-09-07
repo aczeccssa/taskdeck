@@ -11,6 +11,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use uuid::Uuid;
 
 use crate::daemon::{DaemonState, dispatch_async_with_audit};
+use crate::protocol::NodeMetricsSample;
 use crate::protocol::{
     Action, AuditContext, AuditRecord, AuditStatus, EditableTaskInput, EventFilter,
     NodeSettingsPatch, NodeSummary, Request, Response, SessionSnapshot, TaskRunFilter,
@@ -38,6 +39,8 @@ pub enum AgentMessage {
     },
     Inventory {
         sessions: Vec<SessionSnapshot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node_metrics: Option<NodeMetricsSample>,
     },
     Heartbeat {
         timestamp_ms: u64,
@@ -187,6 +190,7 @@ pub struct LeaderCluster {
     inner: Arc<Mutex<LeaderClusterInner>>,
     enrollment_token: Option<String>,
     store: Arc<StateStore>,
+    node_metrics: Arc<crate::daemon::NodeMetricsStore>,
 }
 
 struct LeaderClusterInner {
@@ -227,7 +231,12 @@ impl LeaderCluster {
             })),
             enrollment_token,
             store,
+            node_metrics: Arc::new(crate::daemon::NodeMetricsStore::default()),
         })
+    }
+
+    pub fn node_metrics(&self) -> Arc<crate::daemon::NodeMetricsStore> {
+        self.node_metrics.clone()
     }
 
     fn validate_hello(&self, hello: &AgentMessage) -> Result<(String, String)> {
@@ -301,8 +310,16 @@ impl LeaderCluster {
         }
     }
 
-    fn update_inventory(&self, node_id: &str, sessions: Vec<SessionSnapshot>) -> Result<()> {
+    fn update_inventory(
+        &self,
+        node_id: &str,
+        sessions: Vec<SessionSnapshot>,
+        node_metrics: Option<NodeMetricsSample>,
+    ) -> Result<()> {
         let now = current_timestamp_ms();
+        if let Some(sample) = node_metrics {
+            self.node_metrics.push(node_id, sample);
+        }
         let (name, inventory_json) = {
             let mut inner = self.inner.lock().expect("leader cluster lock");
             let worker = inner
@@ -573,8 +590,14 @@ pub async fn serve_agent_socket(cluster: LeaderCluster, mut socket: WebSocket) {
             Err(_) => break,
         };
         match message {
-            AgentMessage::Inventory { sessions } => {
-                if cluster.update_inventory(&node_id, sessions).is_err() {
+            AgentMessage::Inventory {
+                sessions,
+                node_metrics,
+            } => {
+                if cluster
+                    .update_inventory(&node_id, sessions, node_metrics)
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -680,6 +703,7 @@ async fn run_worker_connection(
             _ = interval.tick() => {
                 send_worker(&mut writer, &AgentMessage::Inventory {
                     sessions: state.local_inventory(),
+                    node_metrics: state.node_metrics.latest(&settings.node_id),
                 }).await?;
                 send_worker(&mut writer, &AgentMessage::Heartbeat {
                     timestamp_ms: current_timestamp_ms(),
