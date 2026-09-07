@@ -2266,6 +2266,24 @@ async fn node_metrics(State(state): State<DaemonState>) -> Json<Response> {
             task_status_counts: status_counts,
         });
     }
+    // Pure masters have no self executor, so node_summaries() omits this node;
+    // the dashboard should still show the leader's own CPU/memory samples.
+    let self_node_id = state.public_settings().node_id;
+    if !entries.iter().any(|entry| entry.is_self) {
+        let samples = state
+            .node_metrics
+            .window(&self_node_id, crate::daemon::MAX_NODE_METRIC_SAMPLES);
+        entries.push(crate::protocol::NodeMetricsEntryView {
+            node_id: "self".to_string(),
+            node_name: Some(state.public_settings().name),
+            online: true,
+            is_self: true,
+            current: samples.last().cloned(),
+            samples,
+            session_count: 0,
+            task_status_counts: Default::default(),
+        });
+    }
     Json(Response::ok(
         "node metrics",
         NodeMetricsView {
@@ -5310,6 +5328,38 @@ mod tests {
         assert!(self_entry["is_self"].as_bool().unwrap());
         assert_eq!(self_entry["task_status_counts"]["idle"], 2);
         assert!(data["task_status_counts"]["idle"].as_u64().unwrap() >= 3);
+    }
+
+    #[tokio::test]
+    async fn node_metrics_includes_self_on_pure_master() {
+        let state = DaemonState::new();
+        let settings = state
+            .store
+            .configure(crate::state::NodeSettingsUpdate {
+                role: Some(crate::state::NodeRole::Leader),
+                leader_mode: Some(crate::state::LeaderMode::PureMaster),
+                ..Default::default()
+            })
+            .unwrap();
+        *state.settings.lock().expect("node settings lock") = settings;
+        // Seed one self sample the way the daemon sampler would.
+        state.node_metrics.push(
+            &state.public_settings().node_id,
+            crate::protocol::NodeMetricsSample {
+                timestamp_ms: current_millis(),
+                cpu_percent: 12.5,
+                memory_bytes: 1_000,
+                memory_total_bytes: 4_000,
+                running_tasks: 0,
+            },
+        );
+        let listed = get_json(state, "/api/node-metrics").await;
+        assert!(listed.ok, "{}", listed.message);
+        let nodes = listed.data.unwrap()["nodes"].as_array().unwrap().clone();
+        assert_eq!(nodes.len(), 1);
+        assert!(nodes[0]["is_self"].as_bool().unwrap());
+        assert_eq!(nodes[0]["current"]["cpu_percent"], 12.5);
+        assert_eq!(nodes[0]["session_count"], 0);
     }
 
     #[tokio::test]
