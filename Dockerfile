@@ -1,8 +1,14 @@
+FROM oven/bun:1.3.14 AS bun
+
 FROM rust:1.87-bookworm AS builder
 
 WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
+COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY frontend/package.json frontend/bun.lock ./frontend/
+RUN bun install --cwd frontend --frozen-lockfile
 COPY src ./src
+COPY frontend ./frontend
 RUN cargo build --locked --release
 
 FROM scratch AS artifact

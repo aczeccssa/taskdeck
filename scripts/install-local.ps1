@@ -43,6 +43,7 @@ if ($Sync) {
 }
 
 Require-Command cargo
+Require-Command bun
 $taskdeck = Get-Command taskdeck.exe -ErrorAction SilentlyContinue
 if ($taskdeck) {
     & $taskdeck.Source shutdown *> $null

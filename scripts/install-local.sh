@@ -10,7 +10,7 @@ usage() {
 Usage:
   install-local.sh [--sync]
 
-Build and install Taskdeck using cargo install.
+Build and install Taskdeck using cargo install. Bun 1.3.14+ is required because the React Web UI is embedded during the Cargo build.
 The running Taskdeck daemon is stopped before installation so its executable
 can be replaced safely on every supported platform.
 
@@ -42,6 +42,7 @@ esac
 
 [ "$sync_git" = false ] || taskdeck_git_sync
 taskdeck_require cargo
+taskdeck_require bun
 
 if command -v taskdeck >/dev/null 2>&1 && taskdeck shutdown >/dev/null 2>&1; then
     printf '%s\n' 'Stopped the running Taskdeck daemon.'
