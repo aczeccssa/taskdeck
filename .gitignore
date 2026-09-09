@@ -13,3 +13,4 @@ src/.DS_Store
 /frontend/.vite
 
 /.playwright-cli
+/.tmp

@@ -691,14 +691,108 @@ svg {
 }
 
 .worker-stage {
+    position: relative;
     display: grid;
     min-width: 0;
     min-height: 0;
     gap: 12px;
+    --split-position: .62;
 }
 
 .worker-stage.mode-split {
     grid-template-columns: minmax(0, 1fr) minmax(330px, 38%);
+}
+
+.worker-stage.mode-split .monitor-panel {
+    grid-column: 2;
+}
+
+.worker-stage:not(.mode-split) .split-divider {
+    display: none;
+}
+
+.split-divider {
+    position: absolute;
+    z-index: 2;
+    top: 50%;
+    left: var(--split-left, 62%);
+    display: grid;
+    box-sizing: border-box;
+    width: 8px;
+    min-width: 8px;
+    height: 68px;
+    min-height: 68px;
+    border: 0;
+    border-radius: 5px;
+    background: var(--surface-strong);
+    cursor: col-resize;
+    padding: 0;
+    touch-action: none;
+    transform: translate(-50%, -50%);
+    transition: background-color 160ms ease, left 260ms cubic-bezier(.22, 1, .36, 1);
+}
+
+.split-divider span {
+    display: grid;
+    place-self: center;
+    width: 3px;
+    height: 3px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 -7px 0 var(--accent), 0 7px 0 var(--accent);
+    opacity: 1;
+    transition: opacity 160ms ease, background-color 160ms ease;
+}
+
+.split-divider span::before,
+.split-divider span::after {
+    display: none;
+}
+
+.split-divider:hover,
+.split-divider.dragging,
+.split-divider:focus-visible {
+    background: color-mix(in oklab, var(--accent) 16%, var(--surface-strong));
+}
+
+.split-divider:hover span,
+.split-divider.dragging span,
+.split-divider:focus-visible span {
+    background: var(--accent);
+    opacity: 1;
+}
+
+.worker-stage.mode-split:not(.resizing) {
+    transition: grid-template-columns 260ms cubic-bezier(.22, 1, .36, 1);
+}
+
+.worker-stage.resizing:not(.snapping),
+.worker-stage.resizing:not(.snapping) .split-divider {
+    transition: none;
+}
+
+.worker-stage.snapping {
+    transition: grid-template-columns 240ms cubic-bezier(.22, 1, .36, 1);
+}
+
+.worker-stage.mode-split .log-panel,
+.worker-stage.mode-split .monitor-panel {
+    transition: opacity 180ms ease, transform 240ms cubic-bezier(.22, 1, .36, 1);
+}
+
+.worker-stage.snap-log .monitor-panel,
+.worker-stage.snap-monitor .log-panel {
+    opacity: 0;
+    transform: scaleX(.98);
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .worker-stage,
+    .worker-stage .log-panel,
+    .worker-stage .monitor-panel,
+    .split-divider {
+        transition-duration: 0ms !important;
+    }
 }
 
 .worker-stage.mode-monitor {
@@ -3681,6 +3775,10 @@ body,
     .worker-stage.mode-split {
         grid-template-columns: minmax(0, 1fr);
         grid-template-rows: minmax(320px, 1fr) minmax(280px, auto);
+    }
+
+    .split-divider {
+        display: none;
     }
 
     .monitor-panel {

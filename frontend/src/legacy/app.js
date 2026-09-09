@@ -59,6 +59,8 @@ const state = {
     scrollToMatch: false,
     suppressScroll: false,
     workspaceMode: localStorage.getItem("taskdeck-worker-mode") || "split",
+    splitPosition: 0.62,
+    splitSnapping: false,
     metrics: null,
     calls: [],
     callsSignature: "",
@@ -1579,8 +1581,12 @@ function ensureTaskScaffold() {
         <header class="monitor-header"><strong>Performance</strong><span id="monitor-state">Waiting</span></header>
         <div class="monitor-body" id="monitor-body"><div class="monitor-empty">No samples</div></div>
       </aside>
+            <button class="split-divider" id="split-divider" type="button" aria-label="Resize logs and performance panels" title="Resize panels">
+                <span aria-hidden="true"></span>
+            </button>
     </div>`;
     bindLogControls();
+        bindSplitDivider();
     applyWorkspaceMode();
 }
 
@@ -1927,6 +1933,12 @@ function applyWorkspaceMode() {
     const narrow = matchMedia("(max-width: 820px)").matches;
     const mode = state.workspaceMode;
     stage.className = `worker-stage mode-${mode}`;
+    stage.style.setProperty("--split-position", String(state.splitPosition));
+    if (mode === "split" && !matchMedia("(max-width: 1180px)").matches) {
+        updateSplitLayout(stage);
+    } else {
+        stage.style.removeProperty("grid-template-columns");
+    }
     $$("[data-mode]", $("#task-header")).forEach((button) => {
         const active = button.dataset.mode === mode || (narrow && button.dataset.mode === "log" && mode === "split");
         button.classList.toggle("active", active);
@@ -1934,7 +1946,92 @@ function applyWorkspaceMode() {
     });
 }
 
+function updateSplitLayout(stage = $("#worker-stage")) {
+    if (!stage || state.workspaceMode !== "split" || matchMedia("(max-width: 1180px)").matches) return;
+    const width = stage.getBoundingClientRect().width;
+    if (!width) return;
+    const gap = 12;
+    const logWidth = Math.round((width - gap) * state.splitPosition);
+    stage.style.gridTemplateColumns = `minmax(0, ${logWidth}px) minmax(0, 1fr)`;
+    $("#split-divider")?.style.setProperty("--split-left", `${logWidth + gap / 2}px`);
+}
+
+function snapWorkspaceMode(mode, stage) {
+    if (state.splitSnapping) return;
+    state.splitSnapping = true;
+    const width = stage.getBoundingClientRect().width;
+    stage.classList.add("snapping", `snap-${mode}`);
+    stage.style.gridTemplateColumns = mode === "log"
+        ? `minmax(0, ${width - 12}px) minmax(0, 0px)`
+        : `minmax(0, 0px) minmax(0, ${width - 12}px)`;
+    setTimeout(() => {
+        state.splitSnapping = false;
+        setWorkspaceMode(mode);
+    }, 240);
+}
+
+function bindSplitDivider() {
+    const divider = $("#split-divider");
+    const stage = $("#worker-stage");
+    if (!divider || !stage) return;
+
+    const positionFromPointer = (event) => {
+        const bounds = stage.getBoundingClientRect();
+        return (event.clientX - bounds.left) / bounds.width;
+    };
+    const updatePosition = (position) => {
+        if (position <= 0.25) {
+            snapWorkspaceMode("monitor", stage);
+            return;
+        }
+        if (position >= 0.75) {
+            snapWorkspaceMode("log", stage);
+            return;
+        }
+        state.splitPosition = Math.max(0.25, Math.min(0.75, position));
+        stage.style.setProperty("--split-position", String(state.splitPosition));
+        updateSplitLayout(stage);
+    };
+
+    divider.addEventListener("pointerdown", (event) => {
+        if (state.workspaceMode !== "split" || matchMedia("(max-width: 1180px)").matches) return;
+        divider.setPointerCapture(event.pointerId);
+        divider.classList.add("dragging");
+        stage.classList.add("resizing");
+        updatePosition(positionFromPointer(event));
+        event.preventDefault();
+    });
+    divider.addEventListener("pointermove", (event) => {
+        if (!divider.hasPointerCapture(event.pointerId)) return;
+        updatePosition(positionFromPointer(event));
+    });
+    const finish = (event) => {
+        if (!divider.hasPointerCapture(event.pointerId)) return;
+        divider.releasePointerCapture(event.pointerId);
+        divider.classList.remove("dragging");
+        stage.classList.remove("resizing");
+    };
+    divider.addEventListener("pointerup", finish);
+    divider.addEventListener("pointercancel", finish);
+    divider.addEventListener("keydown", (event) => {
+        if (state.workspaceMode !== "split") return;
+        if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+            state.splitPosition += event.key === "ArrowLeft" ? -0.04 : 0.04;
+            state.splitPosition = Math.max(0.25, Math.min(0.75, state.splitPosition));
+            applyWorkspaceMode();
+            event.preventDefault();
+        } else if (event.key === "Home") {
+            setWorkspaceMode("log");
+            event.preventDefault();
+        } else if (event.key === "End") {
+            setWorkspaceMode("monitor");
+            event.preventDefault();
+        }
+    });
+}
+
 function setWorkspaceMode(mode) {
+    if (mode === "split" && state.workspaceMode !== "split") state.splitPosition = 0.62;
     state.workspaceMode = mode;
     localStorage.setItem("taskdeck-worker-mode", mode);
     applyWorkspaceMode();
