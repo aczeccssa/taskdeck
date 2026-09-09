@@ -11,7 +11,6 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
 use chrono::{DateTime, Local, TimeZone, Utc};
-use clap::ValueEnum;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -37,15 +36,10 @@ pub const AUDIT_RETENTION_LIMIT: usize = 10_000;
 pub const WORKFLOW_REVISION_RETENTION_LIMIT: usize = 50;
 pub const NOTIFICATION_RETENTION_LIMIT: usize = 1_000;
 
+pub use crate::protocol::{LeaderMode, NodeRole, PublicNodeSettings};
+
 #[cfg(test)]
 use crate::protocol::TaskStatus;
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeRole {
-    Worker,
-    Leader,
-}
 
 impl NodeRole {
     fn as_str(self) -> &'static str {
@@ -66,14 +60,6 @@ impl NodeRole {
     pub fn as_label(self) -> &'static str {
         self.as_str()
     }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum LeaderMode {
-    Standard,
-    #[value(name = "pure-master")]
-    PureMaster,
 }
 
 impl LeaderMode {
@@ -153,19 +139,6 @@ impl NodeSettings {
         }
         Ok(())
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PublicNodeSettings {
-    pub node_id: String,
-    pub name: String,
-    pub role: NodeRole,
-    pub leader_mode: LeaderMode,
-    pub leader_url: Option<String>,
-    pub has_enrollment_token: bool,
-    pub bind_host: String,
-    pub web_port: u16,
-    pub execution_enabled: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -4021,7 +3994,7 @@ mod tests {
         assert_eq!(store.unread_notification_count().unwrap(), 0);
         assert_eq!(store.notifications(10).unwrap().len(), 2);
 
-        for index in 0..(NOTIFICATION_RETENTION_LIMIT + 5) {
+        for _index in 0..(NOTIFICATION_RETENTION_LIMIT + 5) {
             store
                 .insert_notification(
                     "node-1",
