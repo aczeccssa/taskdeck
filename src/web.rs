@@ -7,7 +7,7 @@ use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Redirect, Response as AxumResponse};
+use axum::response::{IntoResponse, Redirect, Response as AxumResponse};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -41,10 +41,14 @@ pub async fn serve(state: DaemonState, listener: tokio::net::TcpListener) -> Res
 fn app(state: DaemonState) -> Router {
     Router::new()
         .route("/", get(index))
-        .route("/assets/styles.css", get(styles))
-        .route("/assets/app.js", get(script))
-        .route("/favicon.svg", get(favicon))
-        .route("/favicon.ico", get(favicon))
+        .route("/dashboard", get(index))
+        .route("/workflows", get(index))
+        .route("/boards", get(index))
+        .route("/alerts", get(index))
+        .route("/calls", get(index))
+        .route("/audit", get(index))
+        .route("/docs", get(index))
+        .route("/settings", get(index))
         .route("/healthz", get(health))
         .route("/api/agent/connect", get(agent_connect))
         .route("/api/nodes", get(list_nodes))
@@ -160,9 +164,10 @@ fn app(state: DaemonState) -> Router {
         .route("/mcp", post(mcp))
         .route("/api/task-runs", get(list_task_runs))
         .route("/api/events", get(list_events_route))
-        .route("/login", get(login_page).post(login_submit))
+        .route("/login", get(index).post(login_submit))
         .route("/logout", post(logout))
         .route("/me", get(auth_status))
+        .route("/{*asset_path}", get(static_asset))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -170,31 +175,51 @@ fn app(state: DaemonState) -> Router {
         .with_state(state)
 }
 
-async fn index() -> Html<&'static str> {
-    Html(INDEX_HTML)
+pub(crate) struct EmbeddedAsset {
+    path: &'static str,
+    bytes: &'static [u8],
 }
 
-async fn styles() -> impl IntoResponse {
-    (
-        [
-            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        STYLES_CSS,
-    )
+include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
+
+async fn index() -> AxumResponse {
+    embedded_asset_response("/index.html", false)
 }
 
-async fn script() -> impl IntoResponse {
-    (
-        [
-            (
-                header::CONTENT_TYPE,
-                "application/javascript; charset=utf-8",
-            ),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        APP_JS,
-    )
+async fn static_asset(Path(asset_path): Path<String>) -> AxumResponse {
+    if asset_path.contains("..") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    embedded_asset_response(&format!("/{asset_path}"), asset_path.starts_with("assets/"))
+}
+
+fn embedded_asset_response(path: &str, immutable: bool) -> AxumResponse {
+    let Some(asset) = EMBEDDED_ASSETS.iter().find(|asset| asset.path == path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let content_type = match path.rsplit('.').next().unwrap_or_default() {
+        "html" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "application/javascript; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        _ => "application/octet-stream",
+    };
+    let cache_control = if immutable {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    AxumResponse::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, cache_control)
+        .body(Body::from(asset.bytes.to_vec()))
+        .expect("valid embedded frontend response")
 }
 
 async fn health() -> StatusCode {
@@ -261,7 +286,9 @@ async fn auth_middleware(
     let path = request.uri().path();
     let method = request.method().clone();
     let headers = request.headers().clone();
-    let exempt = path == "/health"
+    let exempt = path == "/"
+        || path == "/login"
+        || path == "/health"
         || path == "/healthz"
         || path.starts_with("/assets/")
         || path == "/favicon.svg"
@@ -284,17 +311,13 @@ async fn auth_middleware(
         return next.run(request).await;
     }
     if path == "/" && method.as_str() == "GET" {
-        return Html(LOGIN_HTML).into_response();
+        return index().await;
     }
     (
         StatusCode::UNAUTHORIZED,
         Json(json!({"kind":"unauthorized","status":401})),
     )
         .into_response()
-}
-
-async fn login_page() -> Html<String> {
-    Html(LOGIN_HTML.replace("%LOGIN_ERROR%", ""))
 }
 
 async fn login_submit(
@@ -312,11 +335,7 @@ async fn login_submit(
     match state.store.verify_access_key(&body.access_key) {
         Ok(true) => {}
         _ => {
-            return Html(LOGIN_HTML.replace(
-                "%LOGIN_ERROR%",
-                "<p class=\"form-error\">Invalid access key</p>",
-            ))
-            .into_response();
+            return index().await;
         }
     };
     match state.store.create_auth_session() {
@@ -330,10 +349,7 @@ async fn login_submit(
             );
             response
         }
-        Err(_) => {
-            Html(LOGIN_HTML.replace("%LOGIN_ERROR%", "<p class=\"form-error\">Login failed</p>"))
-                .into_response()
-        }
+        Err(_) => index().await,
     }
 }
 
@@ -365,16 +381,6 @@ async fn auth_status(State(state): State<DaemonState>, headers: HeaderMap) -> Js
         "authentication status",
         json!({"enabled":settings.enabled,"configured":settings.password_hash.is_some(),"authenticated":!settings.enabled||authenticated}),
     ))
-}
-
-async fn favicon() -> impl IntoResponse {
-    (
-        [
-            (header::CONTENT_TYPE, "image/svg+xml"),
-            (header::CACHE_CONTROL, "public, max-age=86400"),
-        ],
-        FAVICON_SVG,
-    )
 }
 
 async fn list_nodes(State(state): State<DaemonState>) -> Json<Response> {
@@ -3331,22 +3337,6 @@ async fn call_mcp_tool(
     }))
 }
 
-const INDEX_HTML: &str = include_str!("web/index.html");
-const STYLES_CSS: &str = include_str!("web/styles.css");
-const APP_JS: &str = include_str!("web/app.js");
-
-const LOGIN_HTML: &str = r#"<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Taskdeck</title>
-<style>:root{color-scheme:dark}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#111315;color:#e8eaed;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.card{width:min(380px,92vw);background:#191d20;border:1px solid #2b3237;padding:28px;border-radius:16px}h1{font-size:22px;margin:0 0 6px}p{margin:0;color:#9ba4a9;font-size:14px}form{display:flex;flex-direction:column;gap:14px;margin-top:24px}input{border-radius:10px;background:#22272b;border:1px solid #333b41;color:#fff;padding:11px 12px}button{background:#51c878;color:#04140a;border:0;border-radius:10px;padding:12px;font-weight:700}.form-error{color:#ff8080;margin-top:18px}</style></head>
-<body><main class="card"><h1>Taskdeck</h1><p>Enter your access key to continue.</p>%LOGIN_ERROR%<form method="post" action="/login"><label for="access_key">Access key</label><input id="access_key" name="access_key" type="password" autocomplete="current-password" required autofocus><button>Unlock</button></form></main></body></html>"#;
-
-const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Taskdeck">
-<rect width="32" height="32" rx="7" fill="#111315"/>
-<path d="M8 9h16M8 16h10M8 23h7" fill="none" stroke="#56b6c2" stroke-width="3" stroke-linecap="round"/>
-<circle cx="23" cy="23" r="3" fill="#51c878"/>
-</svg>"##;
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -3392,80 +3382,53 @@ mod tests {
     }
 
     #[test]
-    fn page_uses_split_assets_and_exposes_workspace_controls() {
-        assert!(INDEX_HTML.contains("/favicon.svg"));
-        assert!(INDEX_HTML.contains("/assets/styles.css"));
-        assert!(INDEX_HTML.contains("/assets/app.js"));
-        assert!(INDEX_HTML.contains("data-view=\"docs\""));
-        assert!(INDEX_HTML.contains("data-view=\"calls\""));
-        assert!(INDEX_HTML.contains("data-view=\"audit\""));
-        assert!(INDEX_HTML.contains("data-view=\"workflows\""));
-        assert!(INDEX_HTML.contains("id=\"workflows-view\""));
-        assert!(INDEX_HTML.contains("id=\"workflow-groups\""));
-        assert!(INDEX_HTML.contains("id=\"workflow-members\""));
-        assert!(INDEX_HTML.contains("id=\"ungrouped-workspaces\""));
-        assert!(INDEX_HTML.contains("id=\"audit-view\""));
-        assert!(INDEX_HTML.contains("id=\"audit-dialog\""));
-        assert!(INDEX_HTML.contains("id=\"config-dialog\""));
-        assert!(INDEX_HTML.contains("data-view=\"settings\""));
-        assert!(INDEX_HTML.contains("id=\"node-settings-form\""));
-        assert!(INDEX_HTML.contains("id=\"alias-form\""));
-        assert!(INDEX_HTML.contains("id=\"service-form\""));
-        assert!(APP_JS.contains("loadNodeSettings"));
-        assert!(APP_JS.contains("/api/workspaces"));
-        assert!(APP_JS.contains("/api/workflow-groups"));
-        assert!(APP_JS.contains("loadWorkflowGroups"));
-        assert!(APP_JS.contains("data-workflow-action"));
-        assert!(APP_JS.contains("/api/nodes/self/service"));
-        assert!(!INDEX_HTML.contains("<style>"));
-        assert!(!INDEX_HTML.contains("<script>const"));
-        assert!(STYLES_CSS.contains("prefers-color-scheme: dark"));
-        assert!(STYLES_CSS.contains("prefers-reduced-motion: reduce"));
-        assert!(STYLES_CSS.contains("sidebar-collapsed"));
-        assert!(STYLES_CSS.contains("workflow-layout"));
-        assert!(STYLES_CSS.contains("workflow-result"));
-        assert!(APP_JS.contains("/api/mcp-calls"));
-        assert!(APP_JS.contains("/api/audit"));
-        assert!(APP_JS.contains("loadAudit"));
-        assert!(APP_JS.contains("Loading audit records"));
-        assert!(APP_JS.contains("error-row"));
-        assert!(APP_JS.contains("auditSyncLabel"));
-        assert!(APP_JS.contains("/config"));
-        assert!(APP_JS.contains("/logs?"));
-        assert!(INDEX_HTML.contains("id=\"nodes\""));
-        assert!(APP_JS.contains("new URLSearchParams({ window: \"600\" })"));
-        assert!(APP_JS.contains("requestFullscreen"));
-        assert!(APP_JS.contains("taskdeck-log-tail"));
-        assert!(APP_JS.contains("taskdeck-seen-exits"));
-        assert!(APP_JS.contains("restart_markers_ms"));
-        assert!(INDEX_HTML.contains("data-call-mode=\"result\""));
-        assert!(FAVICON_SVG.contains("<svg"));
+    fn embedded_frontend_has_root_document_and_hashed_assets() {
+        assert!(
+            EMBEDDED_ASSETS
+                .iter()
+                .any(|asset| asset.path == "/index.html")
+        );
+        assert!(
+            EMBEDDED_ASSETS
+                .iter()
+                .any(|asset| asset.path.starts_with("/assets/") && asset.path.ends_with(".js"))
+        );
+        assert!(
+            EMBEDDED_ASSETS
+                .iter()
+                .any(|asset| asset.path.starts_with("/assets/") && asset.path.ends_with(".css"))
+        );
+        assert!(
+            EMBEDDED_ASSETS
+                .iter()
+                .any(|asset| asset.path == "/favicon.svg")
+        );
     }
 
     #[test]
-    fn mcp_drawer_preserves_human_readable_details_alongside_raw_payloads() {
-        for id in [
-            "detail-status-icon",
-            "call-overview",
-            "request-fields",
-            "response-summary",
-            "response-data",
-            "call-request",
-            "call-response",
-        ] {
-            assert!(
-                INDEX_HTML.contains(&format!("id=\"{id}\"")),
-                "missing MCP detail element #{id}"
-            );
-        }
-        assert!(INDEX_HTML.contains("data-call-mode=\"result\""));
-        assert!(INDEX_HTML.contains("data-call-mode=\"raw\""));
-        assert!(STYLES_CSS.contains(".detail-status-icon"));
-        assert!(STYLES_CSS.contains(".call-overview"));
-        assert!(STYLES_CSS.contains(".field-row"));
-        assert!(STYLES_CSS.contains(".outcome"));
-        assert!(APP_JS.contains("requestFields(call, target)"));
-        assert!(APP_JS.contains("renderResultData("));
+    fn embedded_asset_responses_use_expected_cache_headers() {
+        let html = embedded_asset_response("/index.html", false);
+        assert_eq!(
+            html.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            html.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
+        let asset = EMBEDDED_ASSETS
+            .iter()
+            .find(|asset| asset.path.starts_with("/assets/") && asset.path.ends_with(".js"))
+            .unwrap();
+        let response = embedded_asset_response(asset.path, true);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=31536000, immutable"
+        );
     }
 
     fn metrics_test_state() -> DaemonState {
@@ -4752,18 +4715,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_page_hides_the_error_placeholder_until_login_fails() {
+    async fn login_get_serves_the_react_shell() {
+        let response = http_route(DaemonState::new(), "GET", "/login", &[], None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_still_exposes_react_shell_and_hashed_assets() {
         let state = DaemonState::new();
         state.store.set_access_key("test-access-key").unwrap();
         state.store.configure_auth(true).unwrap();
-        let response = http_route(state, "GET", "/login", &[], None).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
+        let shell = http_route(state.clone(), "GET", "/", &[], None).await;
+        assert_eq!(shell.status(), StatusCode::OK);
+        let asset = EMBEDDED_ASSETS
+            .iter()
+            .find(|asset| asset.path.starts_with("/assets/") && asset.path.ends_with(".js"))
             .unwrap();
-        let body = String::from_utf8_lossy(&body);
-        assert!(body.contains("Enter your access key"));
-        assert!(!body.contains("%LOGIN_ERROR%"));
+        let static_asset = http_route(state, "GET", asset.path, &[], None).await;
+        assert_eq!(static_asset.status(), StatusCode::OK);
+        assert_eq!(
+            static_asset.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=31536000, immutable"
+        );
     }
 
     #[tokio::test]

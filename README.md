@@ -228,6 +228,32 @@ such as `0.0.0.0:3000` is reported as observed state, not claimed to be an
 externally reachable URL. Without `lsof`, Taskdeck degrades to static/log
 evidence instead of pretending a configured port is live.
 
+## React frontend development and embedded release
+
+The Web UI is a single React + TypeScript + Vite application in `frontend/`. It is
+built with Bun and is embedded into the Taskdeck executable; no `dist` directory,
+Node runtime, or external static-file server is needed when the daemon runs.
+
+Source builds require **Bun 1.3.14 or later**. `cargo build`, `cargo build --release`,
+Docker builds, and the local install scripts invoke the frontend build automatically.
+If Bun is unavailable, Cargo stops with a recovery command rather than shipping a
+stale UI.
+
+```bash
+# isolated, stateful browser mock API (the default frontend development mode)
+cd frontend && bun install --frozen-lockfile && bun run dev
+
+# real local daemon API, preserving same-origin cookies and paths
+TASKDECK_API_TARGET=http://127.0.0.1:9837 bun run dev:api
+
+# independently verify the strict TypeScript production bundle
+bun run build
+```
+
+`bun run dev` is intended for UI work without a daemon: writes to boards, workflow
+groups, templates, notifications, quotas, tokens, and related UI resources persist
+for the browser session. `dev:api` instead proxies the existing API unchanged.
+
 ## Web UI and APIs
 
 Single-user access-key authentication is disabled by default. To enable it,
