@@ -1,19 +1,26 @@
 //! systemd (Linux) service backend.
 
 use super::LINUX_UNIT;
-use super::{daemon_running, extract_environment_home, status_home, write_atomic, run_quiet, ServiceAction, ServiceSpec, ServiceStatus};
+use super::{
+    ServiceAction, ServiceSpec, ServiceStatus, daemon_running, extract_environment_home, run_quiet,
+    status_home, write_atomic,
+};
 
-use std::fs::{self, OpenOptions};
-use std::path::{Path, PathBuf};
-use std::process::Command;
 use super::command_output;
 use super::windows_backend::shell_quote;
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use std::fs::{self, OpenOptions};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::protocol::ServiceScope;
-pub(crate) fn linux(scope: ServiceScope, action: ServiceAction, spec: &ServiceSpec) -> Result<ServiceStatus> {
+pub(crate) fn linux(
+    scope: ServiceScope,
+    action: ServiceAction,
+    spec: &ServiceSpec,
+) -> Result<ServiceStatus> {
     let unit_path = linux_unit_path(scope)?;
     let unit = LINUX_UNIT.to_string();
     let mode = match scope {
@@ -112,4 +119,3 @@ WantedBy={wanted_by}
         home = shell_quote(&spec.home.display().to_string()),
     )
 }
-

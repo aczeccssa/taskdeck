@@ -147,21 +147,21 @@ pub(super) struct CommandResultCache {
 }
 
 impl CommandResultCache {
-pub(super)     fn new(capacity: usize) -> Self {
+    pub(super) fn new(capacity: usize) -> Self {
         Self {
             capacity,
             entries: VecDeque::new(),
         }
     }
 
-pub(super)     fn get(&self, id: &str) -> Option<Response> {
+    pub(super) fn get(&self, id: &str) -> Option<Response> {
         self.entries
             .iter()
             .find(|(entry_id, _)| entry_id == id)
             .map(|(_, response)| response.clone())
     }
 
-pub(super)     fn insert(&mut self, id: String, response: Response) {
+    pub(super) fn insert(&mut self, id: String, response: Response) {
         self.entries.push_back((id, response));
         while self.entries.len() > self.capacity {
             self.entries.pop_front();

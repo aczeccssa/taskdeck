@@ -53,27 +53,18 @@ use super::workflow_groups::*;
 use super::workflow_runs::*;
 use super::workspaces::*;
 pub(crate) async fn list_board_templates(State(state): State<DaemonState>) -> Json<Response> {
-
     Json(match state.store.board_templates() {
-
         Ok(templates) => Response::ok("board templates", BoardTemplatesView { templates }),
 
         Err(error) => Response::error(format!("{error:#}")),
-
     })
-
 }
 
-
-
 pub(crate) async fn create_board_template(
-
     State(state): State<DaemonState>,
 
     Json(input): Json<BoardTemplateInput>,
-
 ) -> Json<Response> {
-
     let started_at_ms = current_millis();
 
     let started = Instant::now();
@@ -81,25 +72,15 @@ pub(crate) async fn create_board_template(
     let mut input = input;
 
     if let Some(board_id) = input
-
         .source_board_id
-
         .clone()
-
         .filter(|board_id| !board_id.trim().is_empty())
-
     {
-
         input.cards = match state.store.board(&board_id) {
-
             Ok(Some(board)) => board
-
                 .cards
-
                 .into_iter()
-
                 .map(|card| BoardCardInput {
-
                     node_id: card.node_id,
 
                     session: card.session,
@@ -109,73 +90,47 @@ pub(crate) async fn create_board_template(
                     mode: card.mode,
 
                     pinned: card.pinned,
-
                 })
-
                 .collect(),
 
             Ok(None) => {
-
                 return Json(Response::error(format!("board '{board_id}' not found")));
-
             }
 
             Err(error) => {
-
                 return Json(Response::error(format!("{error:#}")));
-
             }
-
         };
-
     }
 
     let request = serde_json::to_value(&input).unwrap_or_else(|_| json!({}));
 
     let response = match state.store.create_board_template(input) {
-
         Ok(template) => Response::ok("board template created", template),
 
         Err(error) => Response::error(format!("{error:#}")),
-
     };
 
     record_feature_http_audit(
-
         &state,
-
         "board_template",
-
         "board_template_create",
-
         "template_id",
-
         None,
-
         request,
-
         &response,
-
         started_at_ms,
-
         started.elapsed().as_millis() as u64,
-
     );
 
     Json(response)
-
 }
 
-
-
 pub(crate) async fn import_board_template(
-
     State(state): State<DaemonState>,
 
     Json(export): Json<BoardTemplateExport>,
-
 ) -> Json<Response> {
-
     let started_at_ms = current_millis();
 
     let started = Instant::now();
@@ -183,13 +138,9 @@ pub(crate) async fn import_board_template(
     let request = serde_json::to_value(&export).unwrap_or_else(|_| json!({}));
 
     let response = if export.kind != "taskdeck_board_template" {
-
         Response::error("not a taskdeck board template export")
-
     } else {
-
         let input = BoardTemplateInput {
-
             name: export.name.clone(),
 
             description: export.description.clone(),
@@ -197,55 +148,35 @@ pub(crate) async fn import_board_template(
             cards: export.cards.clone(),
 
             source_board_id: None,
-
         };
 
         match state.store.create_board_template(input) {
-
             Ok(template) => Response::ok("board template imported", template),
 
             Err(error) => Response::error(format!("{error:#}")),
-
         }
-
     };
 
     record_feature_http_audit(
-
         &state,
-
         "board_template",
-
         "board_template_import",
-
         "template_id",
-
         None,
-
         request,
-
         &response,
-
         started_at_ms,
-
         started.elapsed().as_millis() as u64,
-
     );
 
     Json(response)
-
 }
 
-
-
 pub(crate) async fn delete_board_template(
-
     State(state): State<DaemonState>,
 
     Path(template): Path<String>,
-
 ) -> Json<Response> {
-
     let started_at_ms = current_millis();
 
     let started = Instant::now();
@@ -253,53 +184,35 @@ pub(crate) async fn delete_board_template(
     let request = json!({"id": template});
 
     let response = match state.store.delete_board_template(&template) {
-
         Ok(true) => Response::empty("board template deleted"),
 
         Ok(false) => Response::error(format!("board template '{template}' not found")),
 
         Err(error) => Response::error(format!("{error:#}")),
-
     };
 
     record_feature_http_audit(
-
         &state,
-
         "board_template",
-
         "board_template_delete",
-
         "template_id",
-
         Some(&template),
-
         request,
-
         &response,
-
         started_at_ms,
-
         started.elapsed().as_millis() as u64,
-
     );
 
     Json(response)
-
 }
 
-
-
 pub(crate) async fn apply_board_template(
-
     State(state): State<DaemonState>,
 
     Path(template): Path<String>,
 
     Json(input): Json<BoardTemplateApplyInput>,
-
 ) -> Json<Response> {
-
     let started_at_ms = current_millis();
 
     let started = Instant::now();
@@ -307,101 +220,64 @@ pub(crate) async fn apply_board_template(
     let request = json!({"template_id": template, "name": input.name});
 
     let response = match require_board_leader(&state) {
-
         Ok(()) => match state.store.board_template(&template) {
-
             Ok(Some(template)) => {
-
                 let board_input = BoardInput {
-
                     name: input.name,
 
                     cards: template.cards.clone(),
-
                 };
 
                 let scoped = match validate_board_scope(&state, &board_input) {
-
                     Err(response) => Err(response),
 
                     Ok(()) => state
-
                         .store
-
                         .create_board(board_input)
-
                         .map_err(|error| Response::error(format!("{error:#}"))),
-
                 };
 
                 match scoped {
-
                     Ok(board) => {
-
                         Response::ok("board created from template", board_view(&state, board))
-
                     }
 
                     Err(response) => response,
-
                 }
-
             }
 
             Ok(None) => Response::error(format!("board template '{template}' not found")),
 
             Err(error) => Response::error(format!("{error:#}")),
-
         },
 
         Err(response) => response,
-
     };
 
     record_feature_http_audit(
-
         &state,
-
         "board_template",
-
         "board_template_apply",
-
         "template_id",
-
         Some(&template),
-
         request,
-
         &response,
-
         started_at_ms,
-
         started.elapsed().as_millis() as u64,
-
     );
 
     Json(response)
-
 }
 
-
-
 pub(crate) async fn export_board_template(
-
     State(state): State<DaemonState>,
 
     Path(template): Path<String>,
-
 ) -> Json<Response> {
-
     Json(match state.store.board_template(&template) {
-
         Ok(Some(template)) => Response::ok(
-
             "board template export",
-
             BoardTemplateExport {
-
                 kind: "taskdeck_board_template".to_string(),
 
                 name: template.name,
@@ -411,20 +287,14 @@ pub(crate) async fn export_board_template(
                 cards: template.cards,
 
                 exported_at_ms: current_millis(),
-
             },
-
         ),
 
         Ok(None) => Response::error(format!("board template '{template}' not found")),
 
         Err(error) => Response::error(format!("{error:#}")),
-
     })
-
 }
-
-
 
 // ---------------------------------------------------------------------------
 

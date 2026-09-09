@@ -1,12 +1,11 @@
 //! Workspace quota persistence.
 
-
 use anyhow::{Context, Result, bail};
 use rusqlite::params;
 use uuid::Uuid;
 
-use super::util::*;
 use super::StateStore;
+use super::util::*;
 use crate::protocol::*;
 
 impl StateStore {
@@ -104,7 +103,6 @@ impl StateStore {
         let connection = self.connection.lock().expect("state store lock");
         Ok(connection.execute("DELETE FROM workspace_quotas WHERE id=?1", params![id])? > 0)
     }
-
 }
 
 pub(super) fn normalize_quota_session(session: Option<String>) -> Result<Option<String>> {
@@ -120,4 +118,3 @@ pub(super) fn normalize_quota_session(session: Option<String>) -> Result<Option<
         None => Ok(None),
     }
 }
-

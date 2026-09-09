@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use super::super::*;
 use super::super::audit::*;
 use super::super::client::*;
 use super::super::dispatch::*;
@@ -23,168 +22,124 @@ use super::super::scaling::*;
 use super::super::scheduler::*;
 use super::super::state::*;
 use super::super::util::*;
+use super::super::*;
 use super::helpers::*;
 use crate::config;
 use crate::protocol::*;
 use crate::runtime::{SessionRuntime, Sessions};
 use crate::state::{NodeRole, NodeSettings, StateStore};
 
-    #[tokio::test]
+#[tokio::test]
 
-    async fn dispatch_node_compatibility_wrapper_still_audits_failures() {
+async fn dispatch_node_compatibility_wrapper_still_audits_failures() {
+    let state = DaemonState::new();
 
-        let state = DaemonState::new();
+    let response = state
+        .dispatch_node(
+            "remote-on-worker",
+            crate::cluster::RemoteRequest::ListSessions,
+        )
+        .await;
 
-        let response = state
+    assert!(!response.ok);
 
-            .dispatch_node(
+    let page = state
+        .store
+        .list_audit(&crate::protocol::AuditFilter {
+            q: Some("worker nodes can only control".to_string()),
 
-                "remote-on-worker",
+            source: Some("internal".to_string()),
 
-                crate::cluster::RemoteRequest::ListSessions,
+            status: Some("error".to_string()),
 
-            )
+            node: None,
 
-            .await;
+            session: None,
 
-        assert!(!response.ok);
+            task: None,
 
-        let page = state
+            operation: Some("list_sessions".to_string()),
 
-            .store
+            page: 1,
 
-            .list_audit(&crate::protocol::AuditFilter {
+            page_size: 20,
+        })
+        .unwrap();
 
-                q: Some("worker nodes can only control".to_string()),
+    assert_eq!(page.total, 1);
 
-                source: Some("internal".to_string()),
+    let detail = state
+        .store
+        .audit_detail(&page.items[0].audit_id)
+        .unwrap()
+        .unwrap();
 
-                status: Some("error".to_string()),
+    assert_eq!(detail.details["node"], "remote-on-worker");
+}
 
-                node: None,
+#[tokio::test]
 
-                session: None,
+async fn leader_remote_worker_failures_are_audited_with_requested_executor() {
+    let state = DaemonState::new();
 
-                task: None,
+    let settings = state
+        .store
+        .configure(crate::state::NodeSettingsUpdate {
+            role: Some(crate::state::NodeRole::Leader),
 
-                operation: Some("list_sessions".to_string()),
+            ..crate::state::NodeSettingsUpdate::default()
+        })
+        .unwrap();
 
-                page: 1,
+    *state.settings.lock().expect("node settings lock") = settings.clone();
 
-                page_size: 20,
+    let response = state
+        .dispatch_node_with_audit(
+            "missing-worker",
+            crate::cluster::RemoteRequest::ListSessions,
+            AuditContext::new(AuditSource::Web, AuditTransport::Http),
+        )
+        .await;
 
-            })
+    assert!(!response.ok);
 
-            .unwrap();
+    let page = state
+        .store
+        .list_audit(&crate::protocol::AuditFilter {
+            q: Some("worker 'missing-worker' not found".to_string()),
 
-        assert_eq!(page.total, 1);
+            source: Some("web".to_string()),
 
-        let detail = state
+            status: Some("error".to_string()),
 
-            .store
+            node: Some("missing-worker".to_string()),
 
-            .audit_detail(&page.items[0].audit_id)
+            session: None,
 
-            .unwrap()
+            task: None,
 
-            .unwrap();
+            operation: Some("list_sessions".to_string()),
 
-        assert_eq!(detail.details["node"], "remote-on-worker");
+            page: 1,
 
-    }
+            page_size: 20,
+        })
+        .unwrap();
 
+    assert_eq!(page.total, 1);
 
-
-    #[tokio::test]
-
-    async fn leader_remote_worker_failures_are_audited_with_requested_executor() {
-
-        let state = DaemonState::new();
-
-        let settings = state
-
-            .store
-
-            .configure(crate::state::NodeSettingsUpdate {
-
-                role: Some(crate::state::NodeRole::Leader),
-
-                ..crate::state::NodeSettingsUpdate::default()
-
-            })
-
-            .unwrap();
-
-        *state.settings.lock().expect("node settings lock") = settings.clone();
-
-        let response = state
-
-            .dispatch_node_with_audit(
-
-                "missing-worker",
-
-                crate::cluster::RemoteRequest::ListSessions,
-
-                AuditContext::new(AuditSource::Web, AuditTransport::Http),
-
-            )
-
-            .await;
-
-        assert!(!response.ok);
-
-
-
-        let page = state
-
-            .store
-
-            .list_audit(&crate::protocol::AuditFilter {
-
-                q: Some("worker 'missing-worker' not found".to_string()),
-
-                source: Some("web".to_string()),
-
-                status: Some("error".to_string()),
-
-                node: Some("missing-worker".to_string()),
-
-                session: None,
-
-                task: None,
-
-                operation: Some("list_sessions".to_string()),
-
-                page: 1,
-
-                page_size: 20,
-
-            })
-
-            .unwrap();
-
-        assert_eq!(page.total, 1);
-
-        let detail = state
-
-            .store
-
-            .audit_detail(&page.items[0].audit_id)
-
-            .unwrap()
-
-            .unwrap();
-
-        assert_eq!(
-
-            detail.origin_node_id.as_deref(),
-
-            Some(settings.node_id.as_str())
-
-        );
-
-        assert_eq!(detail.executor_node_id.as_deref(), Some("missing-worker"));
-
-        assert_eq!(detail.source, AuditSource::Web);
-
-    }
+    let detail = state
+        .store
+        .audit_detail(&page.items[0].audit_id)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        detail.origin_node_id.as_deref(),
+        Some(settings.node_id.as_str())
+    );
+
+    assert_eq!(detail.executor_node_id.as_deref(), Some("missing-worker"));
+
+    assert_eq!(detail.source, AuditSource::Web);
+}

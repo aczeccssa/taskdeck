@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use rusqlite::params;
 
-use super::util::*;
 use super::StateStore;
+use super::util::*;
 
 impl StateStore {
     pub fn registrations(&self) -> Result<Vec<Registration>> {
@@ -76,7 +76,6 @@ impl StateStore {
             })
             .collect())
     }
-
 }
 
 impl StateStore {
@@ -87,7 +86,6 @@ impl StateStore {
             params![session],
         )? > 0)
     }
-
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

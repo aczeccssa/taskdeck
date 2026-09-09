@@ -265,6 +265,4 @@ impl StateStore {
         store.initialize()?;
         Ok(store)
     }
-
-
 }

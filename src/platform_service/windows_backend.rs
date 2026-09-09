@@ -1,15 +1,18 @@
 //! schtasks (Windows) service backend.
 
+use super::{
+    ServiceAction, ServiceSpec, ServiceStatus, daemon_running, extract_environment_home, run_quiet,
+    status_home, write_atomic,
+};
 use super::{WINDOWS_TASK, WINDOWS_WRAPPER};
-use super::{daemon_running, extract_environment_home, status_home, write_atomic, run_quiet, ServiceAction, ServiceSpec, ServiceStatus};
 
-use std::fs::{self, OpenOptions};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use super::command_output;
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use super::command_output;
+use std::fs::{self, OpenOptions};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::protocol::ServiceScope;
 pub(crate) fn windows(
@@ -105,4 +108,3 @@ pub(crate) fn xml_escape(value: &str) -> String {
 pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
-

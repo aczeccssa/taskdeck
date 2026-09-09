@@ -6,8 +6,8 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
-use super::util::*;
 use super::StateStore;
+use super::util::*;
 use crate::protocol::*;
 
 impl StateStore {
@@ -110,7 +110,6 @@ impl StateStore {
         let connection = self.connection.lock().expect("state store lock");
         read_node_settings(&connection)
     }
-
 }
 
 impl StateStore {
@@ -133,7 +132,6 @@ impl StateStore {
         )?;
         Ok(())
     }
-
 }
 
 impl StateStore {
@@ -153,7 +151,6 @@ impl StateStore {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("failed to read known workers")
     }
-
 }
 
 impl NodeRole {
@@ -360,4 +357,3 @@ pub fn environment_overrides() -> Vec<crate::protocol::EnvironmentOverride> {
     })
     .collect()
 }
-

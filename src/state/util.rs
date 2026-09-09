@@ -5,7 +5,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
-
 pub(super) fn parse_sql_json(value: String, column: usize) -> rusqlite::Result<serde_json::Value> {
     serde_json::from_str(&value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -40,7 +39,11 @@ pub(super) fn required_metadata(connection: &Connection, key: &str) -> Result<St
     get_metadata(connection, key)?.with_context(|| format!("missing state key '{key}'"))
 }
 
-pub(super) fn write_optional_metadata(connection: &Connection, key: &str, value: Option<&str>) -> Result<()> {
+pub(super) fn write_optional_metadata(
+    connection: &Connection,
+    key: &str,
+    value: Option<&str>,
+) -> Result<()> {
     match value {
         Some(value) => set_metadata(connection, key, value),
         None => {
@@ -63,4 +66,3 @@ pub(super) fn current_timestamp_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
-

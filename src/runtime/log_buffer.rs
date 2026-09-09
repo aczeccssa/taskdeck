@@ -36,7 +36,6 @@ use crate::protocol::{
 };
 use crate::service;
 
-
 const MAX_LOG_LINES: usize = 5_000;
 static NEXT_LOG_GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -66,7 +65,7 @@ impl Default for LogBuffer {
 }
 
 impl LogBuffer {
-pub(super)     fn push(&mut self, stream: &str, text: impl Into<String>) {
+    pub(super) fn push(&mut self, stream: &str, text: impl Into<String>) {
         self.next_seq += 1;
         if self.lines.len() >= MAX_LOG_LINES {
             self.lines.pop_front();
@@ -78,7 +77,7 @@ pub(super)     fn push(&mut self, stream: &str, text: impl Into<String>) {
         });
     }
 
-pub(super)     fn snapshot(&self, after: Option<u64>, limit: usize) -> TaskLogsSnapshot {
+    pub(super) fn snapshot(&self, after: Option<u64>, limit: usize) -> TaskLogsSnapshot {
         let limit = limit.clamp(1, MAX_LOG_LINES);
         let first_seq = self.lines.front().map(|line| line.seq);
         let mut reset = after.is_some_and(|after| after > self.next_seq)
@@ -105,7 +104,7 @@ pub(super)     fn snapshot(&self, after: Option<u64>, limit: usize) -> TaskLogsS
         }
     }
 
-pub(super)     fn clear(&mut self) {
+    pub(super) fn clear(&mut self) {
         *self = Self::default();
     }
 }

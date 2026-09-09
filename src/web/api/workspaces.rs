@@ -51,52 +51,36 @@ use super::scaling::*;
 use super::sessions::*;
 use super::tokens::*;
 use super::workflow_groups::*;
-use super::workflow_runs::*;
 use super::workflow_groups::{ordered_task_labels, workflow_context, workflow_targets};
+use super::workflow_runs::*;
 pub(crate) async fn list_workspaces(
-
     State(state): State<DaemonState>,
 
     Query(query): Query<HashMap<String, String>>,
-
 ) -> Json<Response> {
-
     let node = match selected_node(&state, &query) {
-
         Ok(node) => node,
 
         Err(response) => return Json(response),
-
     };
 
     let request = RemoteRequest::ListWorkspaces;
 
     let response = state
-
         .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
-
         .await;
 
     if response.ok || node == "self" {
-
         return Json(response);
-
     }
 
     if let Some(inventory) = state.cluster.cached_inventory(&node) {
-
         let summaries = inventory
-
             .into_iter()
-
             .map(|session| crate::protocol::WorkspaceSummary {
-
                 display_name: session
-
                     .alias
-
                     .clone()
-
                     .unwrap_or_else(|| session.name.clone()),
 
                 session: session.name,
@@ -104,23 +88,16 @@ pub(crate) async fn list_workspaces(
                 alias: session.alias,
 
                 project: session.project,
-
             })
-
             .collect::<Vec<_>>();
 
         return Json(Response::ok("cached workspaces", summaries));
-
     }
 
     Json(response)
-
 }
 
-
-
 pub(crate) async fn update_workspace_alias(
-
     State(state): State<DaemonState>,
 
     Path(session): Path<String>,
@@ -128,35 +105,23 @@ pub(crate) async fn update_workspace_alias(
     Query(query): Query<HashMap<String, String>>,
 
     Json(body): Json<Value>,
-
 ) -> Json<Response> {
-
     let node = match selected_node(&state, &query) {
-
         Ok(node) => node,
 
         Err(response) => return Json(response),
-
     };
 
     let alias = body
-
         .get("alias")
-
         .and_then(Value::as_str)
-
         .map(str::to_string);
 
     let request = RemoteRequest::SetWorkspaceAlias { session, alias };
 
     Json(
-
         state
-
             .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
-
             .await,
-
     )
-
 }

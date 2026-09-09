@@ -35,8 +35,8 @@ pub use workflow::*;
 // the crate currently consumes these via `super::util` inside the module.
 #[allow(unused_imports)]
 pub use util::{
-    casefold_search_text, parse_history_page_size, parse_positive_usize, redact_json,
-    sanitize_audit_value, truncate_json, AUDIT_PAYLOAD_LIMIT_BYTES, REDACTED_VALUE,
+    AUDIT_PAYLOAD_LIMIT_BYTES, REDACTED_VALUE, casefold_search_text, parse_history_page_size,
+    parse_positive_usize, redact_json, sanitize_audit_value, truncate_json,
 };
 
 #[cfg(test)]

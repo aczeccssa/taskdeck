@@ -53,31 +53,19 @@ use super::workflow_groups::*;
 use super::workflow_runs::*;
 use super::workspaces::*;
 pub(crate) async fn agent_connect(
-
     State(state): State<DaemonState>,
 
     upgrade: WebSocketUpgrade,
-
 ) -> AxumResponse {
-
     if !state
-
         .public_settings()
-
         .role
-
         .eq(&crate::state::NodeRole::Leader)
-
     {
-
         return StatusCode::FORBIDDEN.into_response();
-
     }
 
     upgrade
-
         .on_upgrade(move |socket| cluster::serve_agent_socket(state.cluster.clone(), socket))
-
         .into_response()
-
 }

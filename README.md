@@ -72,6 +72,28 @@ empty value.
 Running `taskdeck` without a subcommand opens the TUI. Detaching the TUI does
 not stop managed tasks.
 
+## Source layout
+
+The crate is organised by responsibility; every module directory keeps its
+public API stable through `mod.rs` re-exports.
+
+| Module | Responsibility |
+| --- | --- |
+| `src/protocol/` | Wire types shared by CLI, TUI, Web, daemon and cluster |
+| `src/config/` | Project discovery, `.vscode/tasks.json` import, `taskdeck.yaml` merge, atomic writes |
+| `src/state/` | SQLite persistence (`state.db`): one `StateStore`, domain modules per table group |
+| `src/runtime/` | Task/session process runtimes, log buffers, platform process ops |
+| `src/cluster/` | Leader/worker WebSocket cluster (messages, leader state, worker client) |
+| `src/daemon/` | Daemon lifecycle, request dispatch, cron scheduler, metrics, scaling, notifications |
+| `src/web/` | Axum web UI/API: auth, embedded assets, domain handlers, embedded MCP server |
+| `src/service/` | Managed-service inference and listener inspection |
+| `src/platform_service/` | OS service backends (launchd/systemd/schtasks) |
+| `src/tui/` | Terminal UI (state, input, rendering) |
+| `src/cli.rs` | Subcommand runners shared by `main.rs` |
+
+The daemon is the composition root: `daemon::run` starts the web server, so
+the dependency graph stays acyclic (`web -> daemon::{state,dispatch,metrics}`).
+
 ## Nodes and roles
 
 Every installation has one stable node ID and exactly one role. There are no

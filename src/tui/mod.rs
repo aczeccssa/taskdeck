@@ -1,7 +1,5 @@
 //! Terminal UI application state and event loop.
 
-
-
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -44,7 +42,7 @@ pub(super) struct App {
 }
 
 impl App {
-pub(crate)     fn new(snapshot: SessionSnapshot) -> Self {
+    pub(crate) fn new(snapshot: SessionSnapshot) -> Self {
         let labels = ordered_labels(&snapshot);
         let logs = labels
             .first()
@@ -65,18 +63,18 @@ pub(crate)     fn new(snapshot: SessionSnapshot) -> Self {
         }
     }
 
-pub(crate)     fn display_name(&self) -> &str {
+    pub(crate) fn display_name(&self) -> &str {
         self.snapshot
             .alias
             .as_deref()
             .unwrap_or(&self.snapshot.name)
     }
 
-pub(crate)     fn selected_label(&self) -> Option<&str> {
+    pub(crate) fn selected_label(&self) -> Option<&str> {
         self.labels.get(self.selected).map(String::as_str)
     }
 
-pub(crate)     fn update(&mut self, snapshot: SessionSnapshot) {
+    pub(crate) fn update(&mut self, snapshot: SessionSnapshot) {
         let selected = self.selected_label().map(str::to_owned);
         self.labels = ordered_labels(&snapshot);
         self.selected = selected
@@ -89,7 +87,7 @@ pub(crate)     fn update(&mut self, snapshot: SessionSnapshot) {
         self.snapshot = snapshot;
     }
 
-pub(crate)     fn select(&mut self, selected: usize) {
+    pub(crate) fn select(&mut self, selected: usize) {
         if selected == self.selected || selected >= self.labels.len() {
             return;
         }
@@ -97,13 +95,13 @@ pub(crate)     fn select(&mut self, selected: usize) {
         self.reset_logs();
     }
 
-pub(crate)     fn next(&mut self) {
+    pub(crate) fn next(&mut self) {
         if !self.labels.is_empty() {
             self.select((self.selected + 1) % self.labels.len());
         }
     }
 
-pub(crate)     fn previous(&mut self) {
+    pub(crate) fn previous(&mut self) {
         if !self.labels.is_empty() {
             self.select(
                 self.selected
@@ -113,7 +111,7 @@ pub(crate)     fn previous(&mut self) {
         }
     }
 
-pub(crate)     fn reset_logs(&mut self) {
+    pub(crate) fn reset_logs(&mut self) {
         self.logs.clear();
         self.log_generation = None;
         self.last_log_seq = None;
@@ -121,7 +119,7 @@ pub(crate)     fn reset_logs(&mut self) {
         self.follow = true;
     }
 
-pub(crate)     fn merge_logs(&mut self, payload: TaskLogsSnapshot) {
+    pub(crate) fn merge_logs(&mut self, payload: TaskLogsSnapshot) {
         let generation_changed = self
             .log_generation
             .is_some_and(|generation| generation != payload.generation);
@@ -329,7 +327,6 @@ pub(crate) async fn timed_request(request: Request) -> Result<Response> {
     .await
     .context("daemon request timed out")?
 }
-
 
 mod input;
 use input::{apply_action_result, apply_logs_result, apply_snapshot_result, handle_key};

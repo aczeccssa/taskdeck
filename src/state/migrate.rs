@@ -80,4 +80,3 @@ pub(super) fn ensure_workflow_graph_column(connection: &Connection) -> Result<()
     }
     Ok(())
 }
-

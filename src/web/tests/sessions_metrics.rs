@@ -13,244 +13,155 @@ use super::helpers::*;
 use crate::config::{ProjectDefinition, TaskSpec};
 use crate::runtime::SessionRuntime;
 
+pub(super) fn metrics_test_state() -> DaemonState {
+    let state = DaemonState::new();
 
+    state.sessions.lock().expect("sessions lock").insert(
+        "demo".to_string(),
+        SessionRuntime::new(ProjectDefinition {
+            session: "demo".to_string(),
 
-    pub(super) fn metrics_test_state() -> DaemonState {
+            project: PathBuf::from("/tmp"),
 
-        let state = DaemonState::new();
+            source: "taskdeck.yaml".to_string(),
 
-        state.sessions.lock().expect("sessions lock").insert(
+            tasks: BTreeMap::from([(
+                "api".to_string(),
+                TaskSpec {
+                    label: "api".to_string(),
 
-            "demo".to_string(),
+                    program: "sleep".to_string(),
 
-            SessionRuntime::new(ProjectDefinition {
+                    args: vec!["60".to_string()],
 
-                session: "demo".to_string(),
+                    cwd: PathBuf::from("/tmp"),
 
-                project: PathBuf::from("/tmp"),
+                    env: BTreeMap::new(),
 
-                source: "taskdeck.yaml".to_string(),
+                    shell: false,
 
-                tasks: BTreeMap::from([(
+                    auto_start: false,
 
-                    "api".to_string(),
+                    stop_timeout_ms: 500,
 
-                    TaskSpec {
+                    clear_logs_on_restart: false,
 
-                        label: "api".to_string(),
+                    schedule: None,
+                },
+            )]),
 
-                        program: "sleep".to_string(),
+            task_order: vec!["api".to_string()],
+        }),
+    );
 
-                        args: vec!["60".to_string()],
+    state
+}
 
-                        cwd: PathBuf::from("/tmp"),
+#[tokio::test]
 
-                        env: BTreeMap::new(),
+pub(super) async fn task_logs_route_returns_incremental_payload_and_validates_queries() {
+    let app = app(metrics_test_state());
 
-                        shell: false,
+    let response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .uri("/api/sessions/demo/tasks/api/logs?limit=100")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-                        auto_start: false,
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
 
-                        stop_timeout_ms: 500,
+    let response: Response = serde_json::from_slice(&body).unwrap();
 
-                        clear_logs_on_restart: false,
+    assert!(response.ok);
 
+    assert!(
+        response.data.as_ref().unwrap()["generation"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
 
+    assert_eq!(response.data.as_ref().unwrap()["reset"], false);
 
-                        schedule: None,
+    assert_eq!(response.data.as_ref().unwrap()["lines"], json!([]));
 
-                    },
-
-                )]),
-
-                task_order: vec!["api".to_string()],
-
-            }),
-
-        );
-
-        state
-
-    }
-
-
-
-    #[tokio::test]
-
-    pub(super) async fn task_logs_route_returns_incremental_payload_and_validates_queries() {
-
-        let app = app(metrics_test_state());
-
-
-
+    for uri in [
+        "/api/sessions/demo/tasks/api/logs?after=not-a-sequence",
+        "/api/sessions/demo/tasks/api/logs?limit=0",
+    ] {
         let response = app
-
             .clone()
-
-            .oneshot(
-
-                HttpRequest::builder()
-
-                    .uri("/api/sessions/demo/tasks/api/logs?limit=100")
-
-                    .body(Body::empty())
-
-                    .unwrap(),
-
-            )
-
+            .oneshot(HttpRequest::builder().uri(uri).body(Body::empty()).unwrap())
             .await
-
             .unwrap();
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
 
         let response: Response = serde_json::from_slice(&body).unwrap();
 
-        assert!(response.ok);
+        assert!(!response.ok);
 
-        assert!(
-
-            response.data.as_ref().unwrap()["generation"]
-
-                .as_u64()
-
-                .unwrap()
-
-                > 0
-
-        );
-
-        assert_eq!(response.data.as_ref().unwrap()["reset"], false);
-
-        assert_eq!(response.data.as_ref().unwrap()["lines"], json!([]));
-
-
-
-        for uri in [
-
-            "/api/sessions/demo/tasks/api/logs?after=not-a-sequence",
-
-            "/api/sessions/demo/tasks/api/logs?limit=0",
-
-        ] {
-
-            let response = app
-
-                .clone()
-
-                .oneshot(HttpRequest::builder().uri(uri).body(Body::empty()).unwrap())
-
-                .await
-
-                .unwrap();
-
-            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-
-            let response: Response = serde_json::from_slice(&body).unwrap();
-
-            assert!(!response.ok);
-
-            assert_eq!(response.data.as_ref().unwrap()["status"], 400);
-
-        }
-
+        assert_eq!(response.data.as_ref().unwrap()["status"], 400);
     }
+}
 
+#[tokio::test]
 
+pub(super) async fn task_history_route_replaces_log_generation() {
+    let app = app(metrics_test_state());
 
-    #[tokio::test]
+    let read_generation = |body: axum::body::Bytes| async move {
+        let response: Response = serde_json::from_slice(&body).unwrap();
 
-    pub(super) async fn task_history_route_replaces_log_generation() {
+        response.data.unwrap()["generation"].as_u64().unwrap()
+    };
 
-        let app = app(metrics_test_state());
+    let before = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .uri("/api/sessions/demo/tasks/api/logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        let read_generation = |body: axum::body::Bytes| async move {
+    let before = read_generation(to_bytes(before.into_body(), usize::MAX).await.unwrap()).await;
 
-            let response: Response = serde_json::from_slice(&body).unwrap();
+    let cleared = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("DELETE")
+                .uri("/api/sessions/demo/tasks/api/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-            response.data.unwrap()["generation"].as_u64().unwrap()
+    let cleared: Response =
+        serde_json::from_slice(&to_bytes(cleared.into_body(), usize::MAX).await.unwrap()).unwrap();
 
-        };
+    assert!(cleared.ok);
 
-        let before = app
+    let after = app
+        .oneshot(
+            HttpRequest::builder()
+                .uri("/api/sessions/demo/tasks/api/logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-            .clone()
+    let after = read_generation(to_bytes(after.into_body(), usize::MAX).await.unwrap()).await;
 
-            .oneshot(
-
-                HttpRequest::builder()
-
-                    .uri("/api/sessions/demo/tasks/api/logs")
-
-                    .body(Body::empty())
-
-                    .unwrap(),
-
-            )
-
-            .await
-
-            .unwrap();
-
-        let before = read_generation(to_bytes(before.into_body(), usize::MAX).await.unwrap()).await;
-
-
-
-        let cleared = app
-
-            .clone()
-
-            .oneshot(
-
-                HttpRequest::builder()
-
-                    .method("DELETE")
-
-                    .uri("/api/sessions/demo/tasks/api/history")
-
-                    .body(Body::empty())
-
-                    .unwrap(),
-
-            )
-
-            .await
-
-            .unwrap();
-
-        let cleared: Response =
-
-            serde_json::from_slice(&to_bytes(cleared.into_body(), usize::MAX).await.unwrap())
-
-                .unwrap();
-
-        assert!(cleared.ok);
-
-
-
-        let after = app
-
-            .oneshot(
-
-                HttpRequest::builder()
-
-                    .uri("/api/sessions/demo/tasks/api/logs")
-
-                    .body(Body::empty())
-
-                    .unwrap(),
-
-            )
-
-            .await
-
-            .unwrap();
-
-        let after = read_generation(to_bytes(after.into_body(), usize::MAX).await.unwrap()).await;
-
-        assert_ne!(before, after);
-
-    }
-
-
+    assert_ne!(before, after);
+}

@@ -1,12 +1,11 @@
 //! MCP call history persistence.
 
-
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params, params_from_iter};
 
+use super::StateStore;
 use super::pagination::*;
 use super::util::*;
-use super::StateStore;
 use crate::protocol::*;
 
 impl StateStore {
@@ -115,7 +114,6 @@ impl StateStore {
         let connection = self.connection.lock().expect("state store lock");
         Ok(connection.query_row("SELECT id,tool,operation,started_at_ms,duration_ms,success,target_node,request_json,response_json FROM mcp_calls WHERE id=?1",params![id as i64],|row|{Ok(McpCallRecord{id:row.get::<_,i64>(0)? as u64,tool:row.get(1)?,operation:row.get(2)?,started_at_ms:row.get::<_,i64>(3)? as u64,duration_ms:row.get::<_,i64>(4)? as u64,success:row.get::<_,i64>(5)? != 0,target_node:row.get(6)?,request:{let json=row.get::<_,String>(7)?;parse_sql_json(json,7)?},response:{let json=row.get::<_,String>(8)?;parse_sql_json(json,8)?}})}).optional()?)
     }
-
 }
 
 pub(super) fn paginated_mcp_calls(
@@ -158,4 +156,3 @@ pub(super) fn build_mcp_search_text(
         task.unwrap_or("")
     ))
 }
-

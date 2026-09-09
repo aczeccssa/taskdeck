@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use anyhow::Result;
 use rusqlite::{params, params_from_iter};
 
+use super::StateStore;
 use super::pagination::*;
 use super::util::*;
-use super::StateStore;
 use crate::protocol::*;
 
 impl StateStore {
@@ -32,7 +32,6 @@ impl StateStore {
             details,
         })
     }
-
 }
 
 impl StateStore {
@@ -74,7 +73,6 @@ impl StateStore {
         };
         Ok(paginated_events(rows, total, filter.page, filter.page_size))
     }
-
 }
 
 impl StateStore {
@@ -152,7 +150,6 @@ impl StateStore {
         let updated=connection.execute("WITH target AS (SELECT id FROM task_runs WHERE node_id=?1 AND session=?2 AND task=?3 AND run_generation=?4 AND status='running' ORDER BY id DESC LIMIT 1) UPDATE task_runs SET status=?5,finished_at_ms=?6,duration_ms=(SELECT ?6-started_at_ms FROM task_runs WHERE id IN(SELECT id FROM target)),exit_code=?7,error_message=?8 WHERE id IN(SELECT id FROM target)",params![node_id,session,task,run_generation as i64,status,finished as i64,exit_code,error_message])?;
         Ok(updated == 1)
     }
-
 }
 
 impl StateStore {
@@ -283,4 +280,3 @@ pub(super) fn paginated_events(
         has_previous: page > 1 && total > 0,
     }
 }
-

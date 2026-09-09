@@ -53,7 +53,6 @@ use super::workflow_groups::*;
 use super::workflow_runs::*;
 use super::workspaces::*;
 pub(crate) fn record_feature_http_audit(
-
     state: &DaemonState,
 
     request_kind: &str,
@@ -71,67 +70,41 @@ pub(crate) fn record_feature_http_audit(
     started_at_ms: u64,
 
     duration_ms: u64,
-
 ) {
-
     let response_value = serde_json::to_value(response)
-
         .unwrap_or_else(|error| json!({"ok": response.ok, "message": format!("{error}")}));
 
     let status = if response.ok {
-
         AuditStatus::Success
-
     } else {
-
         AuditStatus::Error
-
     };
 
     let mut details = json!({});
 
     if let Some(entity_id) = entity_id {
-
         details[entity_key] = json!(entity_id);
-
     }
 
     let _ = record_audit_value(
-
         state,
-
         AuditContext::new(AuditSource::Web, AuditTransport::Http),
-
         None,
-
         request_kind,
-
         operation,
-
         None,
-
         None,
-
         status,
-
         started_at_ms,
-
         duration_ms,
-
         request,
-
         response_value,
-
         details,
-
         Some(state.public_settings().node_id),
-
     );
-
 }
 
 pub(crate) fn audit_context_for_remote_request(
-
     state: &DaemonState,
 
     source: AuditSource,
@@ -139,41 +112,25 @@ pub(crate) fn audit_context_for_remote_request(
     transport: AuditTransport,
 
     request: &RemoteRequest,
-
 ) -> AuditContext {
-
     let local_request = request.clone().into_local();
 
     AuditContext::new(source, transport)
-
         .with_request_defaults(&local_request)
-
         .with_origin_node(state.public_settings().node_id)
-
 }
-
-
 
 pub(crate) fn web_audit_context(state: &DaemonState, request: &RemoteRequest) -> AuditContext {
-
     audit_context_for_remote_request(state, AuditSource::Web, AuditTransport::Http, request)
-
 }
-
-
 
 pub(crate) fn mcp_audit_context(state: &DaemonState, request: &RemoteRequest) -> AuditContext {
-
     audit_context_for_remote_request(state, AuditSource::Mcp, AuditTransport::Mcp, request)
-
 }
-
-
 
 #[allow(clippy::too_many_arguments)]
 
 pub(crate) fn record_mcp_direct_audit(
-
     state: &DaemonState,
 
     params: &Value,
@@ -191,105 +148,65 @@ pub(crate) fn record_mcp_direct_audit(
     session: Option<&str>,
 
     task: Option<&str>,
-
 ) {
-
     let mut context = AuditContext::new(AuditSource::Mcp, AuditTransport::Mcp);
 
     context.origin_node_id = Some(state.public_settings().node_id);
 
     let response_value = serde_json::to_value(response).unwrap_or_else(
-
         |error| json!({"serialization_error": error.to_string(), "ok": response.ok}),
-
     );
 
     let _ = record_audit_value(
-
         state,
-
         context,
-
         None,
-
         "mcp_tools_call",
-
         operation,
-
         session,
-
         task,
-
         AuditStatus::from_ok(response.ok),
-
         started_at_ms,
-
         duration_ms,
-
         params.clone(),
-
         response_value,
-
         json!({"node": node}),
-
         node.map(str::to_string)
-
             .or_else(|| Some(state.public_settings().node_id)),
-
     );
-
 }
 
 pub(crate) async fn list_audit(
-
     State(state): State<DaemonState>,
 
     Query(query): Query<HashMap<String, String>>,
-
 ) -> Json<Response> {
-
     let filter = match AuditFilter::parse(&query) {
-
         Ok(filter) => filter,
 
         Err(response) => return Json(response),
-
     };
 
     match state.store.list_audit(&filter) {
-
         Ok(page) => Json(Response::ok("audit records", page)),
 
         Err(error) => Json(Response::error(format!("{error:#}"))),
-
     }
-
 }
 
-
-
 pub(crate) async fn audit_detail(
-
     State(state): State<DaemonState>,
 
     Path(audit_id): Path<String>,
-
 ) -> Json<Response> {
-
     match state.store.audit_detail(&audit_id) {
-
         Ok(Some(record)) => Json(Response::ok("audit record", record)),
 
         Ok(None) => Json(Response::error_with_data(
-
             "audit record not found",
-
             json!({"kind": "not_found", "status": 404}),
-
         )),
 
         Err(error) => Json(Response::error(format!("{error:#}"))),
-
     }
-
 }

@@ -1,12 +1,11 @@
 //! Task dependency persistence.
 
-
 use anyhow::{Result, bail};
 use rusqlite::params;
 use uuid::Uuid;
 
-use super::util::*;
 use super::StateStore;
+use super::util::*;
 use crate::protocol::*;
 
 impl StateStore {
@@ -99,10 +98,11 @@ impl StateStore {
             })
             .collect())
     }
-
 }
 
-pub(super) fn normalize_task_dependency_input(mut input: TaskDependencyInput) -> Result<TaskDependencyInput> {
+pub(super) fn normalize_task_dependency_input(
+    mut input: TaskDependencyInput,
+) -> Result<TaskDependencyInput> {
     input.node_id = input.node_id.trim().to_string();
     input.session = input.session.trim().to_string();
     input.task = input.task.trim().to_string();
@@ -131,4 +131,3 @@ pub(super) fn normalize_task_dependency_input(mut input: TaskDependencyInput) ->
     }
     Ok(input)
 }
-

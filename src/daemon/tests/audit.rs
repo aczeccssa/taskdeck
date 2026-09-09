@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use super::super::*;
 use super::super::audit::*;
 use super::super::client::*;
 use super::super::dispatch::*;
@@ -23,166 +22,128 @@ use super::super::scaling::*;
 use super::super::scheduler::*;
 use super::super::state::*;
 use super::super::util::*;
+use super::super::*;
 use super::helpers::*;
 use crate::config;
 use crate::protocol::*;
 use crate::runtime::{SessionRuntime, Sessions};
 use crate::state::{NodeRole, NodeSettings, StateStore};
 
-    pub(super) fn call_record() -> McpCallRecord {
+pub(super) fn call_record() -> McpCallRecord {
+    McpCallRecord {
+        id: 0,
 
-        McpCallRecord {
+        tool: "taskdeck_control".to_string(),
 
-            id: 0,
+        operation: Some("sessions".to_string()),
 
-            tool: "taskdeck_control".to_string(),
+        started_at_ms: 1,
 
-            operation: Some("sessions".to_string()),
+        duration_ms: 2,
 
-            started_at_ms: 1,
+        success: true,
 
-            duration_ms: 2,
+        target_node: None,
 
-            success: true,
+        request: json!({"method": "tools/call"}),
 
-            target_node: None,
-
-            request: json!({"method": "tools/call"}),
-
-            response: json!({"result": {"isError": false}}),
-
-        }
-
+        response: json!({"result": {"isError": false}}),
     }
+}
 
+#[test]
 
+pub(super) fn dispatch_with_audit_records_success_and_error_sources() {
+    let state = DaemonState::new();
 
-    #[test]
+    let cli_context =
+        AuditContext::new(AuditSource::Cli, AuditTransport::Ipc).with_origin_node("cli-origin");
 
-    pub(super) fn dispatch_with_audit_records_success_and_error_sources() {
+    let response = dispatch_with_audit(&state, Request::Ping, Some(cli_context));
 
-        let state = DaemonState::new();
+    assert!(response.ok);
 
-        let cli_context =
+    let page = state
+        .store
+        .list_audit(&crate::protocol::AuditFilter {
+            q: None,
 
-            AuditContext::new(AuditSource::Cli, AuditTransport::Ipc).with_origin_node("cli-origin");
+            source: Some("cli".to_string()),
 
-        let response = dispatch_with_audit(&state, Request::Ping, Some(cli_context));
+            status: Some("success".to_string()),
 
-        assert!(response.ok);
+            node: Some("cli-origin".to_string()),
 
+            session: None,
 
+            task: None,
 
-        let page = state
+            operation: Some("ping".to_string()),
 
-            .store
+            page: 1,
 
-            .list_audit(&crate::protocol::AuditFilter {
+            page_size: 20,
+        })
+        .unwrap();
 
-                q: None,
+    assert_eq!(page.total, 1);
 
-                source: Some("cli".to_string()),
+    let success = state
+        .store
+        .audit_detail(&page.items[0].audit_id)
+        .unwrap()
+        .unwrap();
 
-                status: Some("success".to_string()),
+    assert_eq!(success.source, AuditSource::Cli);
 
-                node: Some("cli-origin".to_string()),
+    assert_eq!(success.transport, AuditTransport::Ipc);
 
-                session: None,
+    assert_eq!(success.origin_node_id.as_deref(), Some("cli-origin"));
 
-                task: None,
+    assert!(success.executor_node_id.is_some());
 
-                operation: Some("ping".to_string()),
+    let response = dispatch_with_audit(
+        &state,
+        Request::Snapshot {
+            session: "missing".to_string(),
 
-                page: 1,
+            tail: None,
+        },
+        Some(AuditContext::new(AuditSource::Tui, AuditTransport::Ipc)),
+    );
 
-                page_size: 20,
+    assert!(!response.ok);
 
-            })
+    let errors = state
+        .store
+        .list_audit(&crate::protocol::AuditFilter {
+            q: Some("session 'missing'".to_string()),
 
-            .unwrap();
+            source: Some("tui".to_string()),
 
-        assert_eq!(page.total, 1);
+            status: Some("error".to_string()),
 
-        let success = state
+            node: None,
 
-            .store
+            session: Some("missing".to_string()),
 
-            .audit_detail(&page.items[0].audit_id)
+            task: None,
 
+            operation: Some("snapshot".to_string()),
+
+            page: 1,
+
+            page_size: 20,
+        })
+        .unwrap();
+
+    assert_eq!(errors.total, 1);
+
+    assert!(
+        errors.items[0]
+            .error
+            .as_deref()
             .unwrap()
-
-            .unwrap();
-
-        assert_eq!(success.source, AuditSource::Cli);
-
-        assert_eq!(success.transport, AuditTransport::Ipc);
-
-        assert_eq!(success.origin_node_id.as_deref(), Some("cli-origin"));
-
-        assert!(success.executor_node_id.is_some());
-
-
-
-        let response = dispatch_with_audit(
-
-            &state,
-
-            Request::Snapshot {
-
-                session: "missing".to_string(),
-
-                tail: None,
-
-            },
-
-            Some(AuditContext::new(AuditSource::Tui, AuditTransport::Ipc)),
-
-        );
-
-        assert!(!response.ok);
-
-        let errors = state
-
-            .store
-
-            .list_audit(&crate::protocol::AuditFilter {
-
-                q: Some("session 'missing'".to_string()),
-
-                source: Some("tui".to_string()),
-
-                status: Some("error".to_string()),
-
-                node: None,
-
-                session: Some("missing".to_string()),
-
-                task: None,
-
-                operation: Some("snapshot".to_string()),
-
-                page: 1,
-
-                page_size: 20,
-
-            })
-
-            .unwrap();
-
-        assert_eq!(errors.total, 1);
-
-        assert!(
-
-            errors.items[0]
-
-                .error
-
-                .as_deref()
-
-                .unwrap()
-
-                .contains("missing")
-
-        );
-
-    }
+            .contains("missing")
+    );
+}

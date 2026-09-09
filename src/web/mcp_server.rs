@@ -34,20 +34,16 @@ use crate::protocol::{
 };
 use crate::state::NodeRole;
 
+use super::api::audit::{mcp_audit_context, record_mcp_direct_audit};
 use crate::web::current_millis;
 use crate::web::optional_query_value;
 use crate::web::parse_positive_usize;
-use super::api::audit::{mcp_audit_context, record_mcp_direct_audit};
 pub(crate) async fn mcp(State(state): State<DaemonState>, Json(rpc): Json<Value>) -> AxumResponse {
-
     let started = Instant::now();
 
     let started_at_ms = SystemTime::now()
-
         .duration_since(UNIX_EPOCH)
-
         .unwrap_or_default()
-
         .as_millis() as u64;
 
     let id = rpc.get("id").cloned().unwrap_or(Value::Null);
@@ -55,13 +51,10 @@ pub(crate) async fn mcp(State(state): State<DaemonState>, Json(rpc): Json<Value>
     let method = rpc.get("method").and_then(Value::as_str).unwrap_or("");
 
     if method.starts_with("notifications/") {
-
         return StatusCode::ACCEPTED.into_response();
-
     }
 
     let result = match method {
-
         "initialize" => json!({
 
             "protocolVersion": "2025-03-26",
@@ -87,11 +80,9 @@ pub(crate) async fn mcp(State(state): State<DaemonState>, Json(rpc): Json<Value>
         "tools/list" => json!({"tools": [mcp_tool_definition(&state)]}),
 
         "tools/call" => {
-
             let params = rpc.get("params").cloned().unwrap_or_else(|| json!({}));
 
             match call_mcp_tool(state.clone(), params, started_at_ms).await {
-
                 Ok(result) => result,
 
                 Err(message) => json!({
@@ -101,13 +92,10 @@ pub(crate) async fn mcp(State(state): State<DaemonState>, Json(rpc): Json<Value>
                     "isError": true
 
                 }),
-
             }
-
         }
 
         _ => {
-
             return Json(json!({
 
                 "jsonrpc": "2.0", "id": id,
@@ -115,67 +103,43 @@ pub(crate) async fn mcp(State(state): State<DaemonState>, Json(rpc): Json<Value>
                 "error": {"code": -32601, "message": format!("method not found: {method}")}
 
             }))
-
             .into_response();
-
         }
-
     };
 
     let success = !result
-
         .get("isError")
-
         .and_then(Value::as_bool)
-
         .unwrap_or(false);
 
     let response = json!({"jsonrpc": "2.0", "id": id, "result": result});
 
     if method == "tools/call" {
-
         let params = rpc.get("params").unwrap_or(&Value::Null);
 
         let target_node = params
-
             .get("arguments")
-
             .and_then(|arguments| arguments.get("node"))
-
             .and_then(Value::as_str)
-
             .map(str::to_string)
-
             .or_else(|| {
-
                 (state.public_settings().role == crate::state::NodeRole::Worker)
-
                     .then(|| "self".to_string())
-
             });
 
         let record = McpCallRecord {
-
             id: 0,
 
             tool: params
-
                 .get("name")
-
                 .and_then(Value::as_str)
-
                 .unwrap_or("unknown")
-
                 .to_string(),
 
             operation: params
-
                 .get("arguments")
-
                 .and_then(|arguments| arguments.get("action"))
-
                 .and_then(Value::as_str)
-
                 .map(str::to_string),
 
             started_at_ms,
@@ -189,27 +153,18 @@ pub(crate) async fn mcp(State(state): State<DaemonState>, Json(rpc): Json<Value>
             request: rpc,
 
             response: response.clone(),
-
         };
 
         if let Err(error) = state.store.record_mcp_call(record) {
-
             eprintln!("failed to persist MCP call: {error:#}");
-
         }
-
     }
 
     Json(response).into_response()
-
 }
 
-
-
 pub(crate) fn mcp_tool_definition(state: &DaemonState) -> Value {
-
     if state.public_settings().role == crate::state::NodeRole::Leader {
-
         json!({
 
             "name": "taskdeck_control",
@@ -249,9 +204,7 @@ pub(crate) fn mcp_tool_definition(state: &DaemonState) -> Value {
             }
 
         })
-
     } else {
-
         json!({
 
             "name": "taskdeck_control",
@@ -289,185 +242,116 @@ pub(crate) fn mcp_tool_definition(state: &DaemonState) -> Value {
             }
 
         })
-
     }
-
 }
 
-
-
 pub(crate) async fn call_mcp_tool(
-
     state: DaemonState,
 
     params: Value,
 
     started_at_ms: u64,
-
 ) -> std::result::Result<Value, String> {
-
     let started = Instant::now();
 
     if params.get("name").and_then(Value::as_str) != Some("taskdeck_control") {
-
         let response = Response::error("unknown tool; expected taskdeck_control");
 
         record_mcp_direct_audit(
-
             &state,
-
             &params,
-
             "unknown",
-
             &response,
-
             started_at_ms,
-
             started.elapsed().as_millis() as u64,
-
             None,
-
             None,
-
             None,
-
         );
 
         return Err(response.message);
-
     }
 
     let arguments = params
-
         .get("arguments")
-
         .cloned()
-
         .unwrap_or_else(|| json!({}));
 
     let Some(operation) = arguments.get("action").and_then(Value::as_str) else {
-
         let response = Response::error("action is required");
 
         record_mcp_direct_audit(
-
             &state,
-
             &params,
-
             "missing_action",
-
             &response,
-
             started_at_ms,
-
             started.elapsed().as_millis() as u64,
-
             arguments.get("node").and_then(Value::as_str),
-
             arguments.get("session").and_then(Value::as_str),
-
             arguments.get("task").and_then(Value::as_str),
-
         );
 
         return Err(response.message);
-
     };
 
     let is_leader = state.public_settings().role == crate::state::NodeRole::Leader;
 
     if !is_leader && arguments.get("node").is_some() {
-
         let response = Response::error("worker MCP is local-only and does not accept node");
 
         record_mcp_direct_audit(
-
             &state,
-
             &params,
-
             operation,
-
             &response,
-
             started_at_ms,
-
             started.elapsed().as_millis() as u64,
-
             arguments.get("node").and_then(Value::as_str),
-
             None,
-
             None,
-
         );
 
         return Err(response.message);
-
     }
 
     let node = arguments.get("node").and_then(Value::as_str);
 
     let session = arguments
-
         .get("session")
-
         .and_then(Value::as_str)
-
         .map(str::to_string);
 
     let task = arguments
-
         .get("task")
-
         .and_then(Value::as_str)
-
         .map(str::to_string);
 
     let tail = arguments
-
         .get("tail")
-
         .and_then(Value::as_u64)
-
         .map(|v| v as usize);
 
     let response = match operation {
-
         "nodes" if is_leader => {
-
             let response = Response::ok("nodes", state.node_summaries());
 
             record_mcp_direct_audit(
-
                 &state,
-
                 &params,
-
                 operation,
-
                 &response,
-
                 started_at_ms,
-
                 started.elapsed().as_millis() as u64,
-
                 node,
-
                 session.as_deref(),
-
                 task.as_deref(),
-
             );
 
             response
-
         }
 
         "sessions" if is_leader && node.is_none() => {
-
             let rows = state
 
                 .node_summaries()
@@ -489,97 +373,59 @@ pub(crate) async fn call_mcp_tool(
             let response = Response::ok("cluster sessions", rows);
 
             record_mcp_direct_audit(
-
                 &state,
-
                 &params,
-
                 operation,
-
                 &response,
-
                 started_at_ms,
-
                 started.elapsed().as_millis() as u64,
-
                 node,
-
                 session.as_deref(),
-
                 task.as_deref(),
-
             );
 
             response
-
         }
 
         "services" if is_leader => {
-
             let response = Response::ok("services", state.service_rows(node));
 
             record_mcp_direct_audit(
-
                 &state,
-
                 &params,
-
                 operation,
-
                 &response,
-
                 started_at_ms,
-
                 started.elapsed().as_millis() as u64,
-
                 node,
-
                 session.as_deref(),
-
                 task.as_deref(),
-
             );
 
             response
-
         }
 
         "sessions" => {
-
             let request = RemoteRequest::ListSessions;
 
             state
-
                 .dispatch_node_with_audit(
-
                     node.unwrap_or("self"),
-
                     request.clone(),
-
                     mcp_audit_context(&state, &request),
-
                 )
-
                 .await
-
         }
 
         "runs" => {
-
             let node = if is_leader {
-
                 node.ok_or_else(|| "node is required for targeted leader operations".to_string())?
-
             } else {
-
                 "self"
-
             };
 
             let request = RemoteRequest::ListTaskRuns {
-
                 filter: crate::protocol::TaskRunFilter {
-
                     session: session.clone(),
 
                     task,
@@ -591,91 +437,57 @@ pub(crate) async fn call_mcp_tool(
                     page: tail.unwrap_or(1),
 
                     page_size: 50,
-
                 },
-
             };
 
             state
-
                 .dispatch_node_with_audit(
-
                     node,
-
                     request.clone(),
-
                     mcp_audit_context(&state, &request),
-
                 )
-
                 .await
-
         }
 
         "status" | "logs" => {
-
             let node = if is_leader {
-
                 node.ok_or_else(|| "node is required for targeted leader operations".to_string())?
-
             } else {
-
                 "self"
-
             };
 
             let request = RemoteRequest::Snapshot {
-
                 session: session.ok_or_else(|| "session is required".to_string())?,
 
                 tail: Some(if operation == "status" {
-
                     20
-
                 } else {
-
                     tail.unwrap_or(200)
-
                 }),
-
             };
 
             state
-
                 .dispatch_node_with_audit(
-
                     node,
-
                     request.clone(),
-
                     mcp_audit_context(&state, &request),
-
                 )
-
                 .await
-
         }
 
         "start" | "stop" | "restart" | "pause" | "resume" => {
-
             let node = if is_leader {
-
                 node.ok_or_else(|| "node is required for targeted leader operations".to_string())?
-
             } else {
-
                 "self"
-
             };
 
             let request = RemoteRequest::Action {
-
                 session: session.ok_or_else(|| "session is required".to_string())?,
 
                 task,
 
                 action: match operation {
-
                     "start" => Action::Start,
 
                     "stop" => Action::Stop,
@@ -687,57 +499,35 @@ pub(crate) async fn call_mcp_tool(
                     "resume" => Action::Resume,
 
                     _ => unreachable!(),
-
                 },
-
             };
 
             state
-
                 .dispatch_node_with_audit(
-
                     node,
-
                     request.clone(),
-
                     mcp_audit_context(&state, &request),
-
                 )
-
                 .await
-
         }
 
         _ => {
-
             let response = Response::error(format!("unsupported action: {operation}"));
 
             record_mcp_direct_audit(
-
                 &state,
-
                 &params,
-
                 operation,
-
                 &response,
-
                 started_at_ms,
-
                 started.elapsed().as_millis() as u64,
-
                 node,
-
                 session.as_deref(),
-
                 task.as_deref(),
-
             );
 
             return Err(response.message);
-
         }
-
     };
 
     let text = serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?;
@@ -751,5 +541,4 @@ pub(crate) async fn call_mcp_tool(
         "isError": !response.ok
 
     }))
-
 }

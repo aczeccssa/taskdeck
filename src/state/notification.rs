@@ -7,7 +7,7 @@ use rusqlite::params;
 use uuid::Uuid;
 
 use super::util::*;
-use super::{StateStore, NOTIFICATION_RETENTION_LIMIT};
+use super::{NOTIFICATION_RETENTION_LIMIT, StateStore};
 use crate::protocol::*;
 
 use super::quota::normalize_quota_session;
@@ -248,7 +248,6 @@ impl StateStore {
         };
         Ok(changed as u64)
     }
-
 }
 
 pub(super) fn normalize_notification_rule_input(
@@ -299,4 +298,3 @@ pub(super) fn normalize_notification_rule_input(
     input.scope_task = normalize_quota_session(input.scope_task)?;
     Ok(input)
 }
-

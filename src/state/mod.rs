@@ -28,9 +28,9 @@ mod test_support;
 
 // The re-exports below preserve the pre-split public interface; some items
 // are consumed only by downstream modules or tests.
+pub use crate::protocol::{LeaderMode, NodeRole, PublicNodeSettings};
 #[allow(unused_imports)]
 pub use auth::{AuthSettings, PublicAuthStatus, hash_access_key, verify_access_key};
-pub use crate::protocol::{LeaderMode, NodeRole, PublicNodeSettings};
 #[allow(unused_imports)]
 pub use node::{
     KnownWorker, NodeSettings, NodeSettingsUpdate, NodeSettingsWrite, environment_overrides,
@@ -39,7 +39,6 @@ pub use node::{
 pub use scaling::{cron_next_after, validate_cron_expression};
 #[allow(unused_imports)]
 pub use sessions::Registration;
-
 
 use std::sync::Mutex;
 

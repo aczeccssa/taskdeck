@@ -35,8 +35,8 @@ pub use client::{
 pub use dispatch::{dispatch_async, dispatch_async_with_audit};
 #[allow(unused_imports)]
 pub use metrics::{
-    MAX_NODE_METRIC_SAMPLES, MAX_TASK_METRIC_SAMPLES, TASK_METRICS_SAMPLE_INTERVAL_MS,
-    NodeMetricsStore, TaskMetricsStore,
+    MAX_NODE_METRIC_SAMPLES, MAX_TASK_METRIC_SAMPLES, NodeMetricsStore,
+    TASK_METRICS_SAMPLE_INTERVAL_MS, TaskMetricsStore,
 };
 #[allow(unused_imports)]
 pub use scaling::spawn_scaling_evaluator;
@@ -49,18 +49,18 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixListener;
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::ServerOptions;
 
+use crate::cluster::spawn_worker_client;
+use crate::protocol::{Envelope, Response};
+use crate::state::NodeRole;
+use crate::web;
 use sampler::{panic_message, spawn_task_history_sampler, spawn_task_metrics_sampler};
 use scheduler::spawn_task_scheduler;
-use crate::cluster::spawn_worker_client;
-use crate::state::NodeRole;
-use crate::protocol::{Envelope, Response};
-use crate::web;
 
 async fn serve_connection<S>(state: DaemonState, stream: S) -> Result<()>
 where
@@ -220,4 +220,3 @@ fn stop_all(state: &DaemonState) {
         session.stop_all();
     }
 }
-

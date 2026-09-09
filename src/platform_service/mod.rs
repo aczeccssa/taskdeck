@@ -1,28 +1,26 @@
 //! OS service install/control.
 //! OS service install/control (launchd/systemd/schtasks).
 
-
-
 mod linux_backend;
 mod macos_backend;
 mod windows_backend;
 
-use macos_backend::macos;
 use linux_backend::linux;
+use macos_backend::macos;
 use windows_backend::windows;
 
 #[cfg(test)]
 mod tests;
 
 #[allow(unused_imports)]
-pub(crate) use macos_backend::{macos_domain, macos_plist_path, render_macos_plist};
-#[allow(unused_imports)]
 pub(crate) use linux_backend::{linux_unit_path, render_systemd_unit};
 #[allow(unused_imports)]
-pub(crate) use windows_backend::{render_windows_command, shell_quote};
+pub(crate) use macos_backend::{macos_domain, macos_plist_path, render_macos_plist};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[allow(unused_imports)]
+pub(crate) use windows_backend::{render_windows_command, shell_quote};
 
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
@@ -67,7 +65,7 @@ struct ServiceSpec {
 
 #[cfg(test)]
 impl ServiceSpec {
-pub(crate)     fn new(executable: &str, home: &str) -> Self {
+    pub(crate) fn new(executable: &str, home: &str) -> Self {
         Self {
             executable: PathBuf::from(executable),
             home: PathBuf::from(home),
@@ -223,4 +221,3 @@ pub(crate) fn run_quiet(program: &str, args: &[&str]) -> bool {
         .output()
         .is_ok_and(|output| output.status.success())
 }
-

@@ -22,17 +22,17 @@ use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 use super::audit::{record_audit_value, record_request_audit};
 use super::client::GlobalPaths;
 use super::dispatch::{
-    config_write_error_response, prepare_session_config_write,
-    reject_unavailable_session, require_local_execution,
+    config_write_error_response, prepare_session_config_write, reject_unavailable_session,
+    require_local_execution,
 };
 use super::handle::handle;
 use super::metrics::{
-    MAX_TASK_METRIC_SAMPLES, NodeMetricsStore, TASK_METRICS_SAMPLE_INTERVAL_MS,
-    TaskMetricsKey, TaskMetricsStore, TaskMetricsTarget,
+    MAX_TASK_METRIC_SAMPLES, NodeMetricsStore, TASK_METRICS_SAMPLE_INTERVAL_MS, TaskMetricsKey,
+    TaskMetricsStore, TaskMetricsTarget,
 };
 use super::process_tree::{
-    aggregate_process_tree, collect_metric_targets, current_metric_keys, observed_processes,
-    running_metric_targets, AggregatedProcessTree, ObservedProcess,
+    AggregatedProcessTree, ObservedProcess, aggregate_process_tree, collect_metric_targets,
+    current_metric_keys, observed_processes, running_metric_targets,
 };
 use super::state::DaemonState;
 use super::util::{ScheduleKey, current_timestamp_ms, status_label};

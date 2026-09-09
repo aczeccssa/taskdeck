@@ -38,51 +38,31 @@ use crate::web::current_millis;
 use crate::web::optional_query_value;
 use crate::web::parse_positive_usize;
 pub(crate) struct EmbeddedAsset {
-
     pub(crate) path: &'static str,
 
     pub(crate) bytes: &'static [u8],
-
 }
-
-
 
 include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
 
-
-
 pub(crate) async fn index() -> AxumResponse {
-
     embedded_asset_response("/index.html", false)
-
 }
 
-
-
 pub(crate) async fn static_asset(Path(asset_path): Path<String>) -> AxumResponse {
-
     if asset_path.contains("..") {
-
         return StatusCode::NOT_FOUND.into_response();
-
     }
 
     embedded_asset_response(&format!("/{asset_path}"), asset_path.starts_with("assets/"))
-
 }
 
-
-
 pub(crate) fn embedded_asset_response(path: &str, immutable: bool) -> AxumResponse {
-
     let Some(asset) = EMBEDDED_ASSETS.iter().find(|asset| asset.path == path) else {
-
         return StatusCode::NOT_FOUND.into_response();
-
     };
 
     let content_type = match path.rsplit('.').next().unwrap_or_default() {
-
         "html" => "text/html; charset=utf-8",
 
         "css" => "text/css; charset=utf-8",
@@ -104,27 +84,17 @@ pub(crate) fn embedded_asset_response(path: &str, immutable: bool) -> AxumRespon
         "woff" => "font/woff",
 
         _ => "application/octet-stream",
-
     };
 
     let cache_control = if immutable {
-
         "public, max-age=31536000, immutable"
-
     } else {
-
         "no-cache"
-
     };
 
     AxumResponse::builder()
-
         .header(header::CONTENT_TYPE, content_type)
-
         .header(header::CACHE_CONTROL, cache_control)
-
         .body(Body::from(asset.bytes.to_vec()))
-
         .expect("valid embedded frontend response")
-
 }

@@ -13,421 +13,272 @@ use super::helpers::*;
 use crate::config::{ProjectDefinition, TaskSpec};
 use crate::runtime::SessionRuntime;
 
-    #[tokio::test]
+#[tokio::test]
 
-    pub(super) async fn quotas_api_crud_and_validation() {
+pub(super) async fn quotas_api_crud_and_validation() {
+    let mut state = DaemonState::new();
 
-        let mut state = DaemonState::new();
+    insert_workflow_session(&state, "api", None, "/tmp/api", &["dev"]);
 
-        insert_workflow_session(&state, "api", None, "/tmp/api", &["dev"]);
+    let created = post_json(
+        state.clone(),
+        "/api/quotas",
+        json!({"session": "api", "max_running_tasks": 2}),
+    )
+    .await;
 
-        let created = post_json(
+    assert!(created.ok, "{}", created.message);
 
-            state.clone(),
+    assert_eq!(created.data.unwrap()["session"], "api");
 
-            "/api/quotas",
+    let node_quota = post_json(
+        state.clone(),
+        "/api/quotas",
+        json!({"max_running_tasks": 8}),
+    )
+    .await;
 
-            json!({"session": "api", "max_running_tasks": 2}),
+    assert!(node_quota.ok, "{}", node_quota.message);
 
+    let duplicate = post_json(
+        state.clone(),
+        "/api/quotas",
+        json!({"session": "api", "max_running_tasks": 3}),
+    )
+    .await;
+
+    assert!(!duplicate.ok);
+
+    let invalid = post_json(
+        state.clone(),
+        "/api/quotas",
+        json!({"max_running_tasks": 0}),
+    )
+    .await;
+
+    assert!(!invalid.ok);
+
+    let list = get_json(state.clone(), "/api/quotas").await;
+
+    let data = list.data.unwrap();
+
+    assert_eq!(data["quotas"].as_array().unwrap().len(), 2);
+
+    assert!(
+        data["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s == "api")
+    );
+
+    let quota_id = data["quotas"][0]["id"].as_str().unwrap().to_string();
+
+    let updated = request_json(
+        state.clone(),
+        "PUT",
+        &format!("/api/quotas/{quota_id}"),
+        Some(json!({"session": "web", "max_running_tasks": 5})),
+    )
+    .await;
+
+    assert!(updated.ok, "{}", updated.message);
+
+    let deleted = request_json(
+        state.clone(),
+        "DELETE",
+        &format!("/api/quotas/{quota_id}"),
+        None,
+    )
+    .await;
+
+    assert!(deleted.ok, "{}", deleted.message);
+
+    assert!(state.check_quotas("api").is_ok());
+}
+
+#[tokio::test]
+
+pub(super) async fn notification_rules_and_notifications_round_trip() {
+    let state = DaemonState::new();
+
+    let rule = post_json(
+        state.clone(),
+        "/api/notification-rules",
+        json!({
+
+            "name": "failures",
+
+            "event_types": ["task_failed"],
+
+            "scope_session": "api",
+
+            "webhook_url": "https://example.com/hook"
+
+        }),
+    )
+    .await;
+
+    assert!(rule.ok, "{}", rule.message);
+
+    let rule_id = rule.data.unwrap()["id"].as_str().unwrap().to_string();
+
+    let invalid = post_json(
+        state.clone(),
+        "/api/notification-rules",
+        json!({"name": "bad", "event_types": ["explosion"]}),
+    )
+    .await;
+
+    assert!(!invalid.ok);
+
+    let empty = get_json(state.clone(), "/api/notifications").await;
+
+    assert_eq!(empty.data.unwrap()["unread_count"], 0);
+
+    state
+        .store
+        .insert_notification(
+            "self-node",
+            Some(&rule_id),
+            Some("failures"),
+            "task_failed",
+            "critical",
+            Some("api"),
+            Some("dev"),
+            "task failed: dev",
+            "dev exited with code 1",
+            &json!({"exit_code": 1}),
         )
+        .unwrap();
 
-        .await;
+    let listed = get_json(state.clone(), "/api/notifications").await;
 
-        assert!(created.ok, "{}", created.message);
+    let data = listed.data.unwrap();
 
-        assert_eq!(created.data.unwrap()["session"], "api");
+    assert_eq!(data["notifications"].as_array().unwrap().len(), 1);
 
+    assert_eq!(data["unread_count"], 1);
 
+    let read = post_json(
+        state.clone(),
+        "/api/notifications/read",
+        json!({"all": true}),
+    )
+    .await;
 
-        let node_quota = post_json(
+    assert!(read.ok, "{}", read.message);
 
-            state.clone(),
+    let listed = get_json(state.clone(), "/api/notifications").await;
 
-            "/api/quotas",
+    assert_eq!(listed.data.unwrap()["unread_count"], 0);
 
-            json!({"max_running_tasks": 8}),
+    let updated = request_json(
+        state.clone(),
+        "PUT",
+        &format!("/api/notification-rules/{rule_id}"),
+        Some(json!({
 
-        )
+            "name": "failures",
 
-        .await;
+            "event_types": ["task_failed", "task_stopped"],
 
-        assert!(node_quota.ok, "{}", node_quota.message);
+            "enabled": false
 
+        })),
+    )
+    .await;
 
+    assert!(updated.ok, "{}", updated.message);
 
-        let duplicate = post_json(
+    assert!(!updated.data.unwrap()["enabled"].as_bool().unwrap());
 
-            state.clone(),
+    let deleted = request_json(
+        state.clone(),
+        "DELETE",
+        &format!("/api/notification-rules/{rule_id}"),
+        None,
+    )
+    .await;
 
-            "/api/quotas",
+    assert!(deleted.ok, "{}", deleted.message);
+}
 
-            json!({"session": "api", "max_running_tasks": 3}),
+#[tokio::test]
 
-        )
+pub(super) async fn api_tokens_authenticate_external_clients() {
+    let state = DaemonState::new();
 
-        .await;
+    let created = post_json(state.clone(), "/api/tokens", json!({"name": "ci"})).await;
 
-        assert!(!duplicate.ok);
+    assert!(created.ok, "{}", created.message);
 
+    let data = created.data.unwrap();
 
+    let secret = data["secret"].as_str().unwrap().to_string();
 
-        let invalid = post_json(
+    let token_id = data["id"].as_str().unwrap().to_string();
 
-            state.clone(),
+    assert!(secret.starts_with("tdk_"));
 
-            "/api/quotas",
+    let listed = get_json(state.clone(), "/api/tokens").await;
 
-            json!({"max_running_tasks": 0}),
+    let listed_data = listed.data.unwrap();
 
-        )
+    let tokens = listed_data["tokens"].as_array().unwrap();
 
-        .await;
+    assert_eq!(tokens.len(), 1);
 
-        assert!(!invalid.ok);
+    assert!(tokens[0].get("secret").is_none());
 
+    state.store.set_access_key("test-access-key").unwrap();
 
+    state.store.configure_auth(true).unwrap();
 
-        let list = get_json(state.clone(), "/api/quotas").await;
+    let unauthorized = http_route(state.clone(), "GET", "/api/quotas", &[], None).await;
 
-        let data = list.data.unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 
-        assert_eq!(data["quotas"].as_array().unwrap().len(), 2);
+    let authorized = http_route(
+        state.clone(),
+        "GET",
+        "/api/quotas",
+        &[(header::AUTHORIZATION, &format!("Bearer {secret}"))],
+        None,
+    )
+    .await;
 
-        assert!(
+    assert_eq!(authorized.status(), StatusCode::OK);
 
-            data["sessions"]
-
-                .as_array()
-
-                .unwrap()
-
-                .iter()
-
-                .any(|s| s == "api")
-
-        );
-
-
-
-        let quota_id = data["quotas"][0]["id"].as_str().unwrap().to_string();
-
-        let updated = request_json(
-
-            state.clone(),
-
-            "PUT",
-
-            &format!("/api/quotas/{quota_id}"),
-
-            Some(json!({"session": "web", "max_running_tasks": 5})),
-
-        )
-
-        .await;
-
-        assert!(updated.ok, "{}", updated.message);
-
-
-
-        let deleted = request_json(
-
-            state.clone(),
-
-            "DELETE",
-
-            &format!("/api/quotas/{quota_id}"),
-
-            None,
-
-        )
-
-        .await;
-
-        assert!(deleted.ok, "{}", deleted.message);
-
-        assert!(state.check_quotas("api").is_ok());
-
-    }
-
-
-
-    #[tokio::test]
-
-    pub(super) async fn notification_rules_and_notifications_round_trip() {
-
-        let state = DaemonState::new();
-
-        let rule = post_json(
-
-            state.clone(),
-
-            "/api/notification-rules",
-
-            json!({
-
-                "name": "failures",
-
-                "event_types": ["task_failed"],
-
-                "scope_session": "api",
-
-                "webhook_url": "https://example.com/hook"
-
-            }),
-
-        )
-
-        .await;
-
-        assert!(rule.ok, "{}", rule.message);
-
-        let rule_id = rule.data.unwrap()["id"].as_str().unwrap().to_string();
-
-
-
-        let invalid = post_json(
-
-            state.clone(),
-
-            "/api/notification-rules",
-
-            json!({"name": "bad", "event_types": ["explosion"]}),
-
-        )
-
-        .await;
-
-        assert!(!invalid.ok);
-
-
-
-        let empty = get_json(state.clone(), "/api/notifications").await;
-
-        assert_eq!(empty.data.unwrap()["unread_count"], 0);
-
-
-
-        state
-
-            .store
-
-            .insert_notification(
-
-                "self-node",
-
-                Some(&rule_id),
-
-                Some("failures"),
-
-                "task_failed",
-
-                "critical",
-
-                Some("api"),
-
-                Some("dev"),
-
-                "task failed: dev",
-
-                "dev exited with code 1",
-
-                &json!({"exit_code": 1}),
-
-            )
-
-            .unwrap();
-
-
-
-        let listed = get_json(state.clone(), "/api/notifications").await;
-
-        let data = listed.data.unwrap();
-
-        assert_eq!(data["notifications"].as_array().unwrap().len(), 1);
-
-        assert_eq!(data["unread_count"], 1);
-
-
-
-        let read = post_json(
-
-            state.clone(),
-
-            "/api/notifications/read",
-
-            json!({"all": true}),
-
-        )
-
-        .await;
-
-        assert!(read.ok, "{}", read.message);
-
-        let listed = get_json(state.clone(), "/api/notifications").await;
-
-        assert_eq!(listed.data.unwrap()["unread_count"], 0);
-
-
-
-        let updated = request_json(
-
-            state.clone(),
-
-            "PUT",
-
-            &format!("/api/notification-rules/{rule_id}"),
-
-            Some(json!({
-
-                "name": "failures",
-
-                "event_types": ["task_failed", "task_stopped"],
-
-                "enabled": false
-
-            })),
-
-        )
-
-        .await;
-
-        assert!(updated.ok, "{}", updated.message);
-
-        assert!(!updated.data.unwrap()["enabled"].as_bool().unwrap());
-
-
-
-        let deleted = request_json(
-
-            state.clone(),
-
-            "DELETE",
-
-            &format!("/api/notification-rules/{rule_id}"),
-
-            None,
-
-        )
-
-        .await;
-
-        assert!(deleted.ok, "{}", deleted.message);
-
-    }
-
-
-
-    #[tokio::test]
-
-    pub(super) async fn api_tokens_authenticate_external_clients() {
-
-        let state = DaemonState::new();
-
-        let created = post_json(state.clone(), "/api/tokens", json!({"name": "ci"})).await;
-
-        assert!(created.ok, "{}", created.message);
-
-        let data = created.data.unwrap();
-
-        let secret = data["secret"].as_str().unwrap().to_string();
-
-        let token_id = data["id"].as_str().unwrap().to_string();
-
-        assert!(secret.starts_with("tdk_"));
-
-
-
-        let listed = get_json(state.clone(), "/api/tokens").await;
-
-        let listed_data = listed.data.unwrap();
-
-        let tokens = listed_data["tokens"].as_array().unwrap();
-
-        assert_eq!(tokens.len(), 1);
-
-        assert!(tokens[0].get("secret").is_none());
-
-
-
-        state.store.set_access_key("test-access-key").unwrap();
-
-        state.store.configure_auth(true).unwrap();
-
-
-
-        let unauthorized = http_route(state.clone(), "GET", "/api/quotas", &[], None).await;
-
-        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
-
-
-
-        let authorized = http_route(
-
-            state.clone(),
-
-            "GET",
-
-            "/api/quotas",
-
-            &[(header::AUTHORIZATION, &format!("Bearer {secret}"))],
-
-            None,
-
-        )
-
-        .await;
-
-        assert_eq!(authorized.status(), StatusCode::OK);
-
-
-
-        let revoked = http_route(
-
-            state.clone(),
-
-            "DELETE",
-
-            &format!("/api/tokens/{token_id}"),
-
-            &[(header::AUTHORIZATION, &format!("Bearer {secret}"))],
-
-            None,
-
-        )
-
-        .await;
-
-        assert_eq!(revoked.status(), StatusCode::OK);
-
-        let rejected = http_route(
-
-            state,
-
-            "GET",
-
-            "/api/quotas",
-
-            &[(header::AUTHORIZATION, &format!("Bearer {secret}"))],
-
-            None,
-
-        )
-
-        .await;
-
-        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
-
-    }
-
-
-
-    #[tokio::test]
-
-    pub(super) async fn board_templates_create_apply_export_import() {
-
-        let state = workflow_leader_state();
-
-        let board = post_json(
+    let revoked = http_route(
+        state.clone(),
+        "DELETE",
+        &format!("/api/tokens/{token_id}"),
+        &[(header::AUTHORIZATION, &format!("Bearer {secret}"))],
+        None,
+    )
+    .await;
+
+    assert_eq!(revoked.status(), StatusCode::OK);
+
+    let rejected = http_route(
+        state,
+        "GET",
+        "/api/quotas",
+        &[(header::AUTHORIZATION, &format!("Bearer {secret}"))],
+        None,
+    )
+    .await;
+
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+
+pub(super) async fn board_templates_create_apply_export_import() {
+    let state = workflow_leader_state();
+
+    let board = post_json(
 
             state.clone(),
 
@@ -445,482 +296,357 @@ use crate::runtime::SessionRuntime;
 
         .await;
 
-        assert!(board.ok, "{}", board.message);
+    assert!(board.ok, "{}", board.message);
 
-        let board_id = board.data.unwrap()["id"].as_str().unwrap().to_string();
+    let board_id = board.data.unwrap()["id"].as_str().unwrap().to_string();
 
+    let template = post_json(
+        state.clone(),
+        "/api/board-templates",
+        json!({"name": "Ops template", "source_board_id": board_id}),
+    )
+    .await;
 
+    assert!(template.ok, "{}", template.message);
 
-        let template = post_json(
+    let data = template.data.unwrap();
 
-            state.clone(),
+    let template_id = data["id"].as_str().unwrap().to_string();
 
-            "/api/board-templates",
+    assert_eq!(data["cards"].as_array().unwrap().len(), 1);
 
-            json!({"name": "Ops template", "source_board_id": board_id}),
+    let applied = post_json(
+        state.clone(),
+        &format!("/api/board-templates/{template_id}/apply"),
+        json!({"name": "Ops clone"}),
+    )
+    .await;
 
-        )
+    assert!(applied.ok, "{}", applied.message);
 
-        .await;
+    assert_eq!(applied.data.unwrap()["name"], "Ops clone");
 
-        assert!(template.ok, "{}", template.message);
+    let export = get_json(
+        state.clone(),
+        &format!("/api/board-templates/{template_id}/export"),
+    )
+    .await;
 
-        let data = template.data.unwrap();
+    let exported = export.data.unwrap();
 
-        let template_id = data["id"].as_str().unwrap().to_string();
+    assert_eq!(exported["kind"], "taskdeck_board_template");
 
-        assert_eq!(data["cards"].as_array().unwrap().len(), 1);
+    let deleted = request_json(
+        state.clone(),
+        "DELETE",
+        &format!("/api/board-templates/{template_id}"),
+        None,
+    )
+    .await;
 
+    assert!(deleted.ok, "{}", deleted.message);
 
+    let imported = post_json(state.clone(), "/api/board-templates/import", exported).await;
 
-        let applied = post_json(
+    assert!(imported.ok, "{}", imported.message);
 
-            state.clone(),
+    let listed = get_json(state.clone(), "/api/board-templates").await;
 
-            &format!("/api/board-templates/{template_id}/apply"),
+    let listed_data = listed.data.unwrap();
 
-            json!({"name": "Ops clone"}),
+    let templates = listed_data["templates"].as_array().unwrap();
 
-        )
+    assert_eq!(templates.len(), 1);
 
-        .await;
+    assert_eq!(templates[0]["name"], "Ops template");
+}
 
-        assert!(applied.ok, "{}", applied.message);
+#[tokio::test]
 
-        assert_eq!(applied.data.unwrap()["name"], "Ops clone");
+pub(super) async fn dependencies_api_validates_scope_and_cycles() {
+    let state = workflow_leader_state();
 
+    let created = post_json(
+        state.clone(),
+        "/api/dependencies",
+        json!({
 
+            "node_id": "self", "session": "api", "task": "dev",
 
-        let export = get_json(
+            "depends_node_id": "worker-7", "depends_session": "worker-api", "depends_task": "deploy"
 
-            state.clone(),
+        }),
+    )
+    .await;
 
-            &format!("/api/board-templates/{template_id}/export"),
+    assert!(created.ok, "{}", created.message);
 
-        )
+    let dependency = created.data.unwrap();
 
-        .await;
+    assert_eq!(dependency["required_state"], "running");
 
-        let exported = export.data.unwrap();
+    assert_eq!(dependency["target_exists"], true);
 
-        assert_eq!(exported["kind"], "taskdeck_board_template");
+    let dependency_id = dependency["id"].as_str().unwrap().to_string();
 
+    let duplicate = post_json(
+        state.clone(),
+        "/api/dependencies",
+        json!({
 
+            "node_id": "self", "session": "api", "task": "dev",
 
-        let deleted = request_json(
+            "depends_node_id": "worker-7", "depends_session": "worker-api", "depends_task": "deploy"
 
-            state.clone(),
+        }),
+    )
+    .await;
 
-            "DELETE",
+    assert!(!duplicate.ok);
 
-            &format!("/api/board-templates/{template_id}"),
+    let cycle = post_json(
+        state.clone(),
+        "/api/dependencies",
+        json!({
 
-            None,
+            "node_id": "worker-7", "session": "worker-api", "task": "deploy",
 
-        )
+            "depends_node_id": "self", "depends_session": "api", "depends_task": "dev"
 
-        .await;
+        }),
+    )
+    .await;
 
-        assert!(deleted.ok, "{}", deleted.message);
+    assert!(!cycle.ok);
 
+    assert!(cycle.message.contains("cycle"));
 
+    let unknown = post_json(
+        state.clone(),
+        "/api/dependencies",
+        json!({
 
-        let imported = post_json(state.clone(), "/api/board-templates/import", exported).await;
+            "node_id": "self", "session": "api", "task": "dev",
 
-        assert!(imported.ok, "{}", imported.message);
+            "depends_node_id": "ghost", "depends_session": "x", "depends_task": "y"
 
+        }),
+    )
+    .await;
 
+    assert!(!unknown.ok);
 
-        let listed = get_json(state.clone(), "/api/board-templates").await;
+    let list = get_json(state.clone(), "/api/dependencies").await;
 
-        let listed_data = listed.data.unwrap();
+    let data = list.data.unwrap();
 
-        let templates = listed_data["templates"].as_array().unwrap();
+    assert_eq!(data["dependencies"].as_array().unwrap().len(), 1);
 
-        assert_eq!(templates.len(), 1);
+    assert!(!data["targets"].as_array().unwrap().is_empty());
 
-        assert_eq!(templates[0]["name"], "Ops template");
+    let deleted = request_json(
+        state.clone(),
+        "DELETE",
+        &format!("/api/dependencies/{dependency_id}"),
+        None,
+    )
+    .await;
 
-    }
+    assert!(deleted.ok, "{}", deleted.message);
+}
 
+#[tokio::test]
 
+pub(super) async fn node_metrics_reports_nodes_and_status_counts() {
+    let state = workflow_leader_state();
 
-    #[tokio::test]
+    let listed = get_json(state.clone(), "/api/node-metrics").await;
 
-    pub(super) async fn dependencies_api_validates_scope_and_cycles() {
+    assert!(listed.ok, "{}", listed.message);
 
-        let state = workflow_leader_state();
+    let data = listed.data.unwrap();
 
-        let created = post_json(
+    let nodes = data["nodes"].as_array().unwrap();
 
-            state.clone(),
+    assert_eq!(nodes.len(), 2);
 
-            "/api/dependencies",
+    let self_entry = nodes.iter().find(|node| node["node_id"] == "self").unwrap();
 
-            json!({
+    assert!(self_entry["is_self"].as_bool().unwrap());
 
-                "node_id": "self", "session": "api", "task": "dev",
+    assert_eq!(self_entry["task_status_counts"]["idle"], 2);
 
-                "depends_node_id": "worker-7", "depends_session": "worker-api", "depends_task": "deploy"
+    assert!(data["task_status_counts"]["idle"].as_u64().unwrap() >= 3);
+}
 
-            }),
+#[tokio::test]
 
-        )
+pub(super) async fn node_metrics_includes_self_on_pure_master() {
+    let state = DaemonState::new();
 
-        .await;
+    let settings = state
+        .store
+        .configure(crate::state::NodeSettingsUpdate {
+            role: Some(crate::state::NodeRole::Leader),
 
-        assert!(created.ok, "{}", created.message);
+            leader_mode: Some(crate::state::LeaderMode::PureMaster),
 
-        let dependency = created.data.unwrap();
+            ..Default::default()
+        })
+        .unwrap();
 
-        assert_eq!(dependency["required_state"], "running");
+    *state.settings.lock().expect("node settings lock") = settings;
 
-        assert_eq!(dependency["target_exists"], true);
+    // Seed one self sample the way the daemon sampler would.
 
-        let dependency_id = dependency["id"].as_str().unwrap().to_string();
+    state.node_metrics.push(
+        &state.public_settings().node_id,
+        crate::protocol::NodeMetricsSample {
+            timestamp_ms: current_millis(),
 
+            cpu_percent: 12.5,
 
+            memory_bytes: 1_000,
 
-        let duplicate = post_json(
+            memory_total_bytes: 4_000,
 
-            state.clone(),
+            running_tasks: 0,
+        },
+    );
 
-            "/api/dependencies",
+    let listed = get_json(state, "/api/node-metrics").await;
 
-            json!({
+    assert!(listed.ok, "{}", listed.message);
 
-                "node_id": "self", "session": "api", "task": "dev",
+    let nodes = listed.data.unwrap()["nodes"].as_array().unwrap().clone();
 
-                "depends_node_id": "worker-7", "depends_session": "worker-api", "depends_task": "deploy"
+    assert_eq!(nodes.len(), 1);
 
-            }),
+    assert!(nodes[0]["is_self"].as_bool().unwrap());
 
-        )
+    assert_eq!(nodes[0]["current"]["cpu_percent"], 12.5);
 
-        .await;
+    assert_eq!(nodes[0]["session_count"], 0);
+}
 
-        assert!(!duplicate.ok);
+#[tokio::test]
 
+pub(super) async fn scaling_policies_api_crud_and_validation() {
+    let state = workflow_leader_state();
 
+    let created = post_json(
+        state.clone(),
+        "/api/scaling-policies",
+        json!({
 
-        let cycle = post_json(
+            "name": "api autoscale",
 
-            state.clone(),
+            "watch_node_id": "self",
 
-            "/api/dependencies",
+            "watch_session": "api",
 
-            json!({
+            "watch_task": "dev",
 
-                "node_id": "worker-7", "session": "worker-api", "task": "deploy",
+            "metric": "cpu_percent",
 
-                "depends_node_id": "self", "depends_session": "api", "depends_task": "dev"
+            "scale_out_threshold": 80.0,
 
-            }),
+            "scale_in_threshold": 20.0,
 
-        )
+            "scale_out_node_id": "self",
 
-        .await;
+            "scale_out_session": "api",
 
-        assert!(!cycle.ok);
+            "scale_out_task": "dev-replica",
 
-        assert!(cycle.message.contains("cycle"));
+            "cooldown_seconds": 60
 
+        }),
+    )
+    .await;
 
+    assert!(created.ok, "{}", created.message);
 
-        let unknown = post_json(
+    let policy_id = created.data.unwrap()["id"].as_str().unwrap().to_string();
 
-            state.clone(),
+    let invalid = post_json(
+        state.clone(),
+        "/api/scaling-policies",
+        json!({
 
-            "/api/dependencies",
+            "name": "bad",
 
-            json!({
+            "watch_node_id": "self",
 
-                "node_id": "self", "session": "api", "task": "dev",
+            "watch_session": "api",
 
-                "depends_node_id": "ghost", "depends_session": "x", "depends_task": "y"
+            "watch_task": "dev",
 
-            }),
+            "metric": "cpu_percent",
 
-        )
+            "scale_out_threshold": 20.0,
 
-        .await;
+            "scale_in_threshold": 80.0,
 
-        assert!(!unknown.ok);
+            "scale_out_node_id": "self",
 
+            "scale_out_session": "api",
 
+            "scale_out_task": "dev-replica"
 
-        let list = get_json(state.clone(), "/api/dependencies").await;
+        }),
+    )
+    .await;
 
-        let data = list.data.unwrap();
+    assert!(!invalid.ok);
 
-        assert_eq!(data["dependencies"].as_array().unwrap().len(), 1);
+    let list = get_json(state.clone(), "/api/scaling-policies").await;
 
-        assert!(!data["targets"].as_array().unwrap().is_empty());
+    let data = list.data.unwrap();
 
+    assert_eq!(data["policies"].as_array().unwrap().len(), 1);
 
+    assert!(!data["targets"].as_array().unwrap().is_empty());
 
-        let deleted = request_json(
+    let updated = request_json(
+        state.clone(),
+        "PUT",
+        &format!("/api/scaling-policies/{policy_id}"),
+        Some(json!({
 
-            state.clone(),
+            "name": "api autoscale v2",
 
-            "DELETE",
+            "watch_node_id": "self",
 
-            &format!("/api/dependencies/{dependency_id}"),
+            "watch_session": "api",
 
-            None,
+            "watch_task": "dev",
 
-        )
+            "metric": "memory_bytes",
 
-        .await;
+            "scale_out_threshold": 1000000000.0,
 
-        assert!(deleted.ok, "{}", deleted.message);
+            "scale_in_threshold": 100000000.0,
 
-    }
+            "scale_out_node_id": "self",
 
+            "scale_out_session": "api",
 
+            "scale_out_task": "dev-replica"
 
-    #[tokio::test]
+        })),
+    )
+    .await;
 
-    pub(super) async fn node_metrics_reports_nodes_and_status_counts() {
+    assert!(updated.ok, "{}", updated.message);
 
-        let state = workflow_leader_state();
+    let deleted = request_json(
+        state.clone(),
+        "DELETE",
+        &format!("/api/scaling-policies/{policy_id}"),
+        None,
+    )
+    .await;
 
-        let listed = get_json(state.clone(), "/api/node-metrics").await;
-
-        assert!(listed.ok, "{}", listed.message);
-
-        let data = listed.data.unwrap();
-
-        let nodes = data["nodes"].as_array().unwrap();
-
-        assert_eq!(nodes.len(), 2);
-
-        let self_entry = nodes.iter().find(|node| node["node_id"] == "self").unwrap();
-
-        assert!(self_entry["is_self"].as_bool().unwrap());
-
-        assert_eq!(self_entry["task_status_counts"]["idle"], 2);
-
-        assert!(data["task_status_counts"]["idle"].as_u64().unwrap() >= 3);
-
-    }
-
-
-
-    #[tokio::test]
-
-    pub(super) async fn node_metrics_includes_self_on_pure_master() {
-
-        let state = DaemonState::new();
-
-        let settings = state
-
-            .store
-
-            .configure(crate::state::NodeSettingsUpdate {
-
-                role: Some(crate::state::NodeRole::Leader),
-
-                leader_mode: Some(crate::state::LeaderMode::PureMaster),
-
-                ..Default::default()
-
-            })
-
-            .unwrap();
-
-        *state.settings.lock().expect("node settings lock") = settings;
-
-        // Seed one self sample the way the daemon sampler would.
-
-        state.node_metrics.push(
-
-            &state.public_settings().node_id,
-
-            crate::protocol::NodeMetricsSample {
-
-                timestamp_ms: current_millis(),
-
-                cpu_percent: 12.5,
-
-                memory_bytes: 1_000,
-
-                memory_total_bytes: 4_000,
-
-                running_tasks: 0,
-
-            },
-
-        );
-
-        let listed = get_json(state, "/api/node-metrics").await;
-
-        assert!(listed.ok, "{}", listed.message);
-
-        let nodes = listed.data.unwrap()["nodes"].as_array().unwrap().clone();
-
-        assert_eq!(nodes.len(), 1);
-
-        assert!(nodes[0]["is_self"].as_bool().unwrap());
-
-        assert_eq!(nodes[0]["current"]["cpu_percent"], 12.5);
-
-        assert_eq!(nodes[0]["session_count"], 0);
-
-    }
-
-
-
-    #[tokio::test]
-
-    pub(super) async fn scaling_policies_api_crud_and_validation() {
-
-        let state = workflow_leader_state();
-
-        let created = post_json(
-
-            state.clone(),
-
-            "/api/scaling-policies",
-
-            json!({
-
-                "name": "api autoscale",
-
-                "watch_node_id": "self",
-
-                "watch_session": "api",
-
-                "watch_task": "dev",
-
-                "metric": "cpu_percent",
-
-                "scale_out_threshold": 80.0,
-
-                "scale_in_threshold": 20.0,
-
-                "scale_out_node_id": "self",
-
-                "scale_out_session": "api",
-
-                "scale_out_task": "dev-replica",
-
-                "cooldown_seconds": 60
-
-            }),
-
-        )
-
-        .await;
-
-        assert!(created.ok, "{}", created.message);
-
-        let policy_id = created.data.unwrap()["id"].as_str().unwrap().to_string();
-
-
-
-        let invalid = post_json(
-
-            state.clone(),
-
-            "/api/scaling-policies",
-
-            json!({
-
-                "name": "bad",
-
-                "watch_node_id": "self",
-
-                "watch_session": "api",
-
-                "watch_task": "dev",
-
-                "metric": "cpu_percent",
-
-                "scale_out_threshold": 20.0,
-
-                "scale_in_threshold": 80.0,
-
-                "scale_out_node_id": "self",
-
-                "scale_out_session": "api",
-
-                "scale_out_task": "dev-replica"
-
-            }),
-
-        )
-
-        .await;
-
-        assert!(!invalid.ok);
-
-
-
-        let list = get_json(state.clone(), "/api/scaling-policies").await;
-
-        let data = list.data.unwrap();
-
-        assert_eq!(data["policies"].as_array().unwrap().len(), 1);
-
-        assert!(!data["targets"].as_array().unwrap().is_empty());
-
-
-
-        let updated = request_json(
-
-            state.clone(),
-
-            "PUT",
-
-            &format!("/api/scaling-policies/{policy_id}"),
-
-            Some(json!({
-
-                "name": "api autoscale v2",
-
-                "watch_node_id": "self",
-
-                "watch_session": "api",
-
-                "watch_task": "dev",
-
-                "metric": "memory_bytes",
-
-                "scale_out_threshold": 1000000000.0,
-
-                "scale_in_threshold": 100000000.0,
-
-                "scale_out_node_id": "self",
-
-                "scale_out_session": "api",
-
-                "scale_out_task": "dev-replica"
-
-            })),
-
-        )
-
-        .await;
-
-        assert!(updated.ok, "{}", updated.message);
-
-
-
-        let deleted = request_json(
-
-            state.clone(),
-
-            "DELETE",
-
-            &format!("/api/scaling-policies/{policy_id}"),
-
-            None,
-
-        )
-
-        .await;
-
-        assert!(deleted.ok, "{}", deleted.message);
-
-    }
+    assert!(deleted.ok, "{}", deleted.message);
+}

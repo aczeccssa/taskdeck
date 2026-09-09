@@ -1,6 +1,5 @@
 //! Auth settings, API tokens and access-key hashing.
 
-
 use anyhow::{Context, Result, bail};
 use argon2::{
     Argon2,
@@ -12,7 +11,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::util::*;
-use super::{StateStore, AUTH_SESSION_TTL_SECONDS};
+use super::{AUTH_SESSION_TTL_SECONDS, StateStore};
 use crate::protocol::*;
 
 impl StateStore {
@@ -95,7 +94,6 @@ impl StateStore {
             _ => Ok(false),
         }
     }
-
 }
 
 impl StateStore {
@@ -200,7 +198,6 @@ impl StateStore {
         };
         Ok(verify_access_key(candidate, &hash))
     }
-
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,4 +272,3 @@ pub(super) fn write_auth_settings(connection: &Connection, settings: &AuthSettin
     )?;
     Ok(())
 }
-

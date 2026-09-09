@@ -1,13 +1,12 @@
 //! Audit record persistence.
 
-
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params, params_from_iter};
 use uuid::Uuid;
 
 use super::pagination::*;
 use super::util::*;
-use super::{StateStore, AUDIT_RETENTION_LIMIT};
+use super::{AUDIT_RETENTION_LIMIT, StateStore};
 use crate::protocol::*;
 
 impl StateStore {
@@ -204,7 +203,6 @@ impl StateStore {
         )?;
         Ok(deleted)
     }
-
 }
 
 pub(super) fn paginated_audit(
@@ -346,4 +344,3 @@ pub(super) fn map_audit_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Audi
         replicated_at_ms: row.get::<_, Option<i64>>(18)?.map(|value| value as u64),
     })
 }
-

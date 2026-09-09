@@ -50,25 +50,17 @@ use super::quotas::*;
 use super::sessions::*;
 use super::tokens::*;
 use super::workflow_groups::*;
+use super::workflow_groups::{ordered_task_labels, workflow_context, workflow_targets};
 use super::workflow_runs::*;
 use super::workspaces::*;
-use super::workflow_groups::{ordered_task_labels, workflow_context, workflow_targets};
 pub(crate) fn task_status_key(status: &crate::protocol::TaskStatus) -> String {
-
     serde_json::to_value(status)
-
         .ok()
-
         .and_then(|value| value.as_str().map(str::to_string))
-
         .unwrap_or_else(|| format!("{status:?}"))
-
 }
 
-
-
 pub(crate) async fn node_metrics(State(state): State<DaemonState>) -> Json<Response> {
-
     let nodes = state.node_summaries();
 
     let mut entries = Vec::new();
@@ -76,15 +68,10 @@ pub(crate) async fn node_metrics(State(state): State<DaemonState>) -> Json<Respo
     let mut totals: std::collections::BTreeMap<String, u32> = Default::default();
 
     for node in nodes {
-
         let inventory = if node.id == "self" {
-
             state.local_inventory()
-
         } else {
-
             state.cluster.cached_inventory(&node.id).unwrap_or_default()
-
         };
 
         let session_count = inventory.len();
@@ -92,43 +79,28 @@ pub(crate) async fn node_metrics(State(state): State<DaemonState>) -> Json<Respo
         let mut status_counts: std::collections::BTreeMap<String, u32> = Default::default();
 
         for session in &inventory {
-
             for task in session.tasks.values() {
-
                 *status_counts
-
                     .entry(task_status_key(&task.status))
-
                     .or_insert(0) += 1;
-
             }
-
         }
 
         for (status, count) in &status_counts {
-
             *totals.entry(status.clone()).or_insert(0) += count;
-
         }
 
         let metrics_node_id = if node.id == "self" {
-
             state.public_settings().node_id.clone()
-
         } else {
-
             node.id.clone()
-
         };
 
         let samples = state
-
             .node_metrics
-
             .window(&metrics_node_id, crate::daemon::MAX_NODE_METRIC_SAMPLES);
 
         entries.push(crate::protocol::NodeMetricsEntryView {
-
             node_id: node.id.clone(),
 
             node_name: Some(node.name.clone()),
@@ -144,9 +116,7 @@ pub(crate) async fn node_metrics(State(state): State<DaemonState>) -> Json<Respo
             session_count,
 
             task_status_counts: status_counts,
-
         });
-
     }
 
     // Pure masters have no self executor, so node_summaries() omits this node;
@@ -156,15 +126,11 @@ pub(crate) async fn node_metrics(State(state): State<DaemonState>) -> Json<Respo
     let self_node_id = state.public_settings().node_id;
 
     if !entries.iter().any(|entry| entry.is_self) {
-
         let samples = state
-
             .node_metrics
-
             .window(&self_node_id, crate::daemon::MAX_NODE_METRIC_SAMPLES);
 
         entries.push(crate::protocol::NodeMetricsEntryView {
-
             node_id: "self".to_string(),
 
             node_name: Some(state.public_settings().name),
@@ -180,28 +146,18 @@ pub(crate) async fn node_metrics(State(state): State<DaemonState>) -> Json<Respo
             session_count: 0,
 
             task_status_counts: Default::default(),
-
         });
-
     }
 
     Json(Response::ok(
-
         "node metrics",
-
         NodeMetricsView {
-
             nodes: entries,
 
             task_status_counts: totals,
-
         },
-
     ))
-
 }
-
-
 
 // ---------------------------------------------------------------------------
 
@@ -209,44 +165,28 @@ pub(crate) async fn node_metrics(State(state): State<DaemonState>) -> Json<Respo
 
 // ---------------------------------------------------------------------------
 
-
-
 pub(crate) async fn list_scaling_policies(State(state): State<DaemonState>) -> Json<Response> {
-
     Json(match state.store.scaling_policies() {
-
         Ok(policies) => {
-
             let (nodes, inventories) = workflow_context(&state);
 
             let targets = workflow_targets(&nodes, &inventories);
 
             Response::ok(
-
                 "scaling policies",
-
                 ScalingPoliciesView { policies, targets },
-
             )
-
         }
 
         Err(error) => Response::error(format!("{error:#}")),
-
     })
-
 }
 
-
-
 pub(crate) async fn create_scaling_policy(
-
     State(state): State<DaemonState>,
 
     Json(input): Json<ScalingPolicyInput>,
-
 ) -> Json<Response> {
-
     let started_at_ms = current_millis();
 
     let started = Instant::now();
@@ -254,51 +194,33 @@ pub(crate) async fn create_scaling_policy(
     let request = serde_json::to_value(&input).unwrap_or_else(|_| json!({}));
 
     let response = match state.store.create_scaling_policy(input) {
-
         Ok(policy) => Response::ok("scaling policy created", policy),
 
         Err(error) => Response::error(format!("{error:#}")),
-
     };
 
     record_feature_http_audit(
-
         &state,
-
         "scaling_policy",
-
         "scaling_policy_create",
-
         "policy_id",
-
         None,
-
         request,
-
         &response,
-
         started_at_ms,
-
         started.elapsed().as_millis() as u64,
-
     );
 
     Json(response)
-
 }
 
-
-
 pub(crate) async fn update_scaling_policy(
-
     State(state): State<DaemonState>,
 
     Path(policy): Path<String>,
 
     Json(input): Json<ScalingPolicyInput>,
-
 ) -> Json<Response> {
-
     let started_at_ms = current_millis();
 
     let started = Instant::now();
@@ -306,49 +228,31 @@ pub(crate) async fn update_scaling_policy(
     let request = serde_json::to_value(&input).unwrap_or_else(|_| json!({}));
 
     let response = match state.store.update_scaling_policy(&policy, input) {
-
         Ok(policy) => Response::ok("scaling policy updated", policy),
 
         Err(error) => Response::error(format!("{error:#}")),
-
     };
 
     record_feature_http_audit(
-
         &state,
-
         "scaling_policy",
-
         "scaling_policy_update",
-
         "policy_id",
-
         Some(&policy),
-
         request,
-
         &response,
-
         started_at_ms,
-
         started.elapsed().as_millis() as u64,
-
     );
 
     Json(response)
-
 }
 
-
-
 pub(crate) async fn delete_scaling_policy(
-
     State(state): State<DaemonState>,
 
     Path(policy): Path<String>,
-
 ) -> Json<Response> {
-
     let started_at_ms = current_millis();
 
     let started = Instant::now();
@@ -356,37 +260,24 @@ pub(crate) async fn delete_scaling_policy(
     let request = json!({"id": policy});
 
     let response = match state.store.delete_scaling_policy(&policy) {
-
         Ok(true) => Response::empty("scaling policy deleted"),
 
         Ok(false) => Response::error(format!("scaling policy '{policy}' not found")),
 
         Err(error) => Response::error(format!("{error:#}")),
-
     };
 
     record_feature_http_audit(
-
         &state,
-
         "scaling_policy",
-
         "scaling_policy_delete",
-
         "policy_id",
-
         Some(&policy),
-
         request,
-
         &response,
-
         started_at_ms,
-
         started.elapsed().as_millis() as u64,
-
     );
 
     Json(response)
-
 }

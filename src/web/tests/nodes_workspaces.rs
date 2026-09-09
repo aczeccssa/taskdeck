@@ -13,342 +13,262 @@ use super::helpers::*;
 use crate::config::{ProjectDefinition, TaskSpec};
 use crate::runtime::SessionRuntime;
 
-    #[tokio::test]
+#[tokio::test]
 
-    pub(super) async fn workspaces_api_lists_and_updates_aliases_without_changing_session_id() {
+pub(super) async fn workspaces_api_lists_and_updates_aliases_without_changing_session_id() {
+    let state = DaemonState::new();
 
-        let state = DaemonState::new();
+    state
+        .store
+        .upsert_registration("api", &PathBuf::from("/tmp/api"))
+        .unwrap();
 
-        state
+    let response = http_route(state.clone(), "GET", "/api/workspaces", &[], None).await;
 
-            .store
+    assert_eq!(response.status(), StatusCode::OK);
 
-            .upsert_registration("api", &PathBuf::from("/tmp/api"))
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
 
-            .unwrap();
+    let parsed: Response = serde_json::from_slice(&body).unwrap();
 
-        let response = http_route(state.clone(), "GET", "/api/workspaces", &[], None).await;
+    let data = parsed.data.unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(data[0]["session"], "api");
 
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(data[0]["display_name"], "api");
 
-        let parsed: Response = serde_json::from_slice(&body).unwrap();
+    let response = http_route(
+        state,
+        "PUT",
+        "/api/workspaces/api/alias",
+        &[(header::CONTENT_TYPE, "application/json")],
+        Some(r#"{"alias":"Backend API"}"#),
+    )
+    .await;
 
-        let data = parsed.data.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 
-        assert_eq!(data[0]["session"], "api");
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
 
-        assert_eq!(data[0]["display_name"], "api");
+    let parsed: Response = serde_json::from_slice(&body).unwrap();
 
-        let response = http_route(
+    let data = parsed.data.unwrap();
 
-            state,
+    assert_eq!(data["session"], "api");
 
-            "PUT",
+    assert_eq!(data["alias"], "Backend API");
 
-            "/api/workspaces/api/alias",
+    assert_eq!(data["display_name"], "Backend API");
+}
 
-            &[(header::CONTENT_TYPE, "application/json")],
+#[tokio::test]
 
-            Some(r#"{"alias":"Backend API"}"#),
+pub(super) async fn node_settings_api_keeps_token_hidden_and_reports_restart() {
+    let state = DaemonState::new();
 
-        )
+    let response = http_route(state.clone(), "GET", "/api/nodes/self/settings", &[], None).await;
 
-        .await;
+    assert_eq!(response.status(), StatusCode::OK);
 
-        assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
 
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let parsed: Response = serde_json::from_slice(&body).unwrap();
 
-        let parsed: Response = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed.data.unwrap()["has_enrollment_token"], false);
 
-        let data = parsed.data.unwrap();
+    let body = serde_json::json!({
 
-        assert_eq!(data["session"], "api");
+        "bind_host": "127.0.0.1",
 
-        assert_eq!(data["alias"], "Backend API");
+        "web_port": 9937,
 
-        assert_eq!(data["display_name"], "Backend API");
+        "enrollment_token": {"mode":"set","value":"secret"}
 
-    }
+    })
+    .to_string();
 
+    let response = http_route(
+        state,
+        "PUT",
+        "/api/nodes/self/settings",
+        &[(header::CONTENT_TYPE, "application/json")],
+        Some(&body),
+    )
+    .await;
 
+    assert_eq!(response.status(), StatusCode::OK);
 
-    #[tokio::test]
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
 
-    pub(super) async fn node_settings_api_keeps_token_hidden_and_reports_restart() {
+    let text = String::from_utf8_lossy(&body).to_string();
 
-        let state = DaemonState::new();
+    assert!(!text.contains("secret"));
 
-        let response =
+    let parsed: Response = serde_json::from_slice(&body).unwrap();
 
-            http_route(state.clone(), "GET", "/api/nodes/self/settings", &[], None).await;
+    let data = parsed.data.unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(data["restart_required"], true);
 
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(data["settings"]["has_enrollment_token"], true);
+}
 
-        let parsed: Response = serde_json::from_slice(&body).unwrap();
+#[tokio::test]
 
-        assert_eq!(parsed.data.unwrap()["has_enrollment_token"], false);
+pub(super) async fn workspaces_route_uses_cached_aliases_for_offline_worker() {
+    let mut state = DaemonState::new();
 
-        let body = serde_json::json!({
+    let settings = state
+        .store
+        .configure(crate::state::NodeSettingsUpdate {
+            role: Some(crate::state::NodeRole::Leader),
 
-            "bind_host": "127.0.0.1",
-
-            "web_port": 9937,
-
-            "enrollment_token": {"mode":"set","value":"secret"}
-
+            ..Default::default()
         })
+        .unwrap();
 
-        .to_string();
+    *state.settings.lock().expect("node settings lock") = settings;
 
-        let response = http_route(
+    let snapshot = crate::protocol::SessionSnapshot {
+        name: "api".to_string(),
 
-            state,
+        alias: Some("Backend API".to_string()),
 
-            "PUT",
+        project: PathBuf::from("/tmp/api"),
 
-            "/api/nodes/self/settings",
+        source: "taskdeck.yaml".to_string(),
 
-            &[(header::CONTENT_TYPE, "application/json")],
+        tasks: Default::default(),
 
-            Some(&body),
+        task_order: Vec::new(),
+    };
 
+    state
+        .store
+        .upsert_worker(
+            "worker-7",
+            "Worker",
+            current_millis(),
+            &serde_json::to_string(&vec![snapshot]).unwrap(),
         )
+        .unwrap();
 
-        .await;
+    state.cluster = crate::cluster::LeaderCluster::new(state.store.clone(), None).unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+    let response = http_route(state, "GET", "/api/workspaces?node=worker-7", &[], None).await;
 
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 
-        let text = String::from_utf8_lossy(&body).to_string();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
 
-        assert!(!text.contains("secret"));
+    let parsed: Response = serde_json::from_slice(&body).unwrap();
 
-        let parsed: Response = serde_json::from_slice(&body).unwrap();
+    let data = parsed.data.unwrap();
 
-        let data = parsed.data.unwrap();
+    assert_eq!(data[0]["session"], "api");
 
-        assert_eq!(data["restart_required"], true);
+    assert_eq!(data[0]["alias"], "Backend API");
 
-        assert_eq!(data["settings"]["has_enrollment_token"], true);
+    assert_eq!(data[0]["display_name"], "Backend API");
+}
 
-    }
+#[tokio::test]
 
+pub(super) async fn node_settings_and_service_actions_are_audited_with_token_redaction() {
+    let state = DaemonState::new();
 
+    let body = serde_json::json!({
 
-    #[tokio::test]
+        "web_port": 9937,
 
-    pub(super) async fn workspaces_route_uses_cached_aliases_for_offline_worker() {
+        "enrollment_token": {"mode":"set","value":"secret"}
 
-        let mut state = DaemonState::new();
+    })
+    .to_string();
 
-        let settings = state
+    let response = http_route(
+        state.clone(),
+        "PUT",
+        "/api/nodes/self/settings",
+        &[(header::CONTENT_TYPE, "application/json")],
+        Some(&body),
+    )
+    .await;
 
-            .store
+    assert_eq!(response.status(), StatusCode::OK);
 
-            .configure(crate::state::NodeSettingsUpdate {
+    let body = serde_json::json!({"action":"status","scope":"user"}).to_string();
 
-                role: Some(crate::state::NodeRole::Leader),
+    let response = http_route(
+        state.clone(),
+        "POST",
+        "/api/nodes/self/service",
+        &[(header::CONTENT_TYPE, "application/json")],
+        Some(&body),
+    )
+    .await;
 
-                ..Default::default()
+    assert_eq!(response.status(), StatusCode::OK);
 
-            })
+    let settings_page = state
+        .store
+        .list_audit(&AuditFilter {
+            q: None,
 
-            .unwrap();
+            source: Some("web".to_string()),
 
-        *state.settings.lock().expect("node settings lock") = settings;
+            status: None,
 
-        let snapshot = crate::protocol::SessionSnapshot {
+            node: None,
 
-            name: "api".to_string(),
+            session: None,
 
-            alias: Some("Backend API".to_string()),
+            task: None,
 
-            project: PathBuf::from("/tmp/api"),
+            operation: Some("put_node_settings".to_string()),
 
-            source: "taskdeck.yaml".to_string(),
+            page: 1,
 
-            tasks: Default::default(),
-
-            task_order: Vec::new(),
-
-        };
-
-        state
-
-            .store
-
-            .upsert_worker(
-
-                "worker-7",
-
-                "Worker",
-
-                current_millis(),
-
-                &serde_json::to_string(&vec![snapshot]).unwrap(),
-
-            )
-
-            .unwrap();
-
-        state.cluster = crate::cluster::LeaderCluster::new(state.store.clone(), None).unwrap();
-
-        let response = http_route(state, "GET", "/api/workspaces?node=worker-7", &[], None).await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-
-        let parsed: Response = serde_json::from_slice(&body).unwrap();
-
-        let data = parsed.data.unwrap();
-
-        assert_eq!(data[0]["session"], "api");
-
-        assert_eq!(data[0]["alias"], "Backend API");
-
-        assert_eq!(data[0]["display_name"], "Backend API");
-
-    }
-
-
-
-    #[tokio::test]
-
-    pub(super) async fn node_settings_and_service_actions_are_audited_with_token_redaction() {
-
-        let state = DaemonState::new();
-
-        let body = serde_json::json!({
-
-            "web_port": 9937,
-
-            "enrollment_token": {"mode":"set","value":"secret"}
-
+            page_size: 20,
         })
+        .unwrap();
 
-        .to_string();
+    assert_eq!(settings_page.total, 1);
 
-        let response = http_route(
+    let settings_detail = state
+        .store
+        .audit_detail(&settings_page.items[0].audit_id)
+        .unwrap()
+        .unwrap();
 
-            state.clone(),
+    let request_text = serde_json::to_string(&settings_detail.request).unwrap();
 
-            "PUT",
+    assert!(!request_text.contains("secret"));
 
-            "/api/nodes/self/settings",
+    let service_page = state
+        .store
+        .list_audit(&AuditFilter {
+            q: None,
 
-            &[(header::CONTENT_TYPE, "application/json")],
+            source: Some("web".to_string()),
 
-            Some(&body),
+            status: None,
 
-        )
+            node: None,
 
-        .await;
+            session: None,
 
-        assert_eq!(response.status(), StatusCode::OK);
+            task: None,
 
-        let body = serde_json::json!({"action":"status","scope":"user"}).to_string();
+            operation: Some("status".to_string()),
 
-        let response = http_route(
+            page: 1,
 
-            state.clone(),
+            page_size: 20,
+        })
+        .unwrap();
 
-            "POST",
+    assert_eq!(service_page.total, 1);
 
-            "/api/nodes/self/service",
-
-            &[(header::CONTENT_TYPE, "application/json")],
-
-            Some(&body),
-
-        )
-
-        .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let settings_page = state
-
-            .store
-
-            .list_audit(&AuditFilter {
-
-                q: None,
-
-                source: Some("web".to_string()),
-
-                status: None,
-
-                node: None,
-
-                session: None,
-
-                task: None,
-
-                operation: Some("put_node_settings".to_string()),
-
-                page: 1,
-
-                page_size: 20,
-
-            })
-
-            .unwrap();
-
-        assert_eq!(settings_page.total, 1);
-
-        let settings_detail = state
-
-            .store
-
-            .audit_detail(&settings_page.items[0].audit_id)
-
-            .unwrap()
-
-            .unwrap();
-
-        let request_text = serde_json::to_string(&settings_detail.request).unwrap();
-
-        assert!(!request_text.contains("secret"));
-
-        let service_page = state
-
-            .store
-
-            .list_audit(&AuditFilter {
-
-                q: None,
-
-                source: Some("web".to_string()),
-
-                status: None,
-
-                node: None,
-
-                session: None,
-
-                task: None,
-
-                operation: Some("status".to_string()),
-
-                page: 1,
-
-                page_size: 20,
-
-            })
-
-            .unwrap();
-
-        assert_eq!(service_page.total, 1);
-
-        assert_eq!(service_page.items[0].operation, "status");
-
-    }
-
-
+    assert_eq!(service_page.items[0].operation, "status");
+}

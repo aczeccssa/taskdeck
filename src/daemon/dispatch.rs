@@ -23,13 +23,13 @@ use super::audit::{record_audit_value, record_request_audit};
 use super::client::GlobalPaths;
 use super::handle::handle;
 use super::metrics::{
-    MAX_TASK_METRIC_SAMPLES, NodeMetricsStore, TASK_METRICS_SAMPLE_INTERVAL_MS,
-    TaskMetricsKey, TaskMetricsStore, TaskMetricsTarget,
+    MAX_TASK_METRIC_SAMPLES, NodeMetricsStore, TASK_METRICS_SAMPLE_INTERVAL_MS, TaskMetricsKey,
+    TaskMetricsStore, TaskMetricsTarget,
 };
 use super::notifications::{collect_run_transitions, emit_transition_notifications};
 use super::process_tree::{
-    aggregate_process_tree, collect_metric_targets, current_metric_keys, observed_processes,
-    running_metric_targets, AggregatedProcessTree, ObservedProcess,
+    AggregatedProcessTree, ObservedProcess, aggregate_process_tree, collect_metric_targets,
+    current_metric_keys, observed_processes, running_metric_targets,
 };
 use super::state::DaemonState;
 use super::util::{ScheduleKey, current_timestamp_ms, status_label};
@@ -46,17 +46,11 @@ use crate::state::{NodeRole, NodeSettings, StateStore};
 
 impl DaemonState {
     pub async fn dispatch_node(&self, node: &str, request: RemoteRequest) -> Response {
-
         self.dispatch_node_with_audit(node, request, AuditContext::internal())
-
             .await
-
     }
 
-
-
     pub async fn dispatch_node_with_audit(
-
         &self,
 
         node: &str,
@@ -64,9 +58,7 @@ impl DaemonState {
         request: RemoteRequest,
 
         audit: AuditContext,
-
     ) -> Response {
-
         let settings = self.settings.lock().expect("node settings lock").clone();
 
         let local_request = request.clone().into_local();
@@ -74,136 +66,84 @@ impl DaemonState {
         let audit = audit.with_request_defaults(&local_request);
 
         if node == "self" {
-
             if !settings.execution_enabled() {
-
                 let response = Response::error("pure master does not have a self executor");
 
                 record_request_audit(
-
                     self,
-
                     &local_request,
-
                     audit,
-
                     None,
-
                     current_timestamp_ms(),
-
                     0,
-
                     AuditStatus::Error,
-
                     Some(settings.node_id),
-
                     &response,
-
                     serde_json::json!({"node": "self"}),
-
                 );
 
                 return response;
-
             }
 
             return dispatch_async_with_audit(self.clone(), local_request, Some(audit)).await;
-
         }
 
         if settings.role != NodeRole::Leader {
-
             let response =
-
                 Response::error("worker nodes can only control their local self executor");
 
             record_request_audit(
-
                 self,
-
                 &local_request,
-
                 audit,
-
                 None,
-
                 current_timestamp_ms(),
-
                 0,
-
                 AuditStatus::Error,
-
                 Some(settings.node_id),
-
                 &response,
-
                 serde_json::json!({"node": node}),
-
             );
 
             return response;
-
         }
-
-
 
         let origin_audit_id = uuid::Uuid::new_v4().to_string();
 
         let mut worker_audit = audit.clone();
 
         if worker_audit.origin_node_id.is_none() {
-
             worker_audit.origin_node_id = Some(settings.node_id.clone());
-
         }
 
         worker_audit.origin_audit_id = Some(origin_audit_id.clone());
 
         worker_audit.transport = AuditTransport::Agent;
 
-
-
         let started_at_ms = current_timestamp_ms();
 
         let started = Instant::now();
 
         let (response, status) = self
-
             .cluster
-
             .request_with_audit(node, request, Some(worker_audit))
-
             .await;
 
         record_request_audit(
-
             self,
-
             &local_request,
-
             audit,
-
             Some(origin_audit_id),
-
             started_at_ms,
-
             started.elapsed().as_millis() as u64,
-
             status,
-
             Some(node.to_string()),
-
             &response,
-
             serde_json::json!({"node": node, "remote_transport": "agent"}),
-
         );
 
         response
-
     }
-
-
 }
 
 pub async fn dispatch_async(state: DaemonState, request: Request) -> Response {

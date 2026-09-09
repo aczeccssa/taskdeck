@@ -13,100 +13,63 @@ use super::helpers::*;
 use crate::config::{ProjectDefinition, TaskSpec};
 use crate::runtime::SessionRuntime;
 
-    #[test]
+#[test]
 
-    pub(super) fn embedded_frontend_has_root_document_and_hashed_assets() {
-
-        assert!(
-
-            EMBEDDED_ASSETS
-
-                .iter()
-
-                .any(|asset| asset.path == "/index.html")
-
-        );
-
-        assert!(
-
-            EMBEDDED_ASSETS
-
-                .iter()
-
-                .any(|asset| asset.path.starts_with("/assets/") && asset.path.ends_with(".js"))
-
-        );
-
-        assert!(
-
-            EMBEDDED_ASSETS
-
-                .iter()
-
-                .any(|asset| asset.path.starts_with("/assets/") && asset.path.ends_with(".css"))
-
-        );
-
-        assert!(
-
-            EMBEDDED_ASSETS
-
-                .iter()
-
-                .any(|asset| asset.path == "/favicon.svg")
-
-        );
-
-    }
-
-
-
-    #[test]
-
-    pub(super) fn embedded_asset_responses_use_expected_cache_headers() {
-
-        let html = embedded_asset_response("/index.html", false);
-
-        assert_eq!(
-
-            html.headers().get(header::CONTENT_TYPE).unwrap(),
-
-            "text/html; charset=utf-8"
-
-        );
-
-        assert_eq!(
-
-            html.headers().get(header::CACHE_CONTROL).unwrap(),
-
-            "no-cache"
-
-        );
-
-        let asset = EMBEDDED_ASSETS
-
+pub(super) fn embedded_frontend_has_root_document_and_hashed_assets() {
+    assert!(
+        EMBEDDED_ASSETS
             .iter()
+            .any(|asset| asset.path == "/index.html")
+    );
 
-            .find(|asset| asset.path.starts_with("/assets/") && asset.path.ends_with(".js"))
+    assert!(
+        EMBEDDED_ASSETS
+            .iter()
+            .any(|asset| asset.path.starts_with("/assets/") && asset.path.ends_with(".js"))
+    );
 
-            .unwrap();
+    assert!(
+        EMBEDDED_ASSETS
+            .iter()
+            .any(|asset| asset.path.starts_with("/assets/") && asset.path.ends_with(".css"))
+    );
 
-        let response = embedded_asset_response(asset.path, true);
+    assert!(
+        EMBEDDED_ASSETS
+            .iter()
+            .any(|asset| asset.path == "/favicon.svg")
+    );
+}
 
-        assert_eq!(
+#[test]
 
-            response.headers().get(header::CONTENT_TYPE).unwrap(),
+pub(super) fn embedded_asset_responses_use_expected_cache_headers() {
+    let html = embedded_asset_response("/index.html", false);
 
-            "application/javascript; charset=utf-8"
+    assert_eq!(
+        html.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/html; charset=utf-8"
+    );
 
-        );
+    assert_eq!(
+        html.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-cache"
+    );
 
-        assert_eq!(
+    let asset = EMBEDDED_ASSETS
+        .iter()
+        .find(|asset| asset.path.starts_with("/assets/") && asset.path.ends_with(".js"))
+        .unwrap();
 
-            response.headers().get(header::CACHE_CONTROL).unwrap(),
+    let response = embedded_asset_response(asset.path, true);
 
-            "public, max-age=31536000, immutable"
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/javascript; charset=utf-8"
+    );
 
-        );
-
-    }
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "public, max-age=31536000, immutable"
+    );
+}

@@ -144,7 +144,6 @@ impl StateStore {
         let connection = self.connection.lock().expect("state store lock");
         Ok(connection.execute("DELETE FROM workflow_groups WHERE id=?1", params![id])? > 0)
     }
-
 }
 
 impl StateStore {
@@ -184,10 +183,11 @@ impl StateStore {
         }
         Ok(revisions)
     }
-
 }
 
-pub(super) fn normalize_workflow_group_input(mut input: WorkflowGroupInput) -> Result<WorkflowGroupInput> {
+pub(super) fn normalize_workflow_group_input(
+    mut input: WorkflowGroupInput,
+) -> Result<WorkflowGroupInput> {
     input.name = input.name.trim().to_string();
     if input.name.is_empty() {
         bail!("workflow group name cannot be empty");
@@ -266,7 +266,10 @@ struct WorkflowRevisionSnapshot {
     graph: WorkflowGraph,
 }
 
-pub(super) fn next_workflow_revision(transaction: &rusqlite::Transaction<'_>, group_id: &str) -> Result<u64> {
+pub(super) fn next_workflow_revision(
+    transaction: &rusqlite::Transaction<'_>,
+    group_id: &str,
+) -> Result<u64> {
     let current = transaction
         .query_row(
             "SELECT COALESCE(MAX(revision), 0) FROM workflow_revisions WHERE group_id=?1",
@@ -347,4 +350,3 @@ pub(super) fn workflow_graph_has_cycle(
     }
     false
 }
-

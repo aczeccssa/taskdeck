@@ -12,308 +12,204 @@ use super::super::*;
 use crate::config::{ProjectDefinition, TaskSpec};
 use crate::runtime::SessionRuntime;
 
+pub(super) async fn http_route(
+    state: DaemonState,
 
+    method: &str,
 
-    pub(super) async fn http_route(
+    uri: &str,
 
-        state: DaemonState,
+    headers: &[(header::HeaderName, &str)],
 
-        method: &str,
+    body: Option<&str>,
+) -> axum::response::Response {
+    let app = app(state);
 
-        uri: &str,
+    let mut builder = HttpRequest::builder().method(method).uri(uri);
 
-        headers: &[(header::HeaderName, &str)],
-
-        body: Option<&str>,
-
-    ) -> axum::response::Response {
-
-        let app = app(state);
-
-        let mut builder = HttpRequest::builder().method(method).uri(uri);
-
-        for (name, value) in headers {
-
-            builder = builder.header(name, *value);
-
-        }
-
-        let body = Body::from(body.unwrap_or_default().to_owned());
-
-        app.oneshot(builder.body(body).unwrap()).await.unwrap()
-
+    for (name, value) in headers {
+        builder = builder.header(name, *value);
     }
 
+    let body = Body::from(body.unwrap_or_default().to_owned());
 
+    app.oneshot(builder.body(body).unwrap()).await.unwrap()
+}
 
-    pub(super) fn workflow_task_spec(label: &str) -> TaskSpec {
+pub(super) fn workflow_task_spec(label: &str) -> TaskSpec {
+    TaskSpec {
+        label: label.to_string(),
 
-        TaskSpec {
+        program: "true".to_string(),
 
-            label: label.to_string(),
+        args: Vec::new(),
 
-            program: "true".to_string(),
+        cwd: PathBuf::from("/tmp"),
 
-            args: Vec::new(),
+        env: BTreeMap::new(),
 
-            cwd: PathBuf::from("/tmp"),
+        shell: false,
 
-            env: BTreeMap::new(),
+        auto_start: false,
 
-            shell: false,
+        stop_timeout_ms: 500,
 
-            auto_start: false,
+        clear_logs_on_restart: false,
 
-            stop_timeout_ms: 500,
-
-            clear_logs_on_restart: false,
-
-            schedule: None,
-
-        }
-
+        schedule: None,
     }
+}
 
+pub(super) fn workflow_definition(
+    session: &str,
+    project: &str,
+    tasks: &[&str],
+) -> ProjectDefinition {
+    ProjectDefinition {
+        session: session.to_string(),
 
+        project: PathBuf::from(project),
 
-    pub(super) fn workflow_definition(session: &str, project: &str, tasks: &[&str]) -> ProjectDefinition {
+        source: "taskdeck.yaml".to_string(),
 
-        ProjectDefinition {
+        tasks: tasks
+            .iter()
+            .map(|label| ((*label).to_string(), workflow_task_spec(label)))
+            .collect(),
 
-            session: session.to_string(),
-
-            project: PathBuf::from(project),
-
-            source: "taskdeck.yaml".to_string(),
-
-            tasks: tasks
-
-                .iter()
-
-                .map(|label| ((*label).to_string(), workflow_task_spec(label)))
-
-                .collect(),
-
-            task_order: tasks.iter().map(|label| (*label).to_string()).collect(),
-
-        }
-
+        task_order: tasks.iter().map(|label| (*label).to_string()).collect(),
     }
+}
 
+pub(super) fn insert_workflow_session(
+    state: &DaemonState,
 
+    session: &str,
 
-    pub(super) fn insert_workflow_session(
+    alias: Option<&str>,
 
-        state: &DaemonState,
+    project: &str,
 
-        session: &str,
+    tasks: &[&str],
+) {
+    state
+        .store
+        .upsert_registration(session, &PathBuf::from(project))
+        .unwrap();
 
-        alias: Option<&str>,
-
-        project: &str,
-
-        tasks: &[&str],
-
-    ) {
-
+    if let Some(alias) = alias {
         state
-
             .store
-
-            .upsert_registration(session, &PathBuf::from(project))
-
+            .set_registration_alias(session, Some(alias))
             .unwrap();
-
-        if let Some(alias) = alias {
-
-            state
-
-                .store
-
-                .set_registration_alias(session, Some(alias))
-
-                .unwrap();
-
-        }
-
-        state.sessions.lock().expect("sessions lock").insert(
-
-            session.to_string(),
-
-            SessionRuntime::new(workflow_definition(session, project, tasks)),
-
-        );
-
     }
 
+    state.sessions.lock().expect("sessions lock").insert(
+        session.to_string(),
+        SessionRuntime::new(workflow_definition(session, project, tasks)),
+    );
+}
 
+pub(super) fn workflow_leader_state() -> DaemonState {
+    let mut state = DaemonState::new();
 
-    pub(super) fn workflow_leader_state() -> DaemonState {
+    let settings = state
+        .store
+        .configure(crate::state::NodeSettingsUpdate {
+            role: Some(crate::state::NodeRole::Leader),
 
-        let mut state = DaemonState::new();
+            ..Default::default()
+        })
+        .unwrap();
 
-        let settings = state
+    *state.settings.lock().expect("node settings lock") = settings;
 
-            .store
+    insert_workflow_session(&state, "api", Some("Backend API"), "/tmp/api", &["dev"]);
 
-            .configure(crate::state::NodeSettingsUpdate {
+    insert_workflow_session(&state, "web", None, "/tmp/web", &["dev"]);
 
-                role: Some(crate::state::NodeRole::Leader),
+    let mut remote = SessionRuntime::new(workflow_definition(
+        "worker-api",
+        "/tmp/worker-api",
+        &["deploy"],
+    ));
 
-                ..Default::default()
+    let remote_snapshot = remote.snapshot(0).unwrap();
 
-            })
-
-            .unwrap();
-
-        *state.settings.lock().expect("node settings lock") = settings;
-
-        insert_workflow_session(&state, "api", Some("Backend API"), "/tmp/api", &["dev"]);
-
-        insert_workflow_session(&state, "web", None, "/tmp/web", &["dev"]);
-
-
-
-        let mut remote = SessionRuntime::new(workflow_definition(
-
-            "worker-api",
-
-            "/tmp/worker-api",
-
-            &["deploy"],
-
-        ));
-
-        let remote_snapshot = remote.snapshot(0).unwrap();
-
-        state
-
-            .store
-
-            .upsert_worker(
-
-                "worker-7",
-
-                "Worker 7",
-
-                current_millis(),
-
-                &serde_json::to_string(&vec![remote_snapshot]).unwrap(),
-
-            )
-
-            .unwrap();
-
-        state.cluster = crate::cluster::LeaderCluster::new(state.store.clone(), None).unwrap();
-
-        state
-
-    }
-
-
-
-    pub(super) async fn async_body_login(state: DaemonState, key: &str) -> axum::response::Response {
-
-        let body = Body::from(format!("access_key={key}"));
-
-        let request = HttpRequest::builder()
-
-            .method("POST")
-
-            .uri("/login")
-
-            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-
-            .body(body)
-
-            .unwrap();
-
-        app(state).oneshot(request).await.unwrap()
-
-    }
-
-
-
-    pub(super) async fn post_json(state: DaemonState, uri: &str, body: serde_json::Value) -> Response {
-
-        let response = http_route(
-
-            state,
-
-            "POST",
-
-            uri,
-
-            &[(header::CONTENT_TYPE, "application/json")],
-
-            Some(&body.to_string()),
-
+    state
+        .store
+        .upsert_worker(
+            "worker-7",
+            "Worker 7",
+            current_millis(),
+            &serde_json::to_string(&vec![remote_snapshot]).unwrap(),
         )
+        .unwrap();
 
-        .await;
+    state.cluster = crate::cluster::LeaderCluster::new(state.store.clone(), None).unwrap();
 
-        parse_json_response(response).await
+    state
+}
 
-    }
+pub(super) async fn async_body_login(state: DaemonState, key: &str) -> axum::response::Response {
+    let body = Body::from(format!("access_key={key}"));
 
+    let request = HttpRequest::builder()
+        .method("POST")
+        .uri("/login")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(body)
+        .unwrap();
 
+    app(state).oneshot(request).await.unwrap()
+}
 
-    pub(super) async fn get_json(state: DaemonState, uri: &str) -> Response {
+pub(super) async fn post_json(state: DaemonState, uri: &str, body: serde_json::Value) -> Response {
+    let response = http_route(
+        state,
+        "POST",
+        uri,
+        &[(header::CONTENT_TYPE, "application/json")],
+        Some(&body.to_string()),
+    )
+    .await;
 
-        let response = http_route(state, "GET", uri, &[], None).await;
+    parse_json_response(response).await
+}
 
-        parse_json_response(response).await
+pub(super) async fn get_json(state: DaemonState, uri: &str) -> Response {
+    let response = http_route(state, "GET", uri, &[], None).await;
 
-    }
+    parse_json_response(response).await
+}
 
+pub(super) async fn request_json(
+    state: DaemonState,
 
+    method: &str,
 
-    pub(super) async fn request_json(
+    uri: &str,
 
-        state: DaemonState,
+    body: Option<serde_json::Value>,
+) -> Response {
+    let response = http_route(
+        state,
+        method,
+        uri,
+        &[(header::CONTENT_TYPE, "application/json")],
+        body.map(|value| value.to_string()).as_deref(),
+    )
+    .await;
 
-        method: &str,
+    parse_json_response(response).await
+}
 
-        uri: &str,
+pub(super) async fn parse_json_response(response: axum::response::Response) -> Response {
+    assert_eq!(response.status(), StatusCode::OK);
 
-        body: Option<serde_json::Value>,
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
 
-    ) -> Response {
-
-        let response = http_route(
-
-            state,
-
-            method,
-
-            uri,
-
-            &[(header::CONTENT_TYPE, "application/json")],
-
-            body.map(|value| value.to_string()).as_deref(),
-
-        )
-
-        .await;
-
-        parse_json_response(response).await
-
-    }
-
-
-
-    pub(super) async fn parse_json_response(response: axum::response::Response) -> Response {
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-
-            .await
-
-            .unwrap();
-
-        serde_json::from_slice(&body).unwrap()
-
-    }
-
-
+    serde_json::from_slice(&body).unwrap()
+}

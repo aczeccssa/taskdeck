@@ -1,8 +1,5 @@
 //! Shared SQL pagination helpers (LIKE escaping / WHERE assembly).
 
-
-
-
 pub(super) fn where_clause(conditions: &[String]) -> String {
     if conditions.is_empty() {
         String::new()
@@ -17,4 +14,3 @@ pub(super) fn escape_like(value: &str) -> String {
         .replace('%', "\\%")
         .replace('_', "\\_")
 }
-

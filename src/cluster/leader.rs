@@ -77,7 +77,7 @@ impl LeaderCluster {
         self.node_metrics.clone()
     }
 
-pub(super)     fn validate_hello(&self, hello: &AgentMessage) -> Result<(String, String)> {
+    pub(super) fn validate_hello(&self, hello: &AgentMessage) -> Result<(String, String)> {
         let AgentMessage::Hello {
             protocol,
             node_id,
@@ -102,7 +102,7 @@ pub(super)     fn validate_hello(&self, hello: &AgentMessage) -> Result<(String,
         Ok((node_id.clone(), name.clone()))
     }
 
-pub(super)     fn connect_worker(
+    pub(super) fn connect_worker(
         &self,
         hello: &AgentMessage,
     ) -> Result<(String, String, mpsc::Receiver<AgentMessage>)> {
@@ -137,7 +137,7 @@ pub(super)     fn connect_worker(
         Ok((node_id, connection_id, receiver))
     }
 
-pub(super)     fn disconnect_worker(&self, node_id: &str, connection_id: &str) {
+    pub(super) fn disconnect_worker(&self, node_id: &str, connection_id: &str) {
         let mut inner = self.inner.lock().expect("leader cluster lock");
         if let Some(worker) = inner.workers.get_mut(node_id) {
             if worker.connection_id.as_deref() == Some(connection_id) {
@@ -148,7 +148,7 @@ pub(super)     fn disconnect_worker(&self, node_id: &str, connection_id: &str) {
         }
     }
 
-pub(super)     fn update_inventory(
+    pub(super) fn update_inventory(
         &self,
         node_id: &str,
         sessions: Vec<SessionSnapshot>,
@@ -175,7 +175,7 @@ pub(super)     fn update_inventory(
             .upsert_worker(node_id, &name, now, &inventory_json)
     }
 
-pub(super)     fn heartbeat(&self, node_id: &str, timestamp_ms: u64) {
+    pub(super) fn heartbeat(&self, node_id: &str, timestamp_ms: u64) {
         if let Some(worker) = self
             .inner
             .lock()
@@ -187,7 +187,7 @@ pub(super)     fn heartbeat(&self, node_id: &str, timestamp_ms: u64) {
         }
     }
 
-pub(super)     fn resolve_result(&self, id: &str, response: Response) {
+    pub(super) fn resolve_result(&self, id: &str, response: Response) {
         if let Some(sender) = self
             .inner
             .lock()
@@ -355,7 +355,10 @@ pub(super)     fn resolve_result(&self, id: &str, response: Response) {
     }
 }
 
-pub(super) fn merge_detail(mut existing: serde_json::Value, patch: serde_json::Value) -> serde_json::Value {
+pub(super) fn merge_detail(
+    mut existing: serde_json::Value,
+    patch: serde_json::Value,
+) -> serde_json::Value {
     match (existing.as_object_mut(), patch) {
         (Some(existing), serde_json::Value::Object(patch)) => {
             for (key, value) in patch {
@@ -465,4 +468,3 @@ pub(super) async fn send_axum(socket: &mut WebSocket, message: &AgentMessage) ->
         .await
         .context("failed to send agent message")
 }
-

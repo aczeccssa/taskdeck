@@ -1,12 +1,11 @@
 //! Board and board-template persistence.
 
-
 use anyhow::{Context, Result, bail};
 use rusqlite::params;
 use uuid::Uuid;
 
-use super::util::*;
 use super::StateStore;
+use super::util::*;
 use crate::protocol::*;
 
 impl StateStore {
@@ -103,7 +102,6 @@ impl StateStore {
         let connection = self.connection.lock().expect("state store lock");
         Ok(connection.execute("DELETE FROM boards WHERE id=?1", params![id])? > 0)
     }
-
 }
 
 impl StateStore {
@@ -181,7 +179,6 @@ impl StateStore {
         let connection = self.connection.lock().expect("state store lock");
         Ok(connection.execute("DELETE FROM board_templates WHERE id=?1", params![id])? > 0)
     }
-
 }
 
 pub(super) fn normalize_board_card_mode(value: &str) -> BoardCardMode {
@@ -234,7 +231,9 @@ pub(super) fn write_board_cards(
     Ok(())
 }
 
-pub(super) fn normalize_board_template_input(mut input: BoardTemplateInput) -> Result<BoardTemplateInput> {
+pub(super) fn normalize_board_template_input(
+    mut input: BoardTemplateInput,
+) -> Result<BoardTemplateInput> {
     input.name = input.name.trim().to_string();
     if input.name.is_empty() {
         bail!("board template name cannot be empty");
@@ -257,4 +256,3 @@ pub(super) fn normalize_board_template_input(mut input: BoardTemplateInput) -> R
     }
     Ok(input)
 }
-

@@ -50,19 +50,14 @@ use super::scaling::*;
 use super::sessions::*;
 use super::tokens::*;
 use super::workflow_groups::*;
+use super::workflow_groups::{ordered_task_labels, workflow_context, workflow_targets};
 use super::workflow_runs::*;
 use super::workspaces::*;
-use super::workflow_groups::{ordered_task_labels, workflow_context, workflow_targets};
 pub(crate) fn quota_sessions(state: &DaemonState) -> Vec<String> {
-
     let mut sessions: Vec<String> = state
-
         .node_summaries()
-
         .into_iter()
-
         .flat_map(|node| node.sessions)
-
         .collect();
 
     sessions.sort();
@@ -70,45 +65,28 @@ pub(crate) fn quota_sessions(state: &DaemonState) -> Vec<String> {
     sessions.dedup();
 
     sessions
-
 }
 
-
-
 pub(crate) async fn list_quotas(State(state): State<DaemonState>) -> Json<Response> {
-
     Json(match state.store.quotas() {
-
         Ok(quotas) => Response::ok(
-
             "quotas",
-
             WorkspaceQuotasView {
-
                 quotas,
 
                 sessions: quota_sessions(&state),
-
             },
-
         ),
 
         Err(error) => Response::error(format!("{error:#}")),
-
     })
-
 }
 
-
-
 pub(crate) async fn create_quota(
-
     State(state): State<DaemonState>,
 
     Json(input): Json<WorkspaceQuotaInput>,
-
 ) -> Json<Response> {
-
     let started_at_ms = current_millis();
 
     let started = Instant::now();
@@ -118,51 +96,33 @@ pub(crate) async fn create_quota(
     let node_id = state.public_settings().node_id;
 
     let response = match state.store.create_quota(&node_id, input) {
-
         Ok(quota) => Response::ok("quota created", quota),
 
         Err(error) => Response::error(format!("{error:#}")),
-
     };
 
     record_feature_http_audit(
-
         &state,
-
         "quota",
-
         "quota_create",
-
         "quota_id",
-
         None,
-
         request,
-
         &response,
-
         started_at_ms,
-
         started.elapsed().as_millis() as u64,
-
     );
 
     Json(response)
-
 }
 
-
-
 pub(crate) async fn update_quota(
-
     State(state): State<DaemonState>,
 
     Path(quota): Path<String>,
 
     Json(input): Json<WorkspaceQuotaInput>,
-
 ) -> Json<Response> {
-
     let started_at_ms = current_millis();
 
     let started = Instant::now();
@@ -170,49 +130,31 @@ pub(crate) async fn update_quota(
     let request = serde_json::to_value(&input).unwrap_or_else(|_| json!({}));
 
     let response = match state.store.update_quota(&quota, input) {
-
         Ok(quota) => Response::ok("quota updated", quota),
 
         Err(error) => Response::error(format!("{error:#}")),
-
     };
 
     record_feature_http_audit(
-
         &state,
-
         "quota",
-
         "quota_update",
-
         "quota_id",
-
         Some(&quota),
-
         request,
-
         &response,
-
         started_at_ms,
-
         started.elapsed().as_millis() as u64,
-
     );
 
     Json(response)
-
 }
 
-
-
 pub(crate) async fn delete_quota(
-
     State(state): State<DaemonState>,
 
     Path(quota): Path<String>,
-
 ) -> Json<Response> {
-
     let started_at_ms = current_millis();
 
     let started = Instant::now();
@@ -220,42 +162,27 @@ pub(crate) async fn delete_quota(
     let request = json!({"id": quota});
 
     let response = match state.store.delete_quota(&quota) {
-
         Ok(true) => Response::empty("quota deleted"),
 
         Ok(false) => Response::error(format!("quota '{quota}' not found")),
 
         Err(error) => Response::error(format!("{error:#}")),
-
     };
 
     record_feature_http_audit(
-
         &state,
-
         "quota",
-
         "quota_delete",
-
         "quota_id",
-
         Some(&quota),
-
         request,
-
         &response,
-
         started_at_ms,
-
         started.elapsed().as_millis() as u64,
-
     );
 
     Json(response)
-
 }
-
-
 
 // ---------------------------------------------------------------------------
 

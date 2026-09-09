@@ -200,7 +200,9 @@ fn configured_endpoint(host: String, port: u16, protocol: &str) -> ServiceEndpoi
 }
 
 #[allow(unused_imports)]
-pub(crate) use listeners::{inspect_listeners, endpoints_from_logs, deduplicate_endpoints, endpoint_from_url};
+pub(crate) use listeners::{
+    deduplicate_endpoints, endpoint_from_url, endpoints_from_logs, inspect_listeners,
+};
 
 #[cfg(test)]
 mod tests;

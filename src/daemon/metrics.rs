@@ -22,8 +22,8 @@ use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 use super::audit::{record_audit_value, record_request_audit};
 use super::client::GlobalPaths;
 use super::dispatch::{
-    config_write_error_response, prepare_session_config_write,
-    reject_unavailable_session, require_local_execution,
+    config_write_error_response, prepare_session_config_write, reject_unavailable_session,
+    require_local_execution,
 };
 use super::handle::handle;
 use super::notifications::{collect_run_transitions, emit_transition_notifications};
@@ -67,7 +67,11 @@ pub(super) struct TaskMetricsEntry {
 }
 
 impl TaskMetricsEntry {
-pub(super)     fn apply_observation(&mut self, timestamp_ms: u64, observation: Option<AggregatedProcessTree>) {
+    pub(super) fn apply_observation(
+        &mut self,
+        timestamp_ms: u64,
+        observation: Option<AggregatedProcessTree>,
+    ) {
         match observation {
             Some(observation) => {
                 self.running = true;
@@ -91,7 +95,7 @@ pub(super)     fn apply_observation(&mut self, timestamp_ms: u64, observation: O
         }
     }
 
-pub(super)     fn snapshot(&self, window_seconds: usize) -> TaskMetricsSnapshot {
+    pub(super) fn snapshot(&self, window_seconds: usize) -> TaskMetricsSnapshot {
         let sample_count = window_seconds.min(MAX_TASK_METRIC_SAMPLES);
         let skip = self.samples.len().saturating_sub(sample_count);
         let samples = self.samples.iter().skip(skip).cloned().collect::<Vec<_>>();
@@ -115,7 +119,7 @@ pub(super)     fn snapshot(&self, window_seconds: usize) -> TaskMetricsSnapshot 
         }
     }
 
-pub(super)     fn mark_restart(&mut self, timestamp_ms: u64) {
+    pub(super) fn mark_restart(&mut self, timestamp_ms: u64) {
         self.restart_markers_ms.push_back(timestamp_ms);
         while self.restart_markers_ms.len() > MAX_TASK_METRIC_SAMPLES {
             self.restart_markers_ms.pop_front();
@@ -129,7 +133,7 @@ pub struct TaskMetricsStore {
 }
 
 impl TaskMetricsStore {
-pub(super)     fn record(
+    pub(super) fn record(
         &mut self,
         session: impl Into<String>,
         task: impl Into<String>,
@@ -146,7 +150,12 @@ pub(super)     fn record(
             .apply_observation(timestamp_ms, observation);
     }
 
-pub(super)     fn snapshot(&self, session: &str, task: &str, window_seconds: usize) -> TaskMetricsSnapshot {
+    pub(super) fn snapshot(
+        &self,
+        session: &str,
+        task: &str,
+        window_seconds: usize,
+    ) -> TaskMetricsSnapshot {
         self.entries
             .get(&TaskMetricsKey {
                 session: session.to_string(),
@@ -156,18 +165,18 @@ pub(super)     fn snapshot(&self, session: &str, task: &str, window_seconds: usi
             .unwrap_or_else(|| TaskMetricsEntry::default().snapshot(window_seconds))
     }
 
-pub(super)     fn remove_session(&mut self, session: &str) {
+    pub(super) fn remove_session(&mut self, session: &str) {
         self.entries.retain(|key, _| key.session != session);
     }
 
-pub(super)     fn clear_task(&mut self, session: &str, task: &str) {
+    pub(super) fn clear_task(&mut self, session: &str, task: &str) {
         self.entries.remove(&TaskMetricsKey {
             session: session.to_string(),
             task: task.to_string(),
         });
     }
 
-pub(super)     fn mark_restart(&mut self, session: &str, task: &str, timestamp_ms: u64) {
+    pub(super) fn mark_restart(&mut self, session: &str, task: &str, timestamp_ms: u64) {
         self.entries
             .entry(TaskMetricsKey {
                 session: session.to_string(),
@@ -177,7 +186,7 @@ pub(super)     fn mark_restart(&mut self, session: &str, task: &str, timestamp_m
             .mark_restart(timestamp_ms);
     }
 
-pub(super)     fn retain_current_tasks(&mut self, current: &HashSet<TaskMetricsKey>) {
+    pub(super) fn retain_current_tasks(&mut self, current: &HashSet<TaskMetricsKey>) {
         self.entries.retain(|key, _| current.contains(key));
     }
 }

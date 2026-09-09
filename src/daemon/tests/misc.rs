@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use super::super::*;
 use super::super::audit::*;
 use super::super::client::*;
 use super::super::dispatch::*;
@@ -23,120 +22,88 @@ use super::super::scaling::*;
 use super::super::scheduler::*;
 use super::super::state::*;
 use super::super::util::*;
+use super::super::*;
 use super::helpers::*;
 use crate::config;
 use crate::protocol::*;
 use crate::runtime::{SessionRuntime, Sessions};
 use crate::state::{NodeRole, NodeSettings, StateStore};
 
-    #[test]
+#[test]
 
-    pub(super) fn worker_binds_to_all_interfaces_by_default() {
+pub(super) fn worker_binds_to_all_interfaces_by_default() {
+    let state = DaemonState::new();
 
-        let state = DaemonState::new();
+    assert_eq!(state.public_settings().bind_host, "0.0.0.0");
+}
 
-        assert_eq!(state.public_settings().bind_host, "0.0.0.0");
+#[test]
 
-    }
+pub(super) fn restores_registered_project_after_state_recreation() {
+    let root = tempfile::tempdir().unwrap();
 
+    let project = tempfile::tempdir().unwrap();
 
+    fs::write(
+        project.path().join("taskdeck.yaml"),
+        "version: 1\nsession: restored\ntasks:\n  idle:\n    command: echo\n    args: [ready]\n",
+    )
+    .unwrap();
 
-    #[test]
+    let project = project.path().canonicalize().unwrap();
 
-    pub(super) fn restores_registered_project_after_state_recreation() {
+    let paths = GlobalPaths {
+        root: root.path().to_path_buf(),
 
-        let root = tempfile::tempdir().unwrap();
+        socket: root.path().join("taskdeck.sock"),
 
-        let project = tempfile::tempdir().unwrap();
+        lock: root.path().join("daemon.lock"),
 
-        fs::write(
+        log: root.path().join("daemon.log"),
+    };
 
-            project.path().join("taskdeck.yaml"),
-
-            "version: 1\nsession: restored\ntasks:\n  idle:\n    command: echo\n    args: [ready]\n",
-
-        )
-
+    StateStore::open(root.path())
+        .unwrap()
+        .upsert_registration("restored", &project)
         .unwrap();
 
-        let project = project.path().canonicalize().unwrap();
+    let state = DaemonState::load(&paths).unwrap();
 
-        let paths = GlobalPaths {
+    let response = dispatch(&state, Request::ListSessions);
 
-            root: root.path().to_path_buf(),
+    assert!(response.ok);
 
-            socket: root.path().join("taskdeck.sock"),
+    assert_eq!(response.data.unwrap(), json!(["restored"]));
+}
 
-            lock: root.path().join("daemon.lock"),
+#[test]
 
-            log: root.path().join("daemon.log"),
+pub(super) fn pure_master_rejects_local_registration() {
+    let state = DaemonState::new();
 
-        };
+    let settings = state
+        .store
+        .configure(crate::state::NodeSettingsUpdate {
+            role: Some(crate::state::NodeRole::Leader),
 
-        StateStore::open(root.path())
+            leader_mode: Some(crate::state::LeaderMode::PureMaster),
 
-            .unwrap()
+            ..crate::state::NodeSettingsUpdate::default()
+        })
+        .unwrap();
 
-            .upsert_registration("restored", &project)
+    *state.settings.lock().expect("node settings lock") = settings;
 
-            .unwrap();
+    let response = dispatch(
+        &state,
+        Request::Register {
+            project: PathBuf::from("/tmp/missing"),
 
+            session: None,
+        },
+    );
 
+    assert!(!response.ok);
 
-        let state = DaemonState::load(&paths).unwrap();
-
-        let response = dispatch(&state, Request::ListSessions);
-
-        assert!(response.ok);
-
-        assert_eq!(response.data.unwrap(), json!(["restored"]));
-
-    }
-
-
-
-    #[test]
-
-    pub(super) fn pure_master_rejects_local_registration() {
-
-        let state = DaemonState::new();
-
-        let settings = state
-
-            .store
-
-            .configure(crate::state::NodeSettingsUpdate {
-
-                role: Some(crate::state::NodeRole::Leader),
-
-                leader_mode: Some(crate::state::LeaderMode::PureMaster),
-
-                ..crate::state::NodeSettingsUpdate::default()
-
-            })
-
-            .unwrap();
-
-        *state.settings.lock().expect("node settings lock") = settings;
-
-
-
-        let response = dispatch(
-
-            &state,
-
-            Request::Register {
-
-                project: PathBuf::from("/tmp/missing"),
-
-                session: None,
-
-            },
-
-        );
-
-        assert!(!response.ok);
-
-        assert!(response.message.contains("pure master"));
-
-    }
+    assert!(response.message.contains("pure master"));
+}

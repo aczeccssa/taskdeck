@@ -1,13 +1,12 @@
 //! Scaling policies and cron schedule helpers.
 
-
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, TimeZone, Utc};
 use rusqlite::params;
 use uuid::Uuid;
 
-use super::util::*;
 use super::StateStore;
+use super::util::*;
 use crate::protocol::*;
 
 impl StateStore {
@@ -144,7 +143,6 @@ impl StateStore {
         )?;
         Ok(())
     }
-
 }
 
 pub(super) fn normalize_scaling_metric(value: &str) -> ScalingMetric {
@@ -154,7 +152,9 @@ pub(super) fn normalize_scaling_metric(value: &str) -> ScalingMetric {
     }
 }
 
-pub(super) fn normalize_scaling_policy_input(mut input: ScalingPolicyInput) -> Result<ScalingPolicyInput> {
+pub(super) fn normalize_scaling_policy_input(
+    mut input: ScalingPolicyInput,
+) -> Result<ScalingPolicyInput> {
     input.name = input.name.trim().to_string();
     if input.name.is_empty() {
         bail!("scaling policy name cannot be empty");
@@ -217,4 +217,3 @@ pub fn validate_cron_expression(expression: &str) -> Result<()> {
 pub fn cron_next_after(expression: &str, after_ms: u64) -> Result<u64> {
     next_after_schedule(expression.trim(), after_ms)
 }
-

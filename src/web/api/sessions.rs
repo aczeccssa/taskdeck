@@ -53,53 +53,36 @@ use super::workflow_groups::*;
 use super::workflow_runs::*;
 use super::workspaces::*;
 pub(crate) async fn list_sessions(
-
     State(state): State<DaemonState>,
 
     Query(query): Query<HashMap<String, String>>,
-
 ) -> Json<Response> {
-
     let node = match selected_node(&state, &query) {
-
         Ok(node) => node,
 
         Err(response) => return Json(response),
-
     };
 
     let request = RemoteRequest::ListSessions;
 
     Json(
-
         state
-
             .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
-
             .await,
-
     )
-
 }
 
-
-
 pub(crate) async fn session_snapshot(
-
     State(state): State<DaemonState>,
 
     Path(session): Path<String>,
 
     Query(query): Query<HashMap<String, String>>,
-
 ) -> Json<Response> {
-
     let node = match selected_node(&state, &query) {
-
         Ok(node) => node,
 
         Err(response) => return Json(response),
-
     };
 
     let tail = query.get("tail").and_then(|value| value.parse().ok());
@@ -107,87 +90,56 @@ pub(crate) async fn session_snapshot(
     let request = RemoteRequest::Snapshot { session, tail };
 
     Json(
-
         state
-
             .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
-
             .await,
-
     )
-
 }
 
-
-
 pub(crate) async fn task_logs(
-
     State(state): State<DaemonState>,
 
     Path((session, task)): Path<(String, String)>,
 
     Query(query): Query<HashMap<String, String>>,
-
 ) -> Json<Response> {
-
     let node = match selected_node(&state, &query) {
-
         Ok(node) => node,
 
         Err(response) => return Json(response),
-
     };
 
     let after = match query.get("after") {
-
         Some(value) => match value.parse::<u64>() {
-
             Ok(value) => Some(value),
 
             Err(_) => {
-
                 return Json(Response::error_with_data(
-
                     "invalid log cursor",
-
                     json!({"kind": "validation_error", "status": 400}),
-
                 ));
-
             }
-
         },
 
         None => None,
-
     };
 
     let limit = match query.get("limit") {
-
         Some(value) => match value.parse::<usize>() {
-
             Ok(value) if value > 0 => value.clamp(1, 5_000),
 
             _ => {
-
                 return Json(Response::error_with_data(
-
                     "invalid log limit",
-
                     json!({"kind": "validation_error", "status": 400}),
-
                 ));
-
             }
-
         },
 
         None => 1_000,
-
     };
 
     let request = RemoteRequest::TaskLogs {
-
         session,
 
         task,
@@ -195,45 +147,27 @@ pub(crate) async fn task_logs(
         after,
 
         limit,
-
     };
 
     Json(
-
         state
-
             .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
-
             .await,
-
     )
-
 }
 
-
-
 pub(crate) fn parse_metrics_window_seconds(
-
     query: &HashMap<String, String>,
-
 ) -> std::result::Result<usize, Response> {
-
     match query.get("window") {
-
         None => Ok(600),
 
         Some(value) => value
-
             .parse::<usize>()
-
             .map(|window| window.clamp(1, 600))
-
             .map_err(|_| {
-
                 Response::error_with_data(
-
                     "invalid metrics window",
-
                     json!({
 
                         "kind": "validation_error",
@@ -241,153 +175,101 @@ pub(crate) fn parse_metrics_window_seconds(
                         "status": 400,
 
                     }),
-
                 )
-
             }),
-
     }
-
 }
 
-
-
 pub(crate) async fn task_metrics(
-
     State(state): State<DaemonState>,
 
     Path((session, task)): Path<(String, String)>,
 
     Query(query): Query<HashMap<String, String>>,
-
 ) -> Json<Response> {
-
     let node = match selected_node(&state, &query) {
-
         Ok(node) => node,
 
         Err(response) => return Json(response),
-
     };
 
     let window_seconds = match parse_metrics_window_seconds(&query) {
-
         Ok(window_seconds) => window_seconds,
 
         Err(response) => return Json(response),
-
     };
 
     let request = RemoteRequest::TaskMetrics {
-
         session,
 
         task,
 
         window_seconds,
-
     };
 
     Json(
-
         state
-
             .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
-
             .await,
-
     )
-
 }
 
-
-
 pub(crate) async fn clear_task_history(
-
     State(state): State<DaemonState>,
 
     Path((session, task)): Path<(String, String)>,
 
     Query(query): Query<HashMap<String, String>>,
-
 ) -> Json<Response> {
-
     let node = match selected_node(&state, &query) {
-
         Ok(node) => node,
 
         Err(response) => return Json(response),
-
     };
 
     let request = RemoteRequest::ClearTaskHistory { session, task };
 
     Json(
-
         state
-
             .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
-
             .await,
-
     )
-
 }
 
-
-
 pub(crate) async fn session_config(
-
     State(state): State<DaemonState>,
 
     Path(session): Path<String>,
 
     Query(query): Query<HashMap<String, String>>,
-
 ) -> Json<Response> {
-
     let node = match selected_node(&state, &query) {
-
         Ok(node) => node,
 
         Err(response) => return Json(response),
-
     };
 
     let request = RemoteRequest::GetSessionConfig { session };
 
     Json(
-
         state
-
             .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
-
             .await,
-
     )
-
 }
-
-
 
 #[derive(Deserialize)]
 
 pub(crate) struct UpdateSessionConfigBody {
-
     revision: String,
 
     #[serde(default)]
-
     workspace_env: Option<std::collections::BTreeMap<String, String>>,
 
     tasks: Vec<EditableTaskInput>,
-
 }
 
-
-
 pub(crate) async fn update_session_config(
-
     State(state): State<DaemonState>,
 
     Path(session): Path<String>,
@@ -395,19 +277,14 @@ pub(crate) async fn update_session_config(
     Query(query): Query<HashMap<String, String>>,
 
     Json(body): Json<UpdateSessionConfigBody>,
-
 ) -> Json<Response> {
-
     let node = match selected_node(&state, &query) {
-
         Ok(node) => node,
 
         Err(response) => return Json(response),
-
     };
 
     let request = RemoteRequest::PutSessionConfig {
-
         session,
 
         revision: body.revision,
@@ -415,27 +292,18 @@ pub(crate) async fn update_session_config(
         workspace_env: body.workspace_env,
 
         tasks: body.tasks,
-
     };
 
     Json(
-
         state
-
             .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
-
             .await,
-
     )
-
 }
-
-
 
 #[derive(Deserialize)]
 
 pub(crate) struct ActionBody {
-
     node: Option<String>,
 
     session: String,
@@ -443,115 +311,80 @@ pub(crate) struct ActionBody {
     task: Option<String>,
 
     action: Action,
-
 }
 
-
-
-pub(crate) async fn action(State(state): State<DaemonState>, Json(body): Json<ActionBody>) -> Json<Response> {
-
+pub(crate) async fn action(
+    State(state): State<DaemonState>,
+    Json(body): Json<ActionBody>,
+) -> Json<Response> {
     let node = match body.node {
-
         Some(node) if !node.trim().is_empty() => node,
 
         _ if state.public_settings().role == crate::state::NodeRole::Worker => "self".to_string(),
 
         _ => {
-
             return Json(Response::error_with_data(
-
                 "node is required for leader actions",
-
                 json!({"kind": "validation_error", "status": 400}),
-
             ));
-
         }
-
     };
 
     let request = RemoteRequest::Action {
-
         session: body.session,
 
         task: body.task,
 
         action: body.action,
-
     };
 
     Json(
-
         state
-
             .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
-
             .await,
-
     )
-
 }
 
 pub(crate) async fn list_task_runs(
-
     State(state): State<DaemonState>,
 
     Query(query): Query<HashMap<String, String>>,
-
 ) -> Json<Response> {
-
     let filter = match TaskRunFilter::parse(&query) {
-
         Ok(v) => v,
 
         Err(response) => return Json(response),
-
     };
 
     let node = match selected_node(&state, &query) {
-
         Ok(node) => node,
 
         Err(response) => return Json(response),
-
     };
 
     let request = RemoteRequest::ListTaskRuns { filter };
 
     Json(
-
         state
-
             .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
-
             .await,
-
     )
-
 }
 
 pub(crate) async fn list_events_route(
-
     State(state): State<DaemonState>,
 
     Query(query): Query<HashMap<String, String>>,
-
 ) -> Json<Response> {
-
     let filter = match EventFilter::parse(&query) {
-
         Ok(v) => v,
 
         Err(response) => return Json(response),
-
     };
 
     match state.store.list_events(&filter) {
-
         Ok(page) => Json(Response::ok("events", page)),
 
         Err(error) => Json(Response::error(format!("{error:#}"))),
-
     }
-
 }

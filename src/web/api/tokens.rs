@@ -53,27 +53,18 @@ use super::workflow_groups::*;
 use super::workflow_runs::*;
 use super::workspaces::*;
 pub(crate) async fn list_api_tokens(State(state): State<DaemonState>) -> Json<Response> {
-
     Json(match state.store.api_tokens() {
-
         Ok(tokens) => Response::ok("api tokens", ApiTokensView { tokens }),
 
         Err(error) => Response::error(format!("{error:#}")),
-
     })
-
 }
 
-
-
 pub(crate) async fn create_api_token(
-
     State(state): State<DaemonState>,
 
     Json(input): Json<ApiTokenInput>,
-
 ) -> Json<Response> {
-
     let started_at_ms = current_millis();
 
     let started = Instant::now();
@@ -81,49 +72,31 @@ pub(crate) async fn create_api_token(
     let request = serde_json::to_value(&input).unwrap_or_else(|_| json!({}));
 
     let response = match state.store.create_api_token(&input.name) {
-
         Ok(created) => Response::ok("api token created", created),
 
         Err(error) => Response::error(format!("{error:#}")),
-
     };
 
     record_feature_http_audit(
-
         &state,
-
         "api_token",
-
         "api_token_create",
-
         "token_id",
-
         None,
-
         request,
-
         &response,
-
         started_at_ms,
-
         started.elapsed().as_millis() as u64,
-
     );
 
     Json(response)
-
 }
 
-
-
 pub(crate) async fn revoke_api_token(
-
     State(state): State<DaemonState>,
 
     Path(token): Path<String>,
-
 ) -> Json<Response> {
-
     let started_at_ms = current_millis();
 
     let started = Instant::now();
@@ -131,42 +104,27 @@ pub(crate) async fn revoke_api_token(
     let request = json!({"id": token});
 
     let response = match state.store.revoke_api_token(&token) {
-
         Ok(true) => Response::empty("api token revoked"),
 
         Ok(false) => Response::error(format!("api token '{token}' not found")),
 
         Err(error) => Response::error(format!("{error:#}")),
-
     };
 
     record_feature_http_audit(
-
         &state,
-
         "api_token",
-
         "api_token_revoke",
-
         "token_id",
-
         Some(&token),
-
         request,
-
         &response,
-
         started_at_ms,
-
         started.elapsed().as_millis() as u64,
-
     );
 
     Json(response)
-
 }
-
-
 
 // ---------------------------------------------------------------------------
 

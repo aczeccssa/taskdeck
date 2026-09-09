@@ -61,7 +61,6 @@ pub struct ProjectDefinition {
     pub task_order: Vec<String>,
 }
 
-
 struct ProjectConfigState {
     pub(crate) project: PathBuf,
     pub(crate) source: String,
@@ -72,7 +71,6 @@ struct ProjectConfigState {
     pub(crate) task_order: Vec<String>,
     pub(crate) yaml: Option<YamlDocument>,
 }
-
 
 mod merge;
 mod session_config;
@@ -139,7 +137,7 @@ pub(crate) fn discover_inner(
 }
 
 impl ProjectConfigState {
-pub(crate)     fn revision(&self) -> String {
+    pub(crate) fn revision(&self) -> String {
         let mut hasher = Fnv64::default();
         hasher.write(self.project.to_string_lossy().as_bytes());
         hasher.write(&[0]);
@@ -158,7 +156,7 @@ pub(crate)     fn revision(&self) -> String {
 struct Fnv64(u64);
 
 impl Fnv64 {
-pub(crate)     fn write(&mut self, bytes: &[u8]) {
+    pub(crate) fn write(&mut self, bytes: &[u8]) {
         if self.0 == 0 {
             self.0 = 0xcbf29ce484222325;
         }
@@ -168,7 +166,7 @@ pub(crate)     fn write(&mut self, bytes: &[u8]) {
         }
     }
 
-pub(crate)     fn finish(self) -> u64 {
+    pub(crate) fn finish(self) -> u64 {
         self.0
     }
 }

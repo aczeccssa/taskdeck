@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use super::super::*;
 use super::super::audit::*;
 use super::super::client::*;
 use super::super::dispatch::*;
@@ -23,91 +22,72 @@ use super::super::scaling::*;
 use super::super::scheduler::*;
 use super::super::state::*;
 use super::super::util::*;
+use super::super::*;
 use crate::config;
 use crate::protocol::*;
 use crate::runtime::{SessionRuntime, Sessions};
 use crate::state::{NodeRole, NodeSettings, StateStore};
 
-    pub(super) fn task_input(label: &str, command: &str) -> EditableTaskInput {
+pub(super) fn task_input(label: &str, command: &str) -> EditableTaskInput {
+    EditableTaskInput {
+        label: label.to_string(),
 
-        EditableTaskInput {
+        command: command.to_string(),
 
-            label: label.to_string(),
+        args: Vec::new(),
 
-            command: command.to_string(),
+        cwd: ".".to_string(),
 
-            args: Vec::new(),
+        env: Default::default(),
 
-            cwd: ".".to_string(),
+        shell: true,
 
-            env: Default::default(),
+        auto_start: false,
 
-            shell: true,
+        stop_timeout_ms: 3_000,
 
-            auto_start: false,
+        clear_logs_on_restart: false,
 
-            stop_timeout_ms: 3_000,
+        schedule: None,
+    }
+}
 
-            clear_logs_on_restart: false,
+pub(super) fn observed_process(
+    pid: u32,
 
-            schedule: None,
+    ppid: Option<u32>,
 
+    cpu_percent: f32,
+
+    memory_bytes: u64,
+) -> ObservedProcess {
+    ObservedProcess {
+        pid,
+
+        ppid,
+
+        name: format!("proc-{pid}"),
+
+        cpu_percent,
+
+        memory_bytes,
+
+        status: "run".to_string(),
+
+        run_time_seconds: pid as u64,
+    }
+}
+
+pub(super) fn wait_for(deadline: Duration, mut condition: impl FnMut() -> bool) {
+    let start = Instant::now();
+
+    while start.elapsed() < deadline {
+        if condition() {
+            return;
         }
 
+        thread::sleep(Duration::from_millis(10));
     }
 
-
-
-    pub(super) fn observed_process(
-
-        pid: u32,
-
-        ppid: Option<u32>,
-
-        cpu_percent: f32,
-
-        memory_bytes: u64,
-
-    ) -> ObservedProcess {
-
-        ObservedProcess {
-
-            pid,
-
-            ppid,
-
-            name: format!("proc-{pid}"),
-
-            cpu_percent,
-
-            memory_bytes,
-
-            status: "run".to_string(),
-
-            run_time_seconds: pid as u64,
-
-        }
-
-    }
-
-
-
-    pub(super) fn wait_for(deadline: Duration, mut condition: impl FnMut() -> bool) {
-
-        let start = Instant::now();
-
-        while start.elapsed() < deadline {
-
-            if condition() {
-
-                return;
-
-            }
-
-            thread::sleep(Duration::from_millis(10));
-
-        }
-
-        assert!(condition(), "condition was not met within {deadline:?}");
-
-    }
+    assert!(condition(), "condition was not met within {deadline:?}");
+}

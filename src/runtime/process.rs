@@ -36,7 +36,6 @@ use crate::protocol::{
 };
 use crate::service;
 
-
 pub(super) fn exit_code_for(status: &ExitStatus) -> Option<i32> {
     status.code()
 }
@@ -126,4 +125,3 @@ pub(super) fn resume_threads(thread_ids: &mut Vec<u32>) {
         unsafe { CloseHandle(thread) };
     }
 }
-

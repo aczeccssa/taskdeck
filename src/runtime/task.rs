@@ -1,11 +1,9 @@
 //! Single-task process runtime.
 
-use super::log_buffer::{display_path, spawn_reader, LogBuffer};
+use super::log_buffer::{LogBuffer, display_path, spawn_reader};
 use super::process::exit_code_for;
 #[cfg(windows)]
-use super::process::{
-    powershell_quote, process_tree_pids, resume_threads, suspend_process_tree,
-};
+use super::process::{powershell_quote, process_tree_pids, resume_threads, suspend_process_tree};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Command, ExitStatus, Stdio};
@@ -42,7 +40,6 @@ use crate::protocol::{
 };
 use crate::service;
 
-
 pub struct TaskActionEffect {
     pub task: String,
     pub restarted: bool,
@@ -66,7 +63,7 @@ pub struct TaskRuntime {
 }
 
 impl TaskRuntime {
-pub(super)     fn new(spec: TaskSpec) -> Self {
+    pub(super) fn new(spec: TaskSpec) -> Self {
         let service = service::infer_service(&spec);
         Self {
             spec,
@@ -85,18 +82,18 @@ pub(super)     fn new(spec: TaskSpec) -> Self {
         }
     }
 
-pub(super)     fn push_system(&self, text: impl Into<String>) {
+    pub(super) fn push_system(&self, text: impl Into<String>) {
         self.logs.lock().expect("log lock").push("system", text);
     }
 
-pub(super)     fn reset_runtime_service(&mut self, inspection: ServiceInspectionState) {
+    pub(super) fn reset_runtime_service(&mut self, inspection: ServiceInspectionState) {
         self.service
             .endpoints
             .retain(|endpoint| endpoint.source == "config");
         self.service.inspection = inspection;
     }
 
-pub(super)     fn start(&mut self) -> Result<()> {
+    pub(super) fn start(&mut self) -> Result<()> {
         self.poll()?;
         if self.child.is_some() {
             bail!("task '{}' is already running", self.spec.label);
@@ -188,14 +185,14 @@ pub(super)     fn start(&mut self) -> Result<()> {
     }
 
     #[cfg(unix)]
-pub(super)     fn signal(&self, signal: Signal) -> Result<()> {
+    pub(super) fn signal(&self, signal: Signal) -> Result<()> {
         let child = self.child.as_ref().context("task is not running")?;
         let pgid = child.id() as i32;
         killpg(Pid::from_raw(pgid), signal)
             .with_context(|| format!("failed to send {signal:?} to process group {pgid}"))
     }
 
-pub(super)     fn pause(&mut self) -> Result<()> {
+    pub(super) fn pause(&mut self) -> Result<()> {
         self.poll()?;
         if self.status != TaskStatus::Running {
             bail!("task '{}' is not running", self.spec.label);
@@ -212,7 +209,7 @@ pub(super)     fn pause(&mut self) -> Result<()> {
         Ok(())
     }
 
-pub(super)     fn resume(&mut self) -> Result<()> {
+    pub(super) fn resume(&mut self) -> Result<()> {
         self.poll()?;
         if self.status != TaskStatus::Paused {
             bail!("task '{}' is not paused", self.spec.label);
@@ -226,7 +223,7 @@ pub(super)     fn resume(&mut self) -> Result<()> {
         Ok(())
     }
 
-pub(super)     fn stop(&mut self) -> Result<()> {
+    pub(super) fn stop(&mut self) -> Result<()> {
         self.poll()?;
         let Some(mut child) = self.child.take() else {
             self.status = TaskStatus::Idle;
@@ -273,7 +270,7 @@ pub(super)     fn stop(&mut self) -> Result<()> {
         Ok(())
     }
 
-pub(super)     fn restart(&mut self) -> Result<bool> {
+    pub(super) fn restart(&mut self) -> Result<bool> {
         self.stop()?;
         let cleared = self.spec.clear_logs_on_restart;
         if cleared {
@@ -283,7 +280,7 @@ pub(super)     fn restart(&mut self) -> Result<bool> {
         Ok(cleared)
     }
 
-pub(super)     fn poll(&mut self) -> Result<()> {
+    pub(super) fn poll(&mut self) -> Result<()> {
         let Some(child) = self.child.as_mut() else {
             return Ok(());
         };
@@ -306,7 +303,7 @@ pub(super)     fn poll(&mut self) -> Result<()> {
         Ok(())
     }
 
-pub(super)     fn apply(&mut self, action: Action) -> Result<(bool, bool)> {
+    pub(super) fn apply(&mut self, action: Action) -> Result<(bool, bool)> {
         match action {
             Action::Start => self.start().map(|()| (false, false)),
             Action::Stop => self.stop().map(|()| (false, false)),
@@ -316,12 +313,12 @@ pub(super)     fn apply(&mut self, action: Action) -> Result<(bool, bool)> {
         }
     }
 
-pub(super)     fn clear_history(&mut self) {
+    pub(super) fn clear_history(&mut self) {
         self.history_generation = self.history_generation.wrapping_add(1).max(1);
         self.logs.lock().expect("log lock").clear();
     }
 
-pub(super)     fn update_spec(&mut self, spec: TaskSpec) {
+    pub(super) fn update_spec(&mut self, spec: TaskSpec) {
         if self.spec != spec {
             self.spec = spec;
             self.service = service::infer_service(&self.spec);
@@ -329,7 +326,7 @@ pub(super)     fn update_spec(&mut self, spec: TaskSpec) {
         }
     }
 
-pub(super)     fn set_service_observation(
+    pub(super) fn set_service_observation(
         &mut self,
         endpoints: Vec<ServiceEndpoint>,
         inspection: ServiceInspectionState,
@@ -344,7 +341,7 @@ pub(super)     fn set_service_observation(
         self.service.inspection = inspection;
     }
 
-pub(super)     fn snapshot(&mut self, tail: usize) -> Result<TaskSnapshot> {
+    pub(super) fn snapshot(&mut self, tail: usize) -> Result<TaskSnapshot> {
         self.poll()?;
         let logs = self.logs.lock().expect("log lock");
         let skip = logs.lines.len().saturating_sub(tail);
@@ -380,9 +377,8 @@ pub(super)     fn snapshot(&mut self, tail: usize) -> Result<TaskSnapshot> {
         })
     }
 
-pub(super)     fn logs(&mut self, after: Option<u64>, limit: usize) -> Result<TaskLogsSnapshot> {
+    pub(super) fn logs(&mut self, after: Option<u64>, limit: usize) -> Result<TaskLogsSnapshot> {
         self.poll()?;
         Ok(self.logs.lock().expect("log lock").snapshot(after, limit))
     }
 }
-
