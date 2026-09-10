@@ -20,6 +20,7 @@ mod quota;
 mod scaling;
 mod schema;
 mod sessions;
+mod user_config;
 mod util;
 mod workflow;
 
@@ -40,11 +41,12 @@ pub use scaling::{cron_next_after, validate_cron_expression};
 #[allow(unused_imports)]
 pub use sessions::Registration;
 
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use rusqlite::Connection;
 
-pub const DEFAULT_BIND_HOST: &str = "0.0.0.0";
+pub const DEFAULT_BIND_HOST: &str = "127.0.0.1";
 pub const DEFAULT_WEB_PORT: u16 = 9837;
 pub const AUTH_SESSION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 pub const AUDIT_RETENTION_LIMIT: usize = 10_000;
@@ -53,6 +55,7 @@ pub const NOTIFICATION_RETENTION_LIMIT: usize = 1_000;
 
 pub struct StateStore {
     pub(super) connection: Mutex<Connection>,
+    pub(super) root: Option<PathBuf>,
 }
 
 #[cfg(test)]

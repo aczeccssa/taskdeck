@@ -256,6 +256,7 @@ impl StateStore {
         )?;
         let store = Self {
             connection: Mutex::new(connection),
+            root: None,
         };
         store.initialize()?;
         Ok(store)

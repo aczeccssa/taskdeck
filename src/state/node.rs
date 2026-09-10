@@ -7,6 +7,7 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
 use super::StateStore;
+use super::user_config;
 use super::util::*;
 use crate::protocol::*;
 
@@ -15,6 +16,7 @@ impl StateStore {
         let connection = self.connection.lock().expect("state store lock");
         let mut settings = read_node_settings(&connection)?;
         drop(connection);
+        self.apply_user_network_config(&mut settings)?;
         apply_environment(&mut settings)?;
         settings.validate()?;
         Ok(settings)
@@ -23,6 +25,12 @@ impl StateStore {
     pub fn configure(&self, update: NodeSettingsUpdate) -> Result<NodeSettings> {
         let mut connection = self.connection.lock().expect("state store lock");
         let mut settings = read_node_settings(&connection)?;
+        let previous_network_config = self.user_network_config(&settings)?;
+        if let Some(config) = &previous_network_config {
+            settings.bind_host = config.bind_host.clone();
+            settings.web_port = config.web_port;
+        }
+        let network_changed = update.bind_host.is_some() || update.web_port.is_some();
         if let Some(role) = update.role {
             settings.role = role;
             if role == NodeRole::Worker {
@@ -59,9 +67,35 @@ impl StateStore {
                 );
             }
         }
+        if network_changed {
+            if let Some(previous) = &previous_network_config {
+                let mut updated = previous.clone();
+                updated.bind_host = settings.bind_host.clone();
+                updated.web_port = settings.web_port;
+                user_config::write(self.root.as_deref().expect("config root exists"), &updated)?;
+            }
+        }
         let transaction = connection.transaction()?;
-        write_node_settings(&transaction, &settings)?;
-        transaction.commit()?;
+        let write_result = (|| -> Result<()> {
+            write_node_settings(&transaction, &settings)?;
+            transaction.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            if network_changed {
+                if let Some(previous) = &previous_network_config {
+                    if let Err(restore_error) = user_config::write(
+                        self.root.as_deref().expect("config root exists"),
+                        previous,
+                    ) {
+                        return Err(error.context(format!(
+                            "database update failed and taskdeck.json could not be restored: {restore_error:#}"
+                        )));
+                    }
+                }
+            }
+            return Err(error);
+        }
         Ok(settings)
     }
 
@@ -78,7 +112,7 @@ impl StateStore {
         &self,
         patch: crate::protocol::NodeSettingsPatch,
     ) -> Result<crate::protocol::NodeSettingsWriteResult> {
-        let original = self.read_node_settings()?;
+        let original = self.node_settings()?;
         let update = NodeSettingsUpdate {
             role: patch.role.as_deref().map(NodeRole::parse).transpose()?,
             leader_mode: patch
@@ -106,9 +140,30 @@ impl StateStore {
         })
     }
 
-    fn read_node_settings(&self) -> Result<NodeSettings> {
-        let connection = self.connection.lock().expect("state store lock");
-        read_node_settings(&connection)
+    fn apply_user_network_config(&self, settings: &mut NodeSettings) -> Result<()> {
+        if let Some(config) = self.user_network_config(settings)? {
+            settings.bind_host = config.bind_host;
+            settings.web_port = config.web_port;
+        }
+        Ok(())
+    }
+
+    fn user_network_config(
+        &self,
+        legacy_settings: &NodeSettings,
+    ) -> Result<Option<user_config::UserNetworkConfig>> {
+        self.root
+            .as_deref()
+            .map(|root| {
+                user_config::load_or_create(
+                    root,
+                    user_config::legacy(
+                        legacy_settings.bind_host.clone(),
+                        legacy_settings.web_port,
+                    ),
+                )
+            })
+            .transpose()
     }
 }
 

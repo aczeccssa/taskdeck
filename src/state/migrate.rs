@@ -20,9 +20,6 @@ impl StateStore {
         match version.as_deref() {
             None => set_metadata(&connection, "schema_version", SCHEMA_VERSION)?,
             Some("1" | "2" | "3" | "4" | "5" | "6" | "7") => {
-                if get_metadata(&connection, "bind_host")?.as_deref() == Some("127.0.0.1") {
-                    set_metadata(&connection, "bind_host", DEFAULT_BIND_HOST)?;
-                }
                 set_metadata(&connection, "schema_version", SCHEMA_VERSION)?;
             }
             Some(SCHEMA_VERSION) => {}
@@ -38,6 +35,7 @@ impl StateStore {
             set_metadata(&connection, "bind_host", DEFAULT_BIND_HOST)?;
             set_metadata(&connection, "web_port", &DEFAULT_WEB_PORT.to_string())?;
         }
+        connection.execute_batch(&format!("PRAGMA user_version={SCHEMA_VERSION}"))?;
         Ok(())
     }
 }

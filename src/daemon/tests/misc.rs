@@ -31,10 +31,10 @@ use crate::state::{NodeRole, NodeSettings, StateStore};
 
 #[test]
 
-pub(super) fn worker_binds_to_all_interfaces_by_default() {
+pub(super) fn worker_binds_to_loopback_by_default() {
     let state = DaemonState::new();
 
-    assert_eq!(state.public_settings().bind_host, "0.0.0.0");
+    assert_eq!(state.public_settings().bind_host, "127.0.0.1");
 }
 
 #[test]

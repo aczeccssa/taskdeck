@@ -26,6 +26,8 @@ fn renders_systemd_user_and_system_units() {
     assert!(user.contains("WantedBy=default.target"));
     assert!(system.contains("WantedBy=multi-user.target"));
     assert!(user.contains("Environment=\"TASKDECK_HOME="));
+    assert!(!user.contains("TASKDECK_HOME='"));
+    assert!(user.contains("TASKDECK_HOME=/tmp/taskdeck home\""));
     assert!(!user.contains("--background"));
 }
 

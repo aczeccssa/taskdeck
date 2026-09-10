@@ -1,11 +1,12 @@
 //! Database open, DDL and schema migrations.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::Path;
 use std::sync::Mutex;
 
-use anyhow::{Context, Result};
-use rusqlite::Connection;
+use anyhow::{Context, Result, bail};
+use fs2::FileExt;
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use super::StateStore;
 
@@ -15,8 +16,15 @@ pub(crate) const SCHEMA_VERSION: &str = "8";
 impl StateStore {
     pub fn open(root: &Path) -> Result<Self> {
         fs::create_dir_all(root).with_context(|| format!("failed to create {}", root.display()))?;
-        let connection = Connection::open(root.join(DATABASE_FILE))
+        let _migration_lock = acquire_migration_lock(root)?;
+        let database = root.join(DATABASE_FILE);
+        let legacy_version = probe_existing_database(&database)?;
+        let connection = Connection::open(&database)
             .with_context(|| format!("failed to open {}/{}", root.display(), DATABASE_FILE))?;
+        if let Some(version) = legacy_version.filter(|version| *version < current_schema_version())
+        {
+            create_backup(&connection, root, version)?;
+        }
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA foreign_keys=ON;
@@ -261,8 +269,120 @@ impl StateStore {
         )?;
         let store = Self {
             connection: Mutex::new(connection),
+            root: Some(root.to_path_buf()),
         };
         store.initialize()?;
         Ok(store)
     }
+}
+
+fn current_schema_version() -> u32 {
+    SCHEMA_VERSION.parse().expect("schema version is numeric")
+}
+
+fn acquire_migration_lock(root: &Path) -> Result<File> {
+    let path = root.join("state-migration.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    lock.lock_exclusive()
+        .with_context(|| format!("failed to acquire migration lock {}", path.display()))?;
+    Ok(lock)
+}
+
+fn probe_existing_database(path: &Path) -> Result<Option<u32>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("failed to open {} read-only", path.display()))?;
+    let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        bail!(
+            "state database {} failed integrity check: {integrity}",
+            path.display()
+        );
+    }
+    let object_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table', 'index', 'view', 'trigger')",
+        [],
+        |row| row.get(0),
+    )?;
+    if object_count == 0 {
+        return Ok(None);
+    }
+    let user_version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let current = current_schema_version();
+    if user_version > current {
+        bail!(
+            "state database user_version {user_version} is newer than supported version {current}"
+        );
+    }
+    let has_metadata: bool = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='metadata'",
+        [],
+        |row| row.get::<_, i64>(0).map(|count| count > 0),
+    )?;
+    if !has_metadata {
+        bail!(
+            "state database {} has data but no metadata table",
+            path.display()
+        );
+    }
+    let metadata_version: Option<String> = connection
+        .query_row(
+            "SELECT value FROM metadata WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let metadata_version = metadata_version
+        .with_context(|| {
+            format!(
+                "state database {} is missing schema_version",
+                path.display()
+            )
+        })?
+        .parse::<u32>()
+        .with_context(|| {
+            format!(
+                "state database {} has invalid schema_version",
+                path.display()
+            )
+        })?;
+    if metadata_version > current {
+        bail!(
+            "state database schema_version {metadata_version} is newer than supported version {current}"
+        );
+    }
+    if user_version != 0 && user_version != metadata_version {
+        bail!(
+            "state database version conflict: user_version {user_version} does not match metadata schema_version {metadata_version}"
+        );
+    }
+    Ok(Some(metadata_version))
+}
+
+fn create_backup(connection: &Connection, root: &Path, version: u32) -> Result<()> {
+    let backup = root.join(format!("state.db.bak-v{version}.sqlite"));
+    if backup.exists() {
+        return Ok(());
+    }
+    let destination = backup.to_string_lossy().replace('\'', "''");
+    connection
+        .execute_batch(&format!("VACUUM INTO '{destination}'"))
+        .with_context(|| format!("failed to create migration backup {}", backup.display()))?;
+    let backup_connection = Connection::open_with_flags(&backup, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let integrity: String =
+        backup_connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        bail!(
+            "migration backup {} failed integrity check: {integrity}",
+            backup.display()
+        );
+    }
+    Ok(())
 }

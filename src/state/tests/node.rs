@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use super::super::util::get_metadata;
 use super::super::*;
 use crate::protocol::*;
 
@@ -23,6 +24,21 @@ fn node_settings_patch_handles_tokens_and_restart_flags() {
     assert_eq!(result.settings.name, "laptop");
     assert!(result.restart_required);
     assert!(result.settings.has_enrollment_token);
+    let user_config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.path().join("taskdeck.json")).unwrap())
+            .unwrap();
+    assert_eq!(user_config["bind_host"], "127.0.0.1");
+    assert_eq!(user_config["web_port"], 9937);
+    let connection = store.connection.lock().unwrap();
+    assert_eq!(
+        get_metadata(&connection, "bind_host").unwrap().as_deref(),
+        Some("127.0.0.1")
+    );
+    assert_eq!(
+        get_metadata(&connection, "web_port").unwrap().as_deref(),
+        Some("9937")
+    );
+    drop(connection);
     let serialized = serde_json::to_string(&result).unwrap();
     assert!(!serialized.contains("secret"));
     let result = store

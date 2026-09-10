@@ -7,7 +7,6 @@ use super::{
 };
 
 use super::command_output;
-use super::windows_backend::shell_quote;
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -115,7 +114,20 @@ RestartSec=3
 [Install]
 WantedBy={wanted_by}
 "#,
-        executable = shell_quote(&spec.executable.display().to_string()),
-        home = shell_quote(&spec.home.display().to_string()),
+        executable = systemd_quote(&spec.executable.display().to_string()),
+        home = systemd_escape(&spec.home.display().to_string()),
     )
+}
+
+fn systemd_quote(value: &str) -> String {
+    format!("\"{}\"", systemd_escape(value))
+}
+
+fn systemd_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
 }
