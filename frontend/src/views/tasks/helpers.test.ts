@@ -1,10 +1,10 @@
 import {describe, expect, test} from "bun:test";
 import {
     chartGeometry, highlightSegments, logMatches, matchOffsets, normalizeMatchIndex,
-    orderedTaskLabels, reconcileLogs, reorder, taskStateDot, taskStatusAllowsAction,
+    orderedTaskLabels, reconcileLogs, taskStateDot, taskStatusAllowsAction,
     validateConfigTasks, validateWorkspaceEnv,
-} from "./phase7Helpers";
-import type {LogLine, TaskSnapshot} from "../domain/models";
+} from "./helpers";
+import type {LogLine, TaskSnapshot} from "../../domain/models";
 
 const task = (status: TaskSnapshot["status"], generation = 0): TaskSnapshot => ({label: "task", status, command: "echo", cwd: ".", run_generation: generation, service: null});
 const line = (seq: number, text: string): LogLine => ({seq, stream: "stdout", text});
@@ -81,16 +81,4 @@ test("chart geometry preserves scale and in-window restart markers", () => {
     expect(geometry.max).toBe(100);
 });
 
-test("reorder moves only the selected item", () => {
-    expect(reorder(["a", "b", "c"], 2, 0)).toEqual(["c", "a", "b"]);
-    expect(reorder(["a", "b"], 0, 5)).toEqual(["a", "b"]);
-});
 
-import {configSaveFailure} from "./phase7Api";
-
-test("classifies configuration save response kinds", () => {
-    expect(configSaveFailure({kind: "stale_revision"})).toEqual({kind: "stale_revision", saved: undefined, current_revision: undefined});
-    expect(configSaveFailure({kind: "reconciliation_error", saved: true, current_revision: "rev-2"})).toEqual({kind: "reconciliation_error", saved: true, current_revision: "rev-2"});
-    expect(configSaveFailure({kind: "validation_error"})).toBeUndefined();
-    expect(configSaveFailure(null)).toBeUndefined();
-});

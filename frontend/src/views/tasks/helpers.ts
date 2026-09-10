@@ -1,4 +1,4 @@
-import type {LogLine, SessionSnapshot, TaskSnapshot, TaskStatus} from "../domain/models";
+import type {LogLine, SessionSnapshot, TaskSnapshot, TaskStatus} from "../../domain/models";
 
 export type TaskStateDot = {className: "running" | "failed" | "exited"; label: string};
 
@@ -172,22 +172,7 @@ export function taskStatusAllowsAction(status: TaskStatus, action: "start" | "pa
     return ["running", "paused"].includes(status);
 }
 
-export function formatBytes(bytes: number): string {
-    const value = Number(bytes || 0);
-    if (value < 1024) return `${value} B`;
-    const units = ["KB", "MB", "GB", "TB"];
-    let size = value;
-    let unit = -1;
-    do { size /= 1024; unit += 1; } while (size >= 1024 && unit < units.length - 1);
-    return `${size >= 100 ? size.toFixed(0) : size.toFixed(1)} ${units[unit]}`;
-}
 
-export function formatRuntime(seconds: number): string {
-    const value = Number(seconds || 0);
-    if (value < 60) return `${value}s`;
-    if (value < 3600) return `${Math.floor(value / 60)}m ${value % 60}s`;
-    return `${Math.floor(value / 3600)}h ${Math.floor((value % 3600) / 60)}m`;
-}
 
 export type ChartSample = {timestamp_ms: number; cpu_percent: number; memory_bytes: number; process_count?: number | null};
 export function chartGeometry(samples: readonly ChartSample[], key: "cpu_percent" | "memory_bytes", restartMarkers: readonly number[] = []): {points: string; markers: string[]; max: number} {
@@ -207,10 +192,3 @@ export function chartGeometry(samples: readonly ChartSample[], key: "cpu_percent
     return {points: points.join(" "), markers, max};
 }
 
-export function reorder<T>(items: readonly T[], from: number, to: number): T[] {
-    if (from === to || from < 0 || to < 0 || from >= items.length || to >= items.length) return [...items];
-    const next = [...items];
-    const [item] = next.splice(from, 1);
-    next.splice(to, 0, item);
-    return next;
-}

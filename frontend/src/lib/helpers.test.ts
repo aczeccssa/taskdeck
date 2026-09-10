@@ -1,5 +1,5 @@
 import {expect, test} from "bun:test";
-import {escapeHtml, formatBytes, formatRuntime, paginate, parseStoredJson, preferenceKey, queryString, translate, viewForPath} from "./helpers";
+import {escapeHtml, formatBytes, formatRuntime, paginate, parseStoredJson, preferenceKey, queryString, reorder, translate, viewForPath} from "./helpers";
 
 test("HTML escaping and route mapping preserve legacy behavior", () => {
  expect(escapeHtml(`<a title='x'>&`)).toBe("&lt;a title=&#39;x&#39;&gt;&amp;");
@@ -24,4 +24,13 @@ test("i18n fallback matches legacy lookup order", () => {
  expect(translate("known", "zh", {en: {known: "English"}, zh: {known: "中文"}})).toBe("中文");
  expect(translate("missing", "zh", {en: {}}, "Fallback")).toBe("Fallback");
  expect(translate("missing", "en", {en: {}})).toBe("missing");
+});
+
+
+test("reorder moves only the selected item without mutating the source", () => {
+    const source = ["a", "b", "c"];
+    expect(reorder(source, 2, 0)).toEqual(["c", "a", "b"]);
+    expect(source).toEqual(["a", "b", "c"]);
+    expect(reorder(source, 0, -1)).toBe(source);
+    expect(reorder(["a", "b"], 0, 5)).toEqual(["a", "b"]);
 });

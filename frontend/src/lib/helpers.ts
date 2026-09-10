@@ -54,3 +54,11 @@ export function translate(key: string, language: Language, tables: Readonly<{en:
  const localized = language === "zh" ? tables.zh?.[key] : undefined;
  return localized ?? tables.en[key] ?? fallback ?? key;
 }
+
+export function reorder<T>(items: readonly T[], from: number, to: number): T[] {
+    if (to < 0 || to >= items.length) return items as T[];
+    const next = [...items];
+    const [item] = next.splice(from, 1);
+    next.splice(to, 0, item);
+    return next;
+}

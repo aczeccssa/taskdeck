@@ -4,11 +4,15 @@ import {BrowserRouter, Route, Routes, useLocation, useNavigate} from "react-rout
 import {AppShell} from "./shell/AppShell";
 import {routes, type View} from "./app/routes";
 import {UI_ICON_STROKE_WIDTH} from "./components/ReiconNavigation";
-import {AlertsView, AuditView, CallsView, DocsView} from "./views/Phase3Views";
-import {DashboardView, SettingsView} from "./views/Phase4Views";
-import {BoardsView} from "./views/Phase5Views";
-import {WorkflowsView} from "./views/Phase6Views";
-import {TasksView} from "./views/Phase7Views";
+import { TasksView } from "./views/tasks/TasksView";
+import { DashboardView } from "./views/dashboard/DashboardView";
+import { BoardsView } from "./views/boards/BoardsView";
+import { WorkflowsView } from "./views/workflows/WorkflowsView";
+import { SettingsView } from "./views/settings/SettingsView";
+import { DocsView } from "./views/docs/DocsView";
+import { CallsView } from "./views/calls/CallsView";
+import { AuditView } from "./views/audit/AuditView";
+import { AlertsView } from "./views/alerts/AlertsView";
 import "./legacy/styles.css";
 
 type AuthState = "loading" | "ready" | "login";
