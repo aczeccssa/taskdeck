@@ -691,14 +691,108 @@ svg {
 }
 
 .worker-stage {
+    position: relative;
     display: grid;
     min-width: 0;
     min-height: 0;
     gap: 12px;
+    --split-position: .62;
 }
 
 .worker-stage.mode-split {
     grid-template-columns: minmax(0, 1fr) minmax(330px, 38%);
+}
+
+.worker-stage.mode-split .monitor-panel {
+    grid-column: 2;
+}
+
+.worker-stage:not(.mode-split) .split-divider {
+    display: none;
+}
+
+.split-divider {
+    position: absolute;
+    z-index: 2;
+    top: 50%;
+    left: var(--split-left, 62%);
+    display: grid;
+    box-sizing: border-box;
+    width: 8px;
+    min-width: 8px;
+    height: 68px;
+    min-height: 68px;
+    border: 0;
+    border-radius: 5px;
+    background: var(--surface-strong);
+    cursor: col-resize;
+    padding: 0;
+    touch-action: none;
+    transform: translate(-50%, -50%);
+    transition: background-color 160ms ease, left 260ms cubic-bezier(.22, 1, .36, 1);
+}
+
+.split-divider span {
+    display: grid;
+    place-self: center;
+    width: 3px;
+    height: 3px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 -7px 0 var(--accent), 0 7px 0 var(--accent);
+    opacity: 1;
+    transition: opacity 160ms ease, background-color 160ms ease;
+}
+
+.split-divider span::before,
+.split-divider span::after {
+    display: none;
+}
+
+.split-divider:hover,
+.split-divider.dragging,
+.split-divider:focus-visible {
+    background: color-mix(in oklab, var(--accent) 16%, var(--surface-strong));
+}
+
+.split-divider:hover span,
+.split-divider.dragging span,
+.split-divider:focus-visible span {
+    background: var(--accent);
+    opacity: 1;
+}
+
+.worker-stage.mode-split:not(.resizing) {
+    transition: grid-template-columns 260ms cubic-bezier(.22, 1, .36, 1);
+}
+
+.worker-stage.resizing:not(.snapping),
+.worker-stage.resizing:not(.snapping) .split-divider {
+    transition: none;
+}
+
+.worker-stage.snapping {
+    transition: grid-template-columns 240ms cubic-bezier(.22, 1, .36, 1);
+}
+
+.worker-stage.mode-split .log-panel,
+.worker-stage.mode-split .monitor-panel {
+    transition: opacity 180ms ease, transform 240ms cubic-bezier(.22, 1, .36, 1);
+}
+
+.worker-stage.snap-log .monitor-panel,
+.worker-stage.snap-monitor .log-panel {
+    opacity: 0;
+    transform: scaleX(.98);
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .worker-stage,
+    .worker-stage .log-panel,
+    .worker-stage .monitor-panel,
+    .split-divider {
+        transition-duration: 0ms !important;
+    }
 }
 
 .worker-stage.mode-monitor {
@@ -3683,6 +3777,10 @@ body,
         grid-template-rows: minmax(320px, 1fr) minmax(280px, auto);
     }
 
+    .split-divider {
+        display: none;
+    }
+
     .monitor-panel {
         min-height: 280px;
     }
@@ -5568,33 +5666,46 @@ select option {
     }
 }
 
-/* Context drawers are floating panels, not permanent full-height rails. Keep
- * the page visible around them and give every editor the same geometry. */
+/* Context drawers are full-height right rails. Native dialogs must override
+ * the UA centering (position:absolute; inset-inline-start:0; margin:auto). */
+.workflow-layout {
+    grid-template-columns: minmax(0, 1fr);
+}
+
 .workflow-editor,
 .alerts-editor,
-.settings-drawer {
-    top: 24px;
-    right: 24px;
-    bottom: auto;
-    height: auto;
-    min-height: 0;
-    max-height: calc(100dvh - 48px);
-    border: 1px solid var(--border-strong);
-    border-radius: 14px;
-    box-shadow: var(--shadow);
+.settings-drawer,
+dialog.drawer.settings-drawer {
+    position: fixed;
+    z-index: 120;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: auto;
+    inset-inline-start: auto;
+    inset-inline-end: 0;
+    height: 100dvh;
+    min-height: 100dvh;
+    max-height: 100dvh;
+    margin: 0;
+    border-radius: 0;
+    border: 0;
+    border-left: 1px solid var(--border);
+    box-shadow: -24px 0 70px rgba(0, 0, 0, .18);
 }
 
 .workflow-editor {
-    width: min(520px, calc(100vw - 48px));
+    width: min(520px, 100vw);
 }
 
 .alerts-editor {
-    width: min(420px, calc(100vw - 48px));
+    width: min(420px, 100vw);
 }
 
-.settings-drawer {
-    width: min(660px, calc(100vw - 48px));
-    margin: 0;
+.settings-drawer,
+dialog.drawer.settings-drawer {
+    width: min(660px, 100vw);
+    max-width: min(660px, 100vw);
 }
 
 .workflow-editor .workflow-member-list,
@@ -5605,33 +5716,76 @@ select option {
 }
 
 .settings-drawer .drawer-shell {
-    height: auto;
-    min-height: 0;
-    max-height: calc(100dvh - 48px);
+    height: 100%;
+    min-height: 100dvh;
+    max-height: 100dvh;
+    grid-template-rows: auto minmax(0, 1fr);
 }
 
 .settings-drawer .settings-form {
-    max-height: calc(100dvh - 122px);
+    max-height: none;
+    display: grid;
+    grid-template-rows: none;
+    align-content: start;
+    gap: 14px;
+}
+
+.settings-drawer .settings-message:empty {
+    display: none;
 }
 
 @media (max-width: 620px) {
-
     .workflow-editor,
     .alerts-editor,
-    .settings-drawer {
-        top: 12px;
-        right: 12px;
-        width: calc(100vw - 24px);
-        max-height: calc(100dvh - 24px);
+    .settings-drawer,
+    dialog.drawer.settings-drawer {
+        top: 0;
+        right: 0;
+        width: 100vw;
+        max-width: 100vw;
+        max-height: 100dvh;
     }
+}
 
-    .settings-drawer .drawer-shell {
-        max-height: calc(100dvh - 24px);
-    }
+.notification-item {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    padding: 12px 14px;
+}
 
-    .settings-drawer .settings-form {
-        max-height: calc(100dvh - 98px);
-    }
+.notification-item header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.notification-item.unread {
+    border-left: 3px solid var(--accent);
+}
+
+.notification-item.read {
+    opacity: .72;
+}
+
+.notification-item p {
+    margin: 6px 0 0;
+    font-size: 13px;
+}
+
+.view.editor-open::before,
+.alerts-layout:not(.editor-collapsed)::before {
+    z-index: 110;
+}
+
+.workflow-editor>header,
+.alerts-editor>header {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    padding-top: 20px;
+    background: var(--surface);
 }
 /* The theme control shows the active mode: system/computer, light/sun, or
  * dark/moon. This makes the three-state cycle discoverable at a glance. */
@@ -5679,4 +5833,89 @@ select option {
 }
 @media (max-width: 620px) {
     .notification-popover { right: -8px; }
+}
+
+/* Settings page matches other views: fill the main column, keep actions compact. */
+.settings-view {
+    overflow: auto;
+}
+
+.settings-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--content-gap);
+    width: 100%;
+    max-width: none;
+    margin: 0;
+    padding: var(--page-pad);
+    align-content: start;
+}
+
+.settings-layout .settings-panel {
+    margin-top: 0;
+    min-width: 0;
+    padding: 22px 24px 24px;
+}
+
+.settings-layout .settings-panel > header {
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 16px;
+}
+
+.settings-layout .settings-panel > header h2 {
+    white-space: nowrap;
+}
+
+.settings-layout .settings-panel > header select {
+    flex: 0 1 240px;
+    width: min(240px, 100%);
+    max-width: 100%;
+}
+
+.settings-layout .settings-form {
+    justify-items: start;
+}
+
+.settings-layout .settings-form > .field-grid,
+.settings-layout .settings-form > input {
+    width: 100%;
+}
+
+.settings-layout .settings-form > .button,
+.settings-layout .settings-form > .button.primary {
+    width: auto;
+    min-width: 132px;
+    justify-self: start;
+}
+
+.settings-layout .settings-message:empty {
+    display: none;
+}
+
+.settings-layout .field-grid.compact-grid {
+    grid-template-columns: minmax(0, 1.6fr) minmax(96px, 180px);
+    max-width: 560px;
+}
+
+.settings-layout .quota-row,
+.settings-layout .token-row {
+    width: 100%;
+}
+
+@media (max-width: 720px) {
+    .settings-layout .settings-panel > header {
+        flex-wrap: wrap;
+    }
+
+    .settings-layout .settings-panel > header select {
+        flex: 1 1 100%;
+        width: 100%;
+    }
+
+    .settings-layout .field-grid,
+    .settings-layout .field-grid.compact-grid {
+        grid-template-columns: minmax(0, 1fr);
+        max-width: none;
+    }
 }

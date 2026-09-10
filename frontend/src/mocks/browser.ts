@@ -37,6 +37,18 @@ export function installMockApi(): void {
         status,
         headers: {"content-type": "application/json"}
     });
+    let taskOrder = ["web", "worker"];
+    const pageQuery = new URLSearchParams(window.location.search);
+    const taskStatus = pageQuery.get("taskStatus") ?? "running";
+    const configFailure = pageQuery.get("configFailure");
+    const metricsEmpty = pageQuery.get("metrics") === "empty";
+    const apiFail = pageQuery.get("apiFail");
+    const apiOffline = pageQuery.get("apiOffline") === "1";
+    const apiDelay = Number(pageQuery.get("apiDelay") || 0);
+    const errorJson = (message: string, data?: Json, status = 409): Response => new Response(JSON.stringify({ok: false, message, ...(data === undefined ? {} : {data})}), {
+        status,
+        headers: {"content-type": "application/json"}
+    });
     const methodOf = (init?: RequestInit): string => (init?.method ?? "GET").toUpperCase();
     const bodyOf = async (init?: RequestInit): Promise<Record<string, unknown>> => {
         if (typeof init?.body !== "string" || !init.body) return {};
@@ -77,9 +89,12 @@ export function installMockApi(): void {
         if (!url.pathname.startsWith("/api/") && !["/me", "/healthz"].includes(url.pathname)) return nativeFetch(input, init);
         const path = url.pathname;
         const method = methodOf(init);
+        if (apiOffline && path.startsWith("/api/")) throw new TypeError("Failed to fetch");
+        if (apiDelay > 0) await new Promise((resolve) => setTimeout(resolve, apiDelay));
+        if (apiFail && path.includes(apiFail)) return errorJson(`Mock failure for ${path}`, undefined, 500);
         if (path === "/healthz") return new Response("", {status: 200});
         if (path === "/me") return json({enabled: false, configured: false, authenticated: true});
-        if (path === "/api/nodes") return json([mockNode()]);
+        if (path === "/api/nodes") return json([mockNode(pageQuery.get("nodeState") !== "offline")]);
         if (path === "/api/workspaces") return json([{
             session: "mock-workspace",
             alias: "Mock workspace",
@@ -87,7 +102,7 @@ export function installMockApi(): void {
             project: "/workspace/mock"
         }]);
         if (path === "/api/sessions") return json(["mock-workspace"]);
-        if (path === "/api/node-metrics") return json(mockNodeMetrics());
+        if (path === "/api/node-metrics") return json(mockNodeMetrics(metricsEmpty));
         if (path === "/api/task-runs" || path === "/api/events") return json({
             items: mockTaskRuns(),
             page: 1,
@@ -125,6 +140,56 @@ export function installMockApi(): void {
             targets: mockTargets()
         });
         if (path === "/api/board-templates" && method === "GET") return json({templates: store.templates});
+        const templateExport = path.match(/^\/api\/board-templates\/([^/]+)\/export$/);
+        if (templateExport) {
+            const templateId = decodeURIComponent(templateExport[1]);
+            const template = store.templates.find((entry) => typeof entry === "object" && entry !== null && (entry as {id?: string}).id === templateId);
+            if (!template) return errorJson(`board template '${templateId}' not found`, undefined, 404);
+            const record = template as Record<string, unknown>;
+            return json({kind: "taskdeck_board_template", name: record.name ?? "Template", description: record.description ?? null, cards: Array.isArray(record.cards) ? record.cards : [], exported_at_ms: now()});
+        }
+        const templateApply = path.match(/^\/api\/board-templates\/([^/]+)\/apply$/);
+        if (templateApply && method === "POST") {
+            const templateId = decodeURIComponent(templateApply[1]);
+            const template = store.templates.find((entry) => typeof entry === "object" && entry !== null && (entry as {id?: string}).id === templateId);
+            if (!template) return errorJson(`board template '${templateId}' not found`, undefined, 404);
+            const record = template as Record<string, unknown>;
+            const body = await bodyOf(init);
+            const board = {
+                id: id("board"),
+                name: String(body.name ?? `Board ${new Date().toISOString().slice(0, 10)}`),
+                cards: (Array.isArray(record.cards) ? record.cards : []).map((card) => ({...(typeof card === "object" && card !== null ? card : {}), id: id("card")})),
+                created_at_ms: now(),
+                updated_at_ms: now()
+            };
+            store.boards.push(board);
+            return json(board);
+        }
+        if (path === "/api/board-templates/import" && method === "POST") {
+            const body = await bodyOf(init);
+            if (body.kind !== "taskdeck_board_template") return errorJson("not a taskdeck board template export");
+            const template = {id: id("template"), name: String(body.name ?? "Imported template"), description: body.description ?? null, cards: Array.isArray(body.cards) ? body.cards : [], created_at_ms: now(), updated_at_ms: now()};
+            store.templates.push(template);
+            return json(template, 201);
+        }
+        if (path === "/api/dependencies" && method === "POST") {
+            const body = await bodyOf(init);
+            const item = {
+                id: id("dependency"),
+                task_node_id: body.node_id ?? "",
+                task_session: body.session ?? "",
+                task: body.task ?? "",
+                depends_node_id: body.depends_node_id ?? "",
+                depends_session: body.depends_session ?? "",
+                depends_task: body.depends_task ?? "",
+                required_state: "running",
+                task_status: "running",
+                depends_status: "running",
+                created_at_ms: now()
+            };
+            store.dependencies.push(item);
+            return json(item, 201);
+        }
         const simple = ({
             "/api/boards": "boards",
             "/api/workflow-groups": "workflows",
@@ -148,20 +213,56 @@ export function installMockApi(): void {
             store.tokens.push(token);
             return json({...token, secret: "tdk_mock_example_secret"}, 201);
         }
-        if (/^\/api\/sessions\/[^/]+$/.test(path)) return json(mockSnapshot());
-        if (/\/logs$/.test(path)) return json({
-            generation: 1,
-            reset: false,
-            lines: [{seq: 1, stream: "stdout", text: "Mock Taskdeck is running."}]
-        });
-        if (/\/metrics$/.test(path)) return json({
-            samples: [{
-                timestamp_ms: now(),
-                cpu_percent: 12,
-                memory_bytes: 256000000
-            }]
-        });
-        if (/\/config$/.test(path)) return json({revision: 1, tasks: [], workspace_env: {}});
+        if (/^\/api\/sessions\/[^/]+$/.test(path)) return json(mockSnapshot(taskStatus, taskOrder));
+        if (/\/logs$/.test(path)) {
+            const after = Number(url.searchParams.get("after") || 0);
+            const limit = Number(url.searchParams.get("limit") || 1000);
+            const all = pageQuery.get("logs") === "long"
+                ? Array.from({length: 160}, (_, index) => ({seq: index + 1, stream: index % 5 === 4 ? "stderr" : "stdout", text: `Mock output line ${index + 1} with searchable token`}))
+                : [{seq: 1, stream: "stdout", text: "Mock Taskdeck is running."}, {seq: 2, stream: "stderr", text: "Watching mock output."}];
+            return json({generation: 1, reset: false, lines: all.filter((line) => Number(line.seq) > after).slice(-limit)});
+        }
+        if (/\/history$/.test(path)) return json({accepted: true});
+        if (/\/metrics$/.test(path)) {
+            const timestamp = now();
+            if (metricsEmpty) {
+                return json({
+                    sample_interval_ms: 1000,
+                    window_seconds: 600,
+                    cpu_percent_unit: "percent",
+                    running: false,
+                    current: {cpu_percent: 0, memory_bytes: 0, process_count: 0},
+                    samples: [],
+                    processes: [],
+                    restart_markers_ms: []
+                });
+            }
+            return json({
+                sample_interval_ms: 1000,
+                window_seconds: 600,
+                cpu_percent_unit: "percent",
+                running: taskStatus === "running",
+                current: {cpu_percent: 12, memory_bytes: 256000000, process_count: 2},
+                samples: [{timestamp_ms: timestamp - 1000, cpu_percent: 10, memory_bytes: 250000000, process_count: 2}, {timestamp_ms: timestamp, cpu_percent: 12, memory_bytes: 256000000, process_count: 2}],
+                processes: [{pid: 1234, ppid: 1, name: "bun", status: "running", run_time_seconds: 42, cpu_percent: 10, memory_bytes: 128000000, process_count: 1}, {pid: 1235, ppid: 1234, name: "vite", status: "running", run_time_seconds: 40, cpu_percent: 2, memory_bytes: 128000000, process_count: 1}],
+                restart_markers_ms: [timestamp - 500]
+            });
+        }
+        if (/\/config$/.test(path)) {
+            if (method === "PUT" && configFailure === "stale_revision") {
+                return errorJson("configuration revision is stale", {kind: "stale_revision"});
+            }
+            if (method === "PUT" && configFailure === "reconciliation_error") {
+                return errorJson("one or more live sessions failed to reconcile", {kind: "reconciliation_error", saved: true, current_revision: "recovered-1"});
+            }
+            if (method === "PUT") {
+                const body = await bodyOf(init);
+                const tasks = Array.isArray(body.tasks) ? body.tasks as Json[] : [];
+                taskOrder = tasks.map((task) => String((task as Record<string, unknown>).label));
+                return json({...mockConfig(), revision: `mock-${now()}`, workspace_env: body.workspace_env ?? {}, tasks});
+            }
+            return json(mockConfig());
+        }
         if (/\/settings$/.test(path)) return json({settings: mockNode(), environment_overrides: []});
         if (/\/service$/.test(path)) return json({status: "running", supported: true});
         if (/\/revisions$/.test(path)) return json({revisions: []});
@@ -194,14 +295,15 @@ function findBy(items: Json[], path: string, key = "id"): Json {
     return items.find((item) => typeof item === "object" && item !== null && (item as Record<string, unknown>)[key] === value) ?? {};
 }
 
-function mockNode(): Json {
+function mockNode(online = true): Json {
     return {
         id: "mock",
         node_id: "mock",
         name: "Mock device",
         is_self: true,
-        online: true,
+        online,
         role: "leader",
+        mode: "standard",
         leader_mode: "standard",
         leader_url: "http://leader:9837",
         bind_host: "127.0.0.1",
@@ -212,7 +314,7 @@ function mockNode(): Json {
     };
 }
 
-function mockNodeMetrics(): Json {
+function mockNodeMetrics(empty = false): Json {
     const timestamp = now();
     const sample = {
         timestamp_ms: timestamp,
@@ -221,6 +323,20 @@ function mockNodeMetrics(): Json {
         memory_total_bytes: 1073741824,
         running_tasks: 1
     };
+    if (empty) {
+        return {
+            nodes: [{
+                node_id: "mock",
+                node_name: "Mock device",
+                online: true,
+                is_self: true,
+                current: null,
+                samples: [],
+                session_count: 1,
+                task_status_counts: {running: 1, stopped: 1}
+            }], task_status_counts: {running: 1, stopped: 1}
+        };
+    }
     return {
         nodes: [{
             node_id: "mock",
@@ -284,7 +400,8 @@ function mockWorkflow(): Json {
             workspace_display_name: "Mock workspace",
             task: "web",
             available: true
-        }]
+        }],
+        graph: {positions: [{x: 40, y: 30}], edges: []}
     };
 }
 
@@ -429,17 +546,31 @@ function mockTaskRuns(): Json[] {
     }];
 }
 
-function mockSnapshot(): Json {
+function mockConfig(): Record<string, unknown> {
+    return {
+        session: "mock-workspace",
+        project: "/workspace/mock",
+        source: "mock",
+        revision: "mock-1",
+        workspace_env: {MOCK_ENV: "1"},
+        tasks: [
+            {label: "web", command: "bun run dev", args: ["--host"], cwd: ".", env: {NODE_ENV: "development"}, shell: true, auto_start: true, stop_timeout_ms: 3000, clear_logs_on_restart: false, schedule: null, origin: {imported: false, has_yaml_override: false}},
+            {label: "worker", command: "bun run worker", args: [], cwd: ".", env: {}, shell: true, auto_start: false, stop_timeout_ms: 5000, clear_logs_on_restart: true, schedule: null, origin: {imported: false, has_yaml_override: false}}
+        ]
+    };
+}
+
+function mockSnapshot(status = "running", order: string[] = ["web", "worker"]): Json {
     return {
         name: "mock-workspace",
         project: "/workspace/mock",
         source: "mock",
         alias: "Mock workspace",
-        task_order: ["web", "worker"],
+        task_order: order,
         tasks: {
             web: {
                 label: "web",
-                status: "running",
+                status,
                 pid: 1234,
                 command: "bun run dev",
                 cwd: "/workspace/mock",
@@ -456,7 +587,7 @@ function mockSnapshot(): Json {
             },
             worker: {
                 label: "worker",
-                status: "stopped",
+                status: "idle",
                 pid: null,
                 command: "bun run worker",
                 cwd: "/workspace/mock",

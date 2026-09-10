@@ -233,6 +233,10 @@ evidence instead of pretending a configured port is live.
 The Web UI is a single React + TypeScript + Vite application in `frontend/`. It is
 built with Bun and is embedded into the Taskdeck executable; no `dist` directory,
 Node runtime, or external static-file server is needed when the daemon runs.
+All operational routes and overlays are React-owned at runtime. The former legacy
+JavaScript bootstrap and HTML shell are no longer imported or injected;
+`frontend/src/legacy/styles.css` remains as the retained visual contract until a
+separate, parity-verified CSS cleanup.
 
 Source builds require **Bun 1.3.14 or later**. `cargo build`, `cargo build --release`,
 Docker builds, and the local install scripts invoke the frontend build automatically.
