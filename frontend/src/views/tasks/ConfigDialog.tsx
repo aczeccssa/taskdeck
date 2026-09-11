@@ -13,7 +13,7 @@ import type { SortDrag } from "./types";
 import { useConfigTaskDrag } from "./useConfigTaskDrag";
 import { ConfigTaskList } from "./ConfigTaskList";
 import { ConfigTaskForm } from "./ConfigTaskForm";
-import { ConfigWorkspaceEnv } from "./ConfigWorkspaceEnv";
+import { EnvironmentDialog } from "./EnvironmentDialog";
 
 const api = new LegacyApiAdapter();
 
@@ -53,6 +53,8 @@ export function ConfigDialog({
     const [message, setMessage] = useState("");
     const [messageError, setMessageError] = useState(false);
     const [reloadVisible, setReloadVisible] = useState(false);
+    const [environmentOpen, setEnvironmentOpen] = useState(false);
+    const [environmentScope, setEnvironmentScope] = useState<"task" | "workspace">("task");
     const sortDrag = useRef<SortDrag | null>(null);
     const configListRef = useRef<HTMLElement>(null);
     useConfigTaskDrag({
@@ -74,6 +76,7 @@ export function ConfigDialog({
         if (dirty && !window.confirm("Discard unsaved configuration changes?")) return false;
         requestRef.current += 1;
         setDirty(false);
+        setEnvironmentOpen(false);
         setOpen(false);
         dialog.close();
         return true;
@@ -86,7 +89,10 @@ export function ConfigDialog({
         const dialog = dialogRef.current;
         if (!dialog) return;
         if (open && !dialog.open) dialog.showModal();
-        if (!open && dialog.open) dialog.close();
+        if (!open && dialog.open) {
+            setEnvironmentOpen(false);
+            dialog.close();
+        }
     }, [open]);
     const loadConfig = async (confirmDiscard = false): Promise<void> => {
         if (saving) return;
@@ -220,7 +226,12 @@ export function ConfigDialog({
     };
     const nodeSummary = nodes.find((candidate) => candidate.id === config?.node);
     const selectedTask = tasks[taskIndex];
+    const openEnvironment = (): void => {
+        setEnvironmentScope(selectedTask ? "task" : "workspace");
+        setEnvironmentOpen(true);
+    };
     return (
+        <>
         <dialog
             className="drawer config-drawer"
             id="config-dialog"
@@ -240,6 +251,9 @@ export function ConfigDialog({
                         <span>Registered configuration</span>
                         <h2 id="config-dialog-title">Edit tasks</h2>
                     </div>
+                    <button className="button compact" type="button" onClick={openEnvironment}>
+                        Environment variables
+                    </button>
                     <button
                         className="icon-button"
                         id="close-config"
@@ -269,7 +283,6 @@ export function ConfigDialog({
                     onAdd={addTask}
                 />
                 <form className="config-form" id="config-form" onSubmit={save}>
-                    <ConfigWorkspaceEnv rows={workspaceEnvRows} setRows={setWorkspaceEnvRows} setDirty={setDirty} />
                     <ConfigTaskForm
                         selectedTask={selectedTask}
                         taskIndex={taskIndex}
@@ -296,5 +309,17 @@ export function ConfigDialog({
             </div>
         </div>
     </dialog>
+    <EnvironmentDialog
+        open={environmentOpen}
+        setOpen={setEnvironmentOpen}
+        scope={environmentScope}
+        setScope={setEnvironmentScope}
+        selectedTask={selectedTask}
+        updateTask={(update) => updateTask(taskIndex, update)}
+        workspaceRows={workspaceEnvRows}
+        setWorkspaceRows={setWorkspaceEnvRows}
+        setDirty={setDirty}
+    />
+    </>
     );
 }

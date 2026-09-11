@@ -363,16 +363,15 @@ export function TasksView(): React.JSX.Element {
         setLogLines, setMetrics, setTail,
         resetLogCursor, loadLogs, loadMetrics, loadSnapshot,
     });
-    const updateSplitLayout = (): void => {
+    const updateSplitLayout = (position = splitPosition): void => {
         const stage = stageRef.current;
         if (!stage || workspaceMode !== "split" || window.matchMedia("(max-width: 1180px)").matches) return;
         const width = stage.getBoundingClientRect().width;
         if (!width) return;
         const gap = 12;
-        const logWidth = Math.round((width - gap) * splitPosition);
+        const logWidth = Math.round((width - gap) * position);
         stage.style.gridTemplateColumns = `minmax(0, ${logWidth}px) minmax(0, 1fr)`;
-        const divider = document.getElementById("split-divider");
-        divider?.style.setProperty("--split-left", `${logWidth + gap / 2}px`);
+        stage.style.setProperty("--split-left", `${logWidth + gap / 2}px`);
     };
 
     const canStart = task ? taskStatusAllowsAction(task.status, "start") : false;

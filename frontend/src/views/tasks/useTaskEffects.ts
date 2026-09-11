@@ -55,7 +55,7 @@ export function useTaskEffects({
     handleLogAction: (action: string) => void;
     setConfigOpen: (open: boolean) => void;
     toggleLogFullscreen: () => Promise<void>;
-    updateSplitLayout: () => void;
+    updateSplitLayout: (position?: number) => void;
     loadNodes: () => Promise<void>;
     loadWorkspaceData: (nodeId: string, sessionOverride?: string) => Promise<void>;
     loadSnapshot: (nodeId?: string, sessionId?: string) => Promise<void>;
@@ -118,5 +118,13 @@ export function useTaskEffects({
             button.setAttribute("aria-pressed", String(active));
         });
     }, [workspaceMode, splitPosition, snapshot, currentTask]);
+
+    useEffect(() => {
+        const stage = stageRef.current;
+        if (!stage || workspaceMode !== "split" || window.matchMedia("(max-width: 1180px)").matches) return;
+        const observer = new ResizeObserver(() => updateSplitLayout());
+        observer.observe(stage);
+        return () => observer.disconnect();
+    }, [workspaceMode, splitPosition, snapshot, currentTask, updateSplitLayout]);
 
 }

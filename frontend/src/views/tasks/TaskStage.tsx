@@ -61,7 +61,7 @@ export type TaskStageContext = {
     loadLogs: (nodeId?: string, sessionId?: string, taskId?: string | null, tailValue?: number) => Promise<void>;
     loadSnapshot: (nodeId?: string, sessionId?: string) => Promise<void>;
     act: (action: "start" | "pause" | "resume" | "restart" | "stop", button: HTMLButtonElement) => Promise<void>;
-    updateSplitLayout: () => void;
+    updateSplitLayout: (position?: number) => void;
     configGuard: { current: () => boolean };
     nodes: NodeSummary[];
 };
@@ -229,39 +229,42 @@ export function TaskStage({
                                             return;
                                         const bounds = stageRef.current.getBoundingClientRect();
                                         const position = (event.clientX - bounds.left) / bounds.width;
-                                        if (position <= 0.25) setWorkspaceMode("monitor");
-                                        else if (position >= 0.75) setWorkspaceMode("log");
-                                        else {
-                                            setSplitPosition(Math.max(0.25, Math.min(0.75, position)));
-                                            updateSplitLayout();
-                                        }
+                                        updateSplitLayout(Math.max(0.25, Math.min(0.75, position)));
                                     }}
                                     onPointerUp={(event) => {
+                                        const bounds = stageRef.current?.getBoundingClientRect();
+                                        const position = bounds ? (event.clientX - bounds.left) / bounds.width : 0.62;
                                         event.currentTarget.classList.remove("dragging");
                                         stageRef.current?.classList.remove("resizing");
+                                        if (position <= 0.25) setWorkspaceMode("monitor");
+                                        else if (position >= 0.75) setWorkspaceMode("log");
+                                        else setSplitPosition(position);
                                     }}
                                     onPointerCancel={(event) => {
                                         event.currentTarget.classList.remove("dragging");
                                         stageRef.current?.classList.remove("resizing");
+                                        updateSplitLayout();
                                     }}
                                     onKeyDown={(event: KeyboardEvent<HTMLButtonElement>) => {
                                         if (workspaceMode !== "split") return;
                                         if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
-                                            setSplitPosition((position) =>
-                                                Math.max(
+                                            setSplitPosition((position) => {
+                                                const next = Math.max(
                                                     0.25,
                                                     Math.min(
                                                         0.75,
                                                         position + (event.key === "ArrowLeft" ? -0.04 : 0.04),
                                                     ),
-                                                ),
-                                            );
+                                                );
+                                                updateSplitLayout(next);
+                                                return next;
+                                            });
                                             event.preventDefault();
                                         } else if (event.key === "Home") {
-                                            setWorkspaceMode("log");
+                                            setWorkspaceMode("monitor");
                                             event.preventDefault();
                                         } else if (event.key === "End") {
-                                            setWorkspaceMode("monitor");
+                                            setWorkspaceMode("log");
                                             event.preventDefault();
                                         }
                                     }}>
