@@ -137,6 +137,19 @@ impl LeaderCluster {
         Ok((node_id, connection_id, receiver))
     }
 
+    pub fn forget_worker(&self, node_id: &str) -> Result<bool> {
+        let sender = {
+            let mut inner = self.inner.lock().expect("leader cluster lock");
+            inner.workers.remove(node_id).and_then(|worker| worker.sender)
+        };
+        if let Some(sender) = sender {
+            let _ = sender.try_send(AgentMessage::Error {
+                message: "worker disconnected by an administrator".to_string(),
+            });
+        }
+        self.store.remove_worker(node_id)
+    }
+
     pub(super) fn disconnect_worker(&self, node_id: &str, connection_id: &str) {
         let mut inner = self.inner.lock().expect("leader cluster lock");
         if let Some(worker) = inner.workers.get_mut(node_id) {

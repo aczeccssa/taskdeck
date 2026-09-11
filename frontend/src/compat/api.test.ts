@@ -18,3 +18,13 @@ test("compat adapter rejects malformed envelopes at the JSON boundary", async ()
  const adapter = new LegacyApiAdapter({fetch: async () => new Response(JSON.stringify({ok: "yes", message: 1, data: "bad"})), redirectToLogin: () => {}});
  await expect(adapter.request("/api/test", stringValue)).rejects.toThrow("response.ok must be a boolean");
 });
+
+test("compat adapter turns a non-JSON API error into a readable envelope", async () => {
+ const adapter = new LegacyApiAdapter({fetch: async () => new Response("Failed to deserialize the JSON body", {status: 422}), redirectToLogin: () => {}});
+ expect(await adapter.request("/api/test", stringValue)).toEqual({ok: false, message: "Failed to deserialize the JSON body"});
+});
+
+test("compat adapter still rejects non-JSON success responses", async () => {
+ const adapter = new LegacyApiAdapter({fetch: async () => new Response("ok", {status: 200}), redirectToLogin: () => {}});
+ await expect(adapter.request("/api/test", stringValue)).rejects.toThrow("response must be valid JSON");
+});

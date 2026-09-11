@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
-import { formatTimestamp } from "../../lib/helpers";
 import { reorder } from "../../lib/helpers";
 import { showToast } from "../../lib/toast";
+import { moveTabFocus } from "../../lib/tabs";
 import type { TaskAction, TaskDependencyView, WorkflowGraph, WorkflowGroup, WorkflowRevision, WorkflowTargetView } from "../../domain/models";
 import { api } from "../shared/api";
-import { emptyGraph, normalizedGraph, targetKey } from "./graph";
+import { emptyGraph, normalizedGraph } from "./graph";
 import type { DraftMember, Summary } from "./types";
 import { WorkflowCard } from "./WorkflowCard";
 import { WorkflowEditor } from "./WorkflowEditor";
@@ -16,7 +16,8 @@ const passthrough = (value: unknown): unknown => value;
 export function WorkflowsView(): React.JSX.Element {
     const [groups, setGroups] = useState<WorkflowGroup[]>([]);
     const [targets, setTargets] = useState<WorkflowTargetView[]>([]);
-    const [ungrouped, setUngrouped] = useState<WorkflowTargetView[]>([]);
+    const [selectedId, setSelectedId] = useState("");
+    const [view, setView] = useState<"flows" | "dependencies">("flows");
     const [editing, setEditing] = useState<string | null>(null);
     const [editorActive, setEditorActive] = useState(false);
     const [name, setName] = useState("");
@@ -42,7 +43,9 @@ export function WorkflowsView(): React.JSX.Element {
         };
         setGroups(data.groups ?? []);
         setTargets(data.targets ?? []);
-        setUngrouped(data.ungrouped ?? []);
+        setSelectedId((current) => (data.groups ?? []).some((group) => group.id === current)
+            ? current
+            : data.groups?.[0]?.id ?? "");
     }, []);
     const loadDependencies = useCallback(async () => {
         const result = await api.request("/api/dependencies", passthrough);
@@ -61,6 +64,19 @@ export function WorkflowsView(): React.JSX.Element {
         }, 5000);
         return () => window.clearInterval(timer);
     }, [load, loadDependencies]);
+    const select = (group: WorkflowGroup) => {
+        setSelectedId(group.id);
+        setEditing(group.id);
+        setName(group.name);
+        setMembers(group.members.map((item) => ({ node_id: item.node_id, session: item.session, task: item.task })));
+        setGraph({ positions: [...(group.graph?.positions ?? [])], edges: [...(group.graph?.edges ?? [])] });
+        setSummary(null);
+        setShowRevisions(false);
+    };
+    useEffect(() => {
+        const group = groups.find((item) => item.id === selectedId);
+        if (group && !editorActive) select(group);
+    }, [selectedId]);
     const open = (group?: WorkflowGroup) => {
         setEditorActive(true);
         setEditing(group?.id ?? null);
@@ -75,12 +91,14 @@ export function WorkflowsView(): React.JSX.Element {
     };
     const close = () => {
         setEditorActive(false);
-        setEditing(null);
-        setName("");
-        setMembers([]);
-        setGraph(emptyGraph());
-        setSummary(null);
-        setShowRevisions(false);
+        const group = groups.find((item) => item.id === selectedId);
+        if (group) select(group);
+        else {
+            setEditing(null);
+            setName("");
+            setMembers([]);
+            setGraph(emptyGraph());
+        }
     };
     const updateMember = (index: number, patch: Partial<DraftMember>) =>
         setMembers((current) => current.map((member, i) => (i === index ? { ...member, ...patch } : member)));
@@ -175,7 +193,11 @@ export function WorkflowsView(): React.JSX.Element {
             data-react-owned="true">
             <div className="workflow-layout">
                 <div className="workflow-main">
-                    <header className="section-heading">
+                    <header className="section-heading page-heading">
+                        <div>
+                            <h1>Workflows</h1>
+                            <p className="muted">Run related tasks as one ordered flow. Configure members only when needed.</p>
+                        </div>
                         <div className="settings-actions">
                             <button className="button" type="button" onClick={() => void load()}>
                                 Refresh
@@ -185,46 +207,23 @@ export function WorkflowsView(): React.JSX.Element {
                             </button>
                         </div>
                     </header>
-                    <div className="workflow-groups">
-                        {groups.length ? (
-                            groups.map((group) => (
-                                <WorkflowCard
-                                    key={group.id}
-                                    group={group}
-                                    onOpen={open}
-                                    onDelete={remove}
-                                    onAction={action}
-                                />
-                            ))
-                        ) : (
-                            <div className="empty-state compact">
-                                <div>
-                                    <h1>No execution workflows</h1>
-                                    <p>Connect tasks across nodes, define their order, and run the flow.</p>
-                                </div>
-                            </div>
-                        )}
+                    <div className="secondary-tabs" role="tablist" aria-label="Workflow views" onKeyDown={moveTabFocus}>
+                        <button role="tab" aria-selected={view === "flows"} onClick={() => setView("flows")}>Flows</button>
+                        <button role="tab" aria-selected={view === "dependencies"} onClick={() => setView("dependencies")}>Dependencies</button>
                     </div>
-                    <section className="workflow-ungrouped">
-                        <header>
-                            <h2>Ungrouped workspaces</h2>
-                            <p>Visible workspaces not assigned to any workflow group.</p>
-                        </header>
-                        <div className="workflow-targets">
-                            {ungrouped.length ? (
-                                ungrouped.map((target) => (
-                                    <button className="workflow-target" key={targetKey(target)} type="button">
-                                        <strong>{target.workspace_display_name}</strong>
-                                        <span>
-                                            {target.node_name} · {target.session} · {target.tasks.length} tasks
-                                        </span>
-                                    </button>
-                                ))
-                            ) : (
-                                <div className="muted">Every visible workspace is assigned to a workflow group.</div>
-                            )}
-                        </div>
-                    </section>
+                    {view === "flows" && <>
+                    <div className="object-tabs" role="tablist" aria-label="Workflows" onKeyDown={moveTabFocus}>
+                        {groups.map((group) => (
+                            <button key={group.id} role="tab" aria-selected={selectedId === group.id}
+                                onClick={() => select(group)}>{group.name}</button>
+                        ))}
+                        <button className="object-tab-create" type="button" onClick={() => open()}>＋ New</button>
+                    </div>
+                    {groups.length ? groups.filter((group) => group.id === selectedId).map((group) => (
+                        <WorkflowCard key={group.id} group={group} onOpen={open} onDelete={remove} onAction={action} />
+                    )) : (
+                        <div className="empty-state compact"><div><h1>No execution workflows</h1><p>Connect tasks across nodes, define their order, and run the flow.</p></div></div>
+                    )}
                     <Orchestrator
                         members={members}
                         graph={graph}
@@ -257,7 +256,8 @@ export function WorkflowsView(): React.JSX.Element {
                         showRevisionsBox={showRevisions}
                         onRestore={restore}
                     />
-                    <Dependencies
+                    </>}
+                    {view === "dependencies" && <Dependencies
                         dependencies={dependencies}
                         targets={dependencyTargets}
                         onRefresh={() => void loadDependencies()}
@@ -279,7 +279,7 @@ export function WorkflowsView(): React.JSX.Element {
                             if (!result.ok) setMessage(result.message || "Unable to delete dependency");
                             await loadDependencies();
                         }}
-                    />
+                    />}
                 </div>
                 <WorkflowEditor
                     editing={editing}

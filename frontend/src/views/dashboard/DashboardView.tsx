@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
+import { useNavigate } from "react-router-dom";
 import type { NodeMetricsView, ScalingPolicy } from "../../domain/models";
 import { formatBytes } from "../../lib/helpers";
 import { useRequest } from "../shared/useRequest";
-import { ScalingDialog } from "./ScalingDialog";
 
 export function DashboardView(): React.JSX.Element {
+    const navigate = useNavigate();
     const [data, busy, error, refresh] = useRequest<NodeMetricsView>("/api/node-metrics", {
         nodes: [],
         task_status_counts: {},
@@ -13,7 +14,6 @@ export function DashboardView(): React.JSX.Element {
         "/api/scaling-policies",
         { policies: [] },
     );
-    const [scalingOpen, setScalingOpen] = useState(false);
     const canvas = useRef<HTMLCanvasElement>(null);
     useEffect(() => {
         const id = window.setInterval(() => {
@@ -49,13 +49,11 @@ export function DashboardView(): React.JSX.Element {
     return (
         <section className="view active dashboard-view react-view" data-react-owned="true">
             <div className="dashboard">
-                <header className="section-heading">
+                <header className="section-heading page-heading">
+                    <div><h1>Dashboard</h1><p className="muted">Health, resource trends, exceptions, and automation status across nodes.</p></div>
                     <div className="settings-actions">
                         <button className="button" onClick={refresh}>
                             Refresh
-                        </button>
-                        <button className="button" onClick={() => setScalingOpen(true)}>
-                            Scaling settings
                         </button>
                     </div>
                 </header>
@@ -157,8 +155,9 @@ export function DashboardView(): React.JSX.Element {
                             <header>
                                 <div>
                                     <h2>Auto-scaling policies</h2>
-                                    <p>Configure policies in Scaling settings.</p>
+                                    <p>Automation is configured in Settings, away from routine health checks.</p>
                                 </div>
+                                <button className="button" onClick={() => navigate("/settings?section=automation")}>Manage automation</button>
                             </header>
                             {policyError ? (
                                 <div className="muted">{policyError}</div>
@@ -178,14 +177,6 @@ export function DashboardView(): React.JSX.Element {
                     </>
                 )}
             </div>
-            <ScalingDialog
-                open={scalingOpen}
-                close={() => setScalingOpen(false)}
-                onSaved={() => {
-                    refreshPolicies();
-                    setScalingOpen(false);
-                }}
-            />
         </section>
     );
 }

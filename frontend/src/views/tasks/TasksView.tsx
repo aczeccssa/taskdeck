@@ -1,16 +1,8 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
-import type { EditableTask, LogLine, NodeSummary, SessionSnapshot, TaskMetricsSnapshot, WorkspaceSummary } from "../../domain/models";
+import type { EditableTask, LogLine, SessionSnapshot, TaskMetricsSnapshot } from "../../domain/models";
 import { showToast } from "../../lib/toast";
 import { LegacyApiAdapter } from "../../compat/api";
-import {
-    decodeConfig,
-    decodeLogs,
-    decodeMetrics,
-    decodeNodes,
-    decodeSnapshot,
-    decodeStrings,
-    decodeWorkspaces,
-} from "../../api/session";
+import { decodeConfig } from "../../api/session";
 import {
     matchOffsets,
     normalizeMatchIndex,
@@ -22,12 +14,12 @@ import {
     validateConfigTasks,
 } from "./helpers";
 import { decodeAccepted, endpointElement, requireData } from "./utils";
-import { sessionOptions, setConnectionState, setMetaText, setSelectOptions } from "./dom";
 import type { SeenExits, SortDrag, WorkspaceMode } from "./types";
 import { useTaskActions } from "./useTaskActions";
 import { useWorkspaceLoaders } from "./useWorkspaceLoaders";
 import { useTaskEffects } from "./useTaskEffects";
 import { TaskStage } from "./TaskStage";
+import { useSelection } from "../../shell/SelectionContext";
 
 const api = new LegacyApiAdapter();
 
@@ -36,13 +28,9 @@ function exitKey(node: string, project: string, task: string): string {
 }
 
 export function TasksView(): React.JSX.Element {
-    const [nodes, setNodes] = useState<NodeSummary[]>([]);
-    const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
-    const [sessions, setSessions] = useState<string[]>([]);
-    const [selectedNode, setSelectedNode] = useState("");
-    const [selectedSession, setSelectedSession] = useState("");
+    const selection = useSelection();
+    const { nodes, selectedNode, selectedSession } = selection;
     const [snapshot, setSnapshot] = useState<SessionSnapshot | null>(null);
-    const [snapshotNode, setSnapshotNode] = useState<string | null>(null);
     const [currentTask, setCurrentTask] = useState<string | null>(null);
     const [seenExits, setSeenExits] = useState<SeenExits>(() => {
         try {
@@ -69,7 +57,6 @@ export function TasksView(): React.JSX.Element {
     const [configOpen, setConfigOpen] = useState(false);
     const [busyAction, setBusyAction] = useState<"start" | "pause" | "resume" | "restart" | "stop" | null>(null);
     const [workspaceLoading, setWorkspaceLoading] = useState(false);
-    const nodesRequest = useRef(0);
     const snapshotRequest = useRef(0);
     const logsRequest = useRef(0);
     const metricsRequest = useRef(0);
@@ -77,8 +64,6 @@ export function TasksView(): React.JSX.Element {
     const lastLogSeq = useRef<number | null>(null);
     const logContext = useRef("");
     const suppressTabClick = useRef(false);
-    const previousNode = useRef("");
-    const previousSession = useRef("");
     const configGuard = useRef<() => boolean>(() => true);
     const stageRef = useRef<HTMLDivElement>(null);
     const tabsRef = useRef<HTMLDivElement>(null);
@@ -105,101 +90,30 @@ export function TasksView(): React.JSX.Element {
         metricsRequest.current += 1;
         logsRequest.current += 1;
         setSnapshot(null);
-        setSnapshotNode(null);
         setCurrentTask(null);
         setMetrics(null);
         resetLogCursor();
         setWorkspaceLoading(loading);
     };
 
-    const { loadNodes, loadWorkspaceData, loadSnapshot, loadLogs, loadMetrics } = useWorkspaceLoaders({
-        nodes, setNodes, workspaces, setWorkspaces, sessions, setSessions,
-        selectedNode, setSelectedNode, selectedSession, setSelectedSession,
-        snapshot, setSnapshot, snapshotNode, setSnapshotNode,
+    const { loadSnapshot, loadLogs, loadMetrics } = useWorkspaceLoaders({
+        selectedNode, selectedSession, snapshot, setSnapshot,
         currentTask, setCurrentTask,
-        logLines, setLogLines, metrics, setMetrics, tail,
-        workspaceLoading, setWorkspaceLoading,
-        nodesRequest, snapshotRequest, logsRequest, metricsRequest,
+        logLines, setLogLines, setMetrics, tail, setWorkspaceLoading,
+        snapshotRequest, logsRequest, metricsRequest,
         logGeneration, lastLogSeq, logContext,
-        previousNode, previousSession, tabDrag,
-        clearWorkspace, resetLogCursor, metaText,
+        tabDrag, resetLogCursor, setMeta: selection.setMeta,
         setFollow, setSearch, setMatchIndex,
     });
 
     useEffect(() => {
-        setMetaText(metaText);
-    }, [metaText]);
+        selection.registerGuard(() => configGuard.current());
+        return () => selection.registerGuard(() => true);
+    }, [selection.registerGuard]);
     useEffect(() => {
-        previousNode.current = selectedNode;
-    }, [selectedNode]);
-    useEffect(() => {
-        previousSession.current = selectedSession;
-    }, [selectedSession]);
-    useEffect(() => {
-        setSelectOptions(
-            document.getElementById("nodes") as HTMLSelectElement | null,
-            nodes.length
-                ? nodes.map((node) => ({
-                      value: node.id,
-                      label: node.is_self
-                          ? `This device · ${node.name}`
-                          : `${node.name}${node.online ? "" : " · offline"}`,
-                  }))
-                : [{ value: "", label: "No nodes" }],
-            selectedNode,
-            "No nodes",
-        );
-        setSelectOptions(
-            document.getElementById("sessions") as HTMLSelectElement | null,
-            sessionOptions(workspaces, sessions, "No sessions"),
-            selectedSession,
-            "No sessions",
-        );
-    }, [nodes, workspaces, sessions, selectedNode, selectedSession]);
-    useEffect(() => {
-        const nodeSelect = document.getElementById("nodes");
-        const sessionSelect = document.getElementById("sessions");
-        if (!(nodeSelect instanceof HTMLSelectElement) || !(sessionSelect instanceof HTMLSelectElement)) return;
-        const onNodeChange = (event: Event): void => {
-            const next = (event.target as HTMLSelectElement).value;
-            if (!configGuard.current()) {
-                event.target && ((event.target as HTMLSelectElement).value = previousNode.current);
-                setSelectedNode(previousNode.current);
-                return;
-            }
-            previousNode.current = next;
-            setSelectedNode(next);
-            clearWorkspace();
-            setSessions([]);
-            setWorkspaces([]);
-            setSelectedSession("");
-        };
-        const onSessionChange = (event: Event): void => {
-            const next = (event.target as HTMLSelectElement).value;
-            if (!configGuard.current()) {
-                (event.target as HTMLSelectElement).value = previousSession.current;
-                setSelectedSession(previousSession.current);
-                return;
-            }
-            previousSession.current = next;
-            setSelectedSession(next);
-            setWorkspaceLoading(true);
-            snapshotRequest.current += 1;
-            metricsRequest.current += 1;
-            logsRequest.current += 1;
-            setSnapshot(null);
-            setCurrentTask(null);
-            setMetrics(null);
-            resetLogCursor();
-            void loadWorkspaceData(selectedNode, next);
-        };
-        nodeSelect.addEventListener("change", onNodeChange);
-        sessionSelect.addEventListener("change", onSessionChange);
-        return () => {
-            nodeSelect.removeEventListener("change", onNodeChange);
-            sessionSelect.removeEventListener("change", onSessionChange);
-        };
-    }, []);
+        clearWorkspace(Boolean(selectedNode && selectedSession));
+        if (selectedNode && selectedSession) void loadSnapshot(selectedNode, selectedSession);
+    }, [selectedNode, selectedSession]);
     useEffect(() => {
         const container = tabsRef.current;
         if (!container) return;
@@ -270,9 +184,6 @@ export function TasksView(): React.JSX.Element {
         };
     }, [labels, snapshot, selectedNode, tabOrderSaving]);
 
-    useEffect(() => {
-        void loadNodes();
-    }, []);
     const pollTick = useRef<() => void>(() => {});
     pollTick.current = () => {
         void loadSnapshot();
@@ -284,12 +195,6 @@ export function TasksView(): React.JSX.Element {
         const id = window.setInterval(() => pollTick.current(), 1000);
         return () => window.clearInterval(id);
     }, [selectedNode, selectedSession, currentTask, selectedNodeState?.online]);
-    useEffect(() => {
-        const nodeTimer = window.setInterval(() => {
-            void loadNodes();
-        }, 5000);
-        return () => window.clearInterval(nodeTimer);
-    }, [selectedNode]);
 
     const markExitSeen = (label: string): void => {
         const generation = Number(snapshot?.tasks[label]?.run_generation || 0);
@@ -382,14 +287,9 @@ export function TasksView(): React.JSX.Element {
     const technologyLabel = technology?.framework || technology?.runtime || "";
     const status = task?.status || "unknown";
     useTaskEffects({
-        metaText, selectedNode, selectedSession, nodes, workspaces, sessions,
-        selectedNodeState, snapshot, currentTask, workspaceMode, splitPosition,
+        snapshot, currentTask, workspaceMode, splitPosition,
         stageRef, setWorkspaceMode, setSplitPosition,
         act, handleLogAction, setConfigOpen, toggleLogFullscreen, updateSplitLayout,
-        loadNodes, loadWorkspaceData, loadSnapshot, loadLogs, loadMetrics,
-        persistWorkspaceOrder, configGuard,
-        labels, tabOrderSaving, tabsRef, tabDrag, suppressTabClick,
-        tabDragActive: tabDrag.current?.active ?? false,
     });
 
     return (

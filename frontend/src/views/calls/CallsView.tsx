@@ -63,15 +63,13 @@ export function CallsView(): React.JSX.Element {
     return (
         <section className="view active" data-react-owned="true" id="calls-view">
             <div className="mcp-calls">
-                <header className="section-heading">
+                <header className="section-heading page-heading">
                     <div className="section-heading-actions">
+                        <div><h1>MCP Calls</h1><p className="muted">Inspect tool activity, targets, outcomes, and timing.</p></div>
                         <span id="calls-summary" className="sr-only">
                             {result.total} retained calls
                         </span>
                     </div>
-                    <button className="button" id="refresh-calls" type="button" onClick={reload}>
-                        Refresh
-                    </button>
                 </header>
                 <div className="calls-toolbar" aria-label="MCP call filters">
                     <label className="search-field">
@@ -128,8 +126,9 @@ export function CallsView(): React.JSX.Element {
                         <option value={50}>50 / page</option>
                         <option value={100}>100 / page</option>
                     </select>
+                    <button className="button" id="refresh-calls" type="button" onClick={reload}>Refresh</button>
                     <button
-                        className="icon-button"
+                        className="button"
                         id="clear-call-filters"
                         type="button"
                         aria-label="Clear filters"
@@ -145,7 +144,7 @@ export function CallsView(): React.JSX.Element {
                                 pageSize: 20,
                             })
                         }>
-                        ×
+                        Clear filters
                     </button>
                 </div>
                 <div className="calls-table-wrap">

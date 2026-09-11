@@ -13,6 +13,7 @@ import { DocsView } from "./views/docs/DocsView";
 import { CallsView } from "./views/calls/CallsView";
 import { AuditView } from "./views/audit/AuditView";
 import { AlertsView } from "./views/alerts/AlertsView";
+import {SelectionProvider} from "./shell/SelectionContext";
 import "./legacy/styles.css";
 
 type AuthState = "loading" | "ready" | "login";
@@ -27,7 +28,7 @@ export function App(): React.JSX.Element {
     }, []);
     if (state === "loading") return <main className="auth-card" aria-busy="true">Loading Taskdeck…</main>;
     if (state === "login") return <Login onAuthenticated={() => setState("ready")}/>;
-    return <BrowserRouter><Routes><Route element={<ReactLayout/>}>{routes.map(({path, view}) => <Route key={path} path={path} element={<RouteView view={view}/>}/>)}</Route></Routes></BrowserRouter>;
+    return <BrowserRouter><SelectionProvider><Routes><Route element={<ReactLayout/>}>{routes.map(({path, view}) => <Route key={path} path={path} element={<RouteView view={view}/>}/>)}</Route></Routes></SelectionProvider></BrowserRouter>;
 }
 
 function Login({onAuthenticated}: {onAuthenticated: () => void}): React.JSX.Element {

@@ -190,6 +190,11 @@ impl StateStore {
 }
 
 impl StateStore {
+    pub fn remove_worker(&self, node_id: &str) -> Result<bool> {
+        let connection = self.connection.lock().expect("state store lock");
+        Ok(connection.execute("DELETE FROM workers WHERE node_id = ?1", params![node_id])? > 0)
+    }
+
     pub fn known_workers(&self) -> Result<Vec<KnownWorker>> {
         let connection = self.connection.lock().expect("state store lock");
         let mut statement = connection.prepare(

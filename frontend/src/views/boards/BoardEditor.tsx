@@ -1,5 +1,4 @@
-import { useRef } from "react";
-import type { BoardCard, BoardCardMode, BoardTemplate, BoardView, WorkflowTargetView } from "../../domain/models";
+import type { BoardCard, BoardCardMode, WorkflowTargetView } from "../../domain/models";
 import type { TemplateMessage } from "./helpers";
 
 export function BoardEditor({
@@ -7,51 +6,22 @@ export function BoardEditor({
     editing,
     draft,
     targets,
-    boards,
     onChange,
     onAdd,
     onSave,
     onCancel,
     boardMessage,
-    templates,
-    templateName,
-    templateId,
-    sourceBoardId,
-    templateMessage,
-    onTemplateName,
-    onSourceBoard,
-    onTemplateSelect,
-    onSaveTemplate,
-    onApplyTemplate,
-    onExportTemplate,
-    onImportTemplate,
-    onDeleteTemplate,
 }: {
     active: boolean;
     editing: boolean;
     draft: { name: string; cards: BoardCard[] };
     targets: WorkflowTargetView[];
-    boards: BoardView[];
     onChange: (draft: { name: string; cards: BoardCard[] }) => void;
     onAdd: (target: WorkflowTargetView) => void;
     onSave: () => void;
     onCancel: () => void;
     boardMessage: TemplateMessage;
-    templates: BoardTemplate[];
-    templateName: string;
-    templateId: string | null;
-    sourceBoardId: string;
-    templateMessage: TemplateMessage;
-    onTemplateName: (value: string) => void;
-    onSourceBoard: (value: string) => void;
-    onTemplateSelect: (value: string | null) => void;
-    onSaveTemplate: () => void;
-    onApplyTemplate: () => void;
-    onExportTemplate: () => void;
-    onImportTemplate: (file: File) => void;
-    onDeleteTemplate: () => void;
 }): React.JSX.Element {
-    const fileInput = useRef<HTMLInputElement>(null);
     return (
         <aside className="workflow-editor" aria-labelledby="board-editor-title">
             <header>
@@ -81,8 +51,8 @@ export function BoardEditor({
             <div className="workflow-member-list" id="board-cards">
                 {active ? (
                     draft.cards.map((card, index) => (
-                        <div className="workflow-member-editor" key={card.id}>
-                            <select
+                        <div className="workflow-member-editor board-card-editor" key={card.id}>
+                            <label className="field"><span>Workspace</span><select
                                 aria-label="Card workspace"
                                 value={`${card.node_id}\u0000${card.session}`}
                                 onChange={(event) => {
@@ -112,9 +82,8 @@ export function BoardEditor({
                                         {target.workspace_display_name}
                                     </option>
                                 ))}
-                            </select>
-                            <input
-                                aria-label="Card task"
+                            </select></label>
+                            <label className="field"><span>Task</span><select
                                 value={card.task}
                                 onChange={(event) =>
                                     onChange({
@@ -123,10 +92,10 @@ export function BoardEditor({
                                             i === index ? { ...item, task: event.target.value } : item,
                                         ),
                                     })
-                                }
-                            />
-                            <select
-                                aria-label="Card view"
+                                }>
+                                {(targets.find((target) => target.node_id === card.node_id && target.session === card.session)?.tasks ?? []).map((task) => <option key={task} value={task}>{task}</option>)}
+                            </select></label>
+                            <label className="field"><span>Default view</span><select
                                 value={card.mode}
                                 onChange={(event) =>
                                     onChange({
@@ -139,7 +108,7 @@ export function BoardEditor({
                                 <option value="status">status</option>
                                 <option value="logs">logs</option>
                                 <option value="metrics">metrics</option>
-                            </select>
+                            </select></label>
                             <label className="check-field">
                                 <input
                                     type="checkbox"
@@ -192,98 +161,6 @@ export function BoardEditor({
                     Save board
                 </button>
             </footer>
-            <div className="board-templates">
-                <header>
-                    <h3>Board templates</h3>
-                    <p>Save a board as a template, clone it later, or share the JSON with other nodes.</p>
-                </header>
-                <div className="field-grid compact-grid">
-                    <label className="field">
-                        <span>Template name</span>
-                        <input
-                            id="template-name"
-                            type="text"
-                            value={templateName}
-                            onChange={(event) => onTemplateName(event.target.value)}
-                            placeholder="Ops template"
-                            autoComplete="off"
-                        />
-                    </label>
-                    <label className="field">
-                        <span>From board</span>
-                        <select
-                            id="template-source"
-                            value={sourceBoardId}
-                            onChange={(event) => onSourceBoard(event.target.value)}>
-                            <option value="">—</option>
-                            {boards.map((board) => (
-                                <option key={board.id} value={board.id}>
-                                    {board.name}
-                                </option>
-                            ))}
-                        </select>
-                    </label>
-                </div>
-                <div className="settings-actions">
-                    <button className="button" id="save-template" type="button" onClick={onSaveTemplate}>
-                        Save as template
-                    </button>
-                    <button className="button" id="apply-template" type="button" onClick={onApplyTemplate}>
-                        Create board
-                    </button>
-                    <button className="button" id="export-template" type="button" onClick={onExportTemplate}>
-                        Export
-                    </button>
-                    <button
-                        className="button"
-                        id="import-template"
-                        type="button"
-                        onClick={() => fileInput.current?.click()}>
-                        Import
-                    </button>
-                    <input
-                        id="import-template-file"
-                        type="file"
-                        accept="application/json,.json"
-                        hidden
-                        ref={fileInput}
-                        onChange={(event) => {
-                            const file = event.target.files?.[0];
-                            if (file) onImportTemplate(file);
-                            event.target.value = "";
-                        }}
-                    />
-                    <button className="button" id="delete-template" type="button" onClick={onDeleteTemplate}>
-                        Delete
-                    </button>
-                </div>
-                <div className="template-list" id="board-template-list">
-                    {templates.length ? (
-                        templates.map((template) => (
-                            <button
-                                className={`template-row${templateId === template.id ? " selected" : ""}`}
-                                type="button"
-                                key={template.id}
-                                data-template-select={template.id}
-                                onClick={() => onTemplateSelect(template.id)}>
-                                <strong>{template.name}</strong>
-                                <span className="muted">
-                                    {template.cards?.length ?? 0} cards
-                                    {template.description ? ` · ${template.description}` : ""}
-                                </span>
-                            </button>
-                        ))
-                    ) : (
-                        <div className="muted">No templates saved.</div>
-                    )}
-                </div>
-                <div
-                    className={`settings-message${templateMessage.kind ? ` ${templateMessage.kind}` : ""}`}
-                    id="template-message"
-                    role="status">
-                    {templateMessage.text}
-                </div>
-            </div>
         </aside>
     );
 }

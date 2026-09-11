@@ -174,6 +174,25 @@ pub(super) async fn workspaces_route_uses_cached_aliases_for_offline_worker() {
 
 #[tokio::test]
 
+pub(super) async fn connected_nodes_manager_refuses_self_disconnect_and_forgets_remote_workers() {
+    let state = workflow_leader_state();
+
+    let response = http_route(state.clone(), "DELETE", "/api/nodes/self", &[], None).await;
+    let parsed = parse_json_response(response).await;
+    assert_eq!(parsed.ok, false);
+    assert!(state.store.known_workers().unwrap().iter().any(|worker| worker.node_id == "worker-7"));
+
+    let response = http_route(state.clone(), "DELETE", "/api/nodes/worker-7", &[], None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let parsed = parse_json_response(response).await;
+    assert_eq!(parsed.ok, true);
+    assert_eq!(parsed.data.unwrap()["disconnected"], true);
+    assert!(!state.store.known_workers().unwrap().iter().any(|worker| worker.node_id == "worker-7"));
+}
+
+#[tokio::test]
+
 pub(super) async fn node_settings_and_service_actions_are_audited_with_token_redaction() {
     let state = DaemonState::new();
 

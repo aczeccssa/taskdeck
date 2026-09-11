@@ -1,16 +1,8 @@
 import { useEffect } from "react";
-import type { NodeSummary, SessionSnapshot, WorkspaceSummary } from "../../domain/models";
-import { setConnectionState, setMetaText, setSelectOptions } from "./dom";
+import type { SessionSnapshot } from "../../domain/models";
 import type { WorkspaceMode } from "./types";
 
 export function useTaskEffects({
-    metaText,
-    selectedNode,
-    selectedSession,
-    nodes,
-    workspaces,
-    sessions,
-    selectedNodeState,
     snapshot,
     currentTask,
     workspaceMode,
@@ -23,27 +15,7 @@ export function useTaskEffects({
     setConfigOpen,
     toggleLogFullscreen,
     updateSplitLayout,
-    loadNodes,
-    loadWorkspaceData,
-    loadSnapshot,
-    loadLogs,
-    loadMetrics,
-    persistWorkspaceOrder,
-    configGuard,
-    labels,
-    tabOrderSaving,
-    tabsRef,
-    tabDrag,
-    suppressTabClick,
-    tabDragActive,
 }: {
-    metaText: string;
-    selectedNode: string;
-    selectedSession: string;
-    nodes: NodeSummary[];
-    workspaces: WorkspaceSummary[];
-    sessions: string[];
-    selectedNodeState: NodeSummary | null;
     snapshot: SessionSnapshot | null;
     currentTask: string | null;
     workspaceMode: WorkspaceMode;
@@ -56,19 +28,6 @@ export function useTaskEffects({
     setConfigOpen: (open: boolean) => void;
     toggleLogFullscreen: () => Promise<void>;
     updateSplitLayout: (position?: number) => void;
-    loadNodes: () => Promise<void>;
-    loadWorkspaceData: (nodeId: string, sessionOverride?: string) => Promise<void>;
-    loadSnapshot: (nodeId?: string, sessionId?: string) => Promise<void>;
-    loadLogs: (nodeId?: string, sessionId?: string, taskId?: string | null, tailValue?: number) => Promise<void>;
-    loadMetrics: (nodeId?: string, sessionId?: string, taskId?: string | null) => Promise<void>;
-    persistWorkspaceOrder: (order: string[], previousOrder: string[]) => Promise<void>;
-    configGuard: { current: () => boolean };
-    labels: string[];
-    tabOrderSaving: boolean;
-    tabsRef: React.RefObject<HTMLDivElement | null>;
-    tabDrag: { current: { active: boolean } | null };
-    suppressTabClick: { current: boolean };
-    tabDragActive: boolean;
 }) {
     useEffect(() => {
         const onFullscreenChange = (): void => {

@@ -38,6 +38,8 @@ export function installMockApi(): void {
         headers: {"content-type": "application/json"}
     });
     let taskOrder = ["web", "worker"];
+    let mockNodeName = "Mock device";
+    let mockWorkspaceAlias = "Mock workspace";
     const pageQuery = new URLSearchParams(window.location.search);
     const taskStatus = pageQuery.get("taskStatus") ?? "running";
     const configFailure = pageQuery.get("configFailure");
@@ -94,11 +96,11 @@ export function installMockApi(): void {
         if (apiFail && path.includes(apiFail)) return errorJson(`Mock failure for ${path}`, undefined, 500);
         if (path === "/healthz") return new Response("", {status: 200});
         if (path === "/me") return json({enabled: false, configured: false, authenticated: true});
-        if (path === "/api/nodes") return json([mockNode(pageQuery.get("nodeState") !== "offline")]);
+        if (path === "/api/nodes") return json([mockNode(pageQuery.get("nodeState") !== "offline", mockNodeName)]);
         if (path === "/api/workspaces") return json([{
             session: "mock-workspace",
-            alias: "Mock workspace",
-            display_name: "Mock workspace",
+            alias: mockWorkspaceAlias,
+            display_name: mockWorkspaceAlias,
             project: "/workspace/mock"
         }]);
         if (path === "/api/sessions") return json(["mock-workspace"]);
@@ -263,7 +265,20 @@ export function installMockApi(): void {
             }
             return json(mockConfig());
         }
-        if (/\/settings$/.test(path)) return json({settings: mockNode(), environment_overrides: []});
+        if (/\/settings$/.test(path)) {
+            if (method === "PUT") {
+                const body = await bodyOf(init);
+                if (path === "/api/nodes/mock/settings" && typeof body.name === "string" && body.name.trim()) mockNodeName = body.name.trim();
+            }
+            return json({settings: mockNode(pageQuery.get("nodeState") !== "offline", mockNodeName), environment_overrides: []});
+        }
+        if (/^\/api\/workspaces\/[^/]+\/alias$/.test(path)) {
+            if (method === "PUT") {
+                const body = await bodyOf(init);
+                mockWorkspaceAlias = typeof body.alias === "string" ? body.alias.trim() : "";
+            }
+            return json({session: "mock-workspace", alias: mockWorkspaceAlias, display_name: mockWorkspaceAlias});
+        }
         if (/\/service$/.test(path)) return json({status: "running", supported: true});
         if (/\/revisions$/.test(path)) return json({revisions: []});
         if (/\/run$|\/actions$|\/restore$|\/apply$|\/import$/.test(path)) return json({accepted: true});
@@ -295,11 +310,11 @@ function findBy(items: Json[], path: string, key = "id"): Json {
     return items.find((item) => typeof item === "object" && item !== null && (item as Record<string, unknown>)[key] === value) ?? {};
 }
 
-function mockNode(online = true): Json {
+function mockNode(online = true, name = "Mock device"): Json {
     return {
         id: "mock",
         node_id: "mock",
-        name: "Mock device",
+        name,
         is_self: true,
         online,
         role: "leader",

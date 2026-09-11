@@ -64,15 +64,13 @@ export function AuditView(): React.JSX.Element {
     return (
         <section className="view active" data-react-owned="true" id="audit-view">
             <div className="audit-log">
-                <header className="section-heading">
+                <header className="section-heading page-heading">
                     <div className="section-heading-actions">
+                        <div><h1>Audit Log</h1><p className="muted">Trace configuration changes and operational actions across Taskdeck.</p></div>
                         <span id="audit-summary" className="sr-only">
                             {result.total} retained audit records
                         </span>
                     </div>
-                    <button className="button" id="refresh-audit" type="button" onClick={reload}>
-                        Refresh
-                    </button>
                 </header>
                 <div className="calls-toolbar audit-toolbar" aria-label="Audit filters">
                     <input
@@ -139,8 +137,9 @@ export function AuditView(): React.JSX.Element {
                         <option value={50}>50 / page</option>
                         <option value={100}>100 / page</option>
                     </select>
+                    <button className="button" id="refresh-audit" type="button" onClick={reload}>Refresh</button>
                     <button
-                        className="icon-button"
+                        className="button"
                         id="clear-audit-filters"
                         type="button"
                         aria-label="Clear audit filters"
@@ -157,7 +156,7 @@ export function AuditView(): React.JSX.Element {
                                 pageSize: 20,
                             })
                         }>
-                        ×
+                        Clear filters
                     </button>
                 </div>
                 <div className="calls-table-wrap audit-table-wrap">

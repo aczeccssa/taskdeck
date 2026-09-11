@@ -84,6 +84,7 @@ pub(crate) fn app(state: DaemonState) -> Router {
             "/api/nodes/{node}/settings",
             get(node_settings).put(update_node_settings),
         )
+        .route("/api/nodes/{node}", delete(delete_node))
         .route(
             "/api/nodes/self/service",
             get(node_service).post(node_service_action),

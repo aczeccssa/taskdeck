@@ -10,20 +10,25 @@ import {applyI18n, storedLanguage, viewTitle} from "../lib/i18n";
 import {showToast} from "../lib/toast";
 import type {Notification} from "../domain/models";
 import type {Language} from "../domain/state";
+import {useSelection} from "./SelectionContext";
 
 const api = new LegacyApiAdapter();
 const POPOVER_LIMIT = 5;
 
-const navigation: ReadonlyArray<{view: View; label: string; icon: typeof Task}> = [
-    {view: "tasks", label: "Tasks", icon: Task},
-    {view: "dashboard", label: "Dashboard", icon: Chart3},
-    {view: "workflows", label: "Workflows", icon: Diagram},
-    {view: "boards", label: "Boards", icon: Kanban},
-    {view: "alerts", label: "Alerts", icon: Notification2},
-    {view: "calls", label: "MCP Calls", icon: Code4},
-    {view: "audit", label: "Audit Log", icon: ClipboardText3},
-    {view: "settings", label: "Settings", icon: Settings4},
-    {view: "docs", label: "MCP Guide", icon: DocumentText},
+const navigation: ReadonlyArray<{label: string; items: ReadonlyArray<{view: View; label: string; icon: typeof Task}>}> = [
+    {label: "Workspace", items: [
+        {view: "tasks", label: "Tasks", icon: Task},
+        {view: "workflows", label: "Workflows", icon: Diagram},
+        {view: "boards", label: "Boards", icon: Kanban},
+    ]},
+    {label: "Observe", items: [
+        {view: "dashboard", label: "Dashboard", icon: Chart3},
+        {view: "alerts", label: "Alerts", icon: Notification2},
+        {view: "calls", label: "MCP Calls", icon: Code4},
+        {view: "audit", label: "Audit Log", icon: ClipboardText3},
+    ]},
+    {label: "Manage", items: [{view: "settings", label: "Settings", icon: Settings4}]},
+    {label: "Help", items: [{view: "docs", label: "MCP Guide", icon: DocumentText}]},
 ];
 
 type ThemeMode = "system" | "light" | "dark";
@@ -61,6 +66,7 @@ export function AppShell(): React.JSX.Element {
     const [unread, setUnread] = useState<number | null>(null);
     const [recent, setRecent] = useState<Notification[]>([]);
     const [popoverOpen, setPopoverOpen] = useState(false);
+    const selection = useSelection();
 
     const toggleSidebar = (): void => {
         const next = !collapsed;
@@ -140,21 +146,36 @@ export function AppShell(): React.JSX.Element {
                     <span className="brand-copy"><strong>Taskdeck</strong><small>Control plane</small></span>
                 </button>
             </div>
-            <div className="nav-label">Workspace</div>
             <nav className="nav" aria-label="Primary navigation">
-                {navigation.map(({view, label, icon: Icon}) => <button className={`nav-button${currentView === view ? " active" : ""}`} key={view} type="button" data-view={view} aria-label={label} title={label} onClick={() => window.dispatchEvent(new CustomEvent("taskdeck:route-request", {detail: view}))}>
-                    <i className="nav-reicon" aria-hidden="true"><Icon className="ui-icon ui-icon--navigation" size={18} strokeWidth={UI_ICON_STROKE_WIDTH} weight="Outline" aria-hidden/></i>
-                    <span data-i18n={`nav.${view}`}>{navLabel(view, label)}</span>
-                </button>)}
+                {navigation.map((group) => <div className="nav-group" key={group.label}>
+                    <div className="nav-label">{group.label}</div>
+                    {group.items.map(({view, label, icon: Icon}) => <button className={`nav-button${currentView === view ? " active" : ""}`} key={view} type="button" data-view={view} aria-label={label} title={label} onClick={() => window.dispatchEvent(new CustomEvent("taskdeck:route-request", {detail: view}))}>
+                        <i className="nav-reicon" aria-hidden="true"><Icon className="ui-icon ui-icon--navigation" size={18} strokeWidth={UI_ICON_STROKE_WIDTH} weight="Outline" aria-hidden/></i>
+                        <span data-i18n={`nav.${view}`}>{navLabel(view, label)}</span>
+                    </button>)}
+                </div>)}
             </nav>
             <div className="nav-spacer"/>
             <div className="connection" id="connection-state"><i/><span>Daemon connected</span></div>
         </aside>
         <main className="main react-owned-route">
             <header className="topbar">
-                <div className="topbar-title"><strong id="page-title">{viewTitle(currentView, language)}</strong><span id="meta">No sessions registered</span></div>
-                <select className="node-select" id="nodes" aria-label="Taskdeck node"><option value="">No nodes</option></select>
-                <select className="session-select" id="sessions" aria-label="Registered session"><option value="">No sessions</option></select>
+                <div className="topbar-title"><strong id="page-title">{viewTitle(currentView, language)}</strong>{currentView === "tasks" && <span id="meta">{selection.meta}</span>}</div>
+                {currentView === "tasks" && <>
+                    <div className="context-control">
+                        <select className="node-select" id="nodes" aria-label="Taskdeck node" value={selection.selectedNode} disabled={selection.loading && !selection.nodes.length} onChange={(event) => selection.selectNode(event.target.value)}>
+                            {selection.nodes.length ? selection.nodes.map((node) => <option key={node.id} value={node.id}>{node.is_self ? `This device · ${node.name}` : `${node.name}${node.online ? "" : " · offline"}`}</option>) : <option value="">No nodes</option>}
+                        </select>
+                    </div>
+                    <div className="context-control">
+                        <select className="session-select" id="sessions" aria-label="Registered session" value={selection.selectedSession} disabled={!selection.sessions.length} onChange={(event) => selection.selectSession(event.target.value)}>
+                            {selection.sessions.length ? selection.sessions.map((session) => {
+                                const workspace = selection.workspaces.find((item) => item.session === session);
+                                return <option key={session} value={session}>{workspace?.alias ? `${workspace.alias} · ${session}` : session}</option>;
+                            }) : <option value="">No sessions</option>}
+                        </select>
+                    </div>
+                </>}
                 <div className="notification-menu-wrap">
                     <button className="icon-button alerts-bell" id="alerts-bell" type="button" aria-expanded={popoverOpen} aria-haspopup="true" aria-controls="notification-popover" aria-label="Notifications" title="Notifications" hidden={unread === null} onClick={togglePopover}>
                         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9a6 6 0 1 1 12 0c0 5 2 6 2 6H4s2-1 2-6M10 20a2 2 0 0 0 4 0"/></svg>

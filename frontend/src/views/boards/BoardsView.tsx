@@ -5,24 +5,26 @@ import type {
     BoardTemplate,
     BoardView,
     BoardsView as BoardsPayload,
-    NodeSummary,
     SessionSnapshot,
     WorkflowTargetView,
 } from "../../domain/models";
 import { showToast } from "../../lib/toast";
+import { moveTabFocus } from "../../lib/tabs";
 import { api, decode } from "../shared/api";
 import { isRecord } from "../../lib/narrow";
 import { BoardPanel } from "./BoardPanel";
 import { BoardEditor } from "./BoardEditor";
+import { BoardTemplates } from "./BoardTemplates";
 import { as, decodeExport, keyOf, quiet, statusClass, type TemplateMessage } from "./helpers";
 
 export function BoardsView(): React.JSX.Element {
     const [boards, setBoards] = useState<BoardView[]>([]);
     const [targets, setTargets] = useState<WorkflowTargetView[]>([]);
-    const [nodes, setNodes] = useState<NodeSummary[]>([]);
     const [templates, setTemplates] = useState<BoardTemplate[]>([]);
     const [selected, setSelected] = useState<string | null>(null);
     const [editorActive, setEditorActive] = useState(false);
+    const [templatesOpen, setTemplatesOpen] = useState(false);
+    const [activeView, setActiveView] = useState("pinned");
     const [draft, setDraft] = useState<{ name: string; cards: BoardCard[] }>({ name: "", cards: [] });
     const [snapshots, setSnapshots] = useState<Record<string, SessionSnapshot>>({});
     const [message, setMessage] = useState("");
@@ -37,16 +39,15 @@ export function BoardsView(): React.JSX.Element {
         setBusy(true);
         setMessage("");
         try {
-            const [result, nodeResult, templateResult] = await Promise.all([
+            const [result, templateResult] = await Promise.all([
                 api.request("/api/boards", decode),
-                api.request("/api/nodes", decode),
                 api.request("/api/board-templates", decode),
             ]);
             if (!result.ok) throw new Error(result.message || "Boards unavailable");
             const value = as<Partial<BoardsPayload>>(result.data, {});
             setBoards(as(value.boards, []));
             setTargets(as(value.targets, []));
-            if (nodeResult.ok) setNodes(as(nodeResult.data, []));
+            setActiveView((current) => current === "pinned" || as<BoardView[]>(value.boards, []).some((board) => board.id === current) ? current : as<BoardView[]>(value.boards, [])[0]?.id ?? "pinned");
             if (templateResult.ok)
                 setTemplates(as((templateResult.data as { templates?: BoardTemplate[] })?.templates, []));
         } catch (error) {
@@ -219,17 +220,8 @@ export function BoardsView(): React.JSX.Element {
             source_board_id: sourceBoardId || null,
         };
         if (!sourceBoardId) {
-            if (!draft.cards.length) {
-                setTemplateMessage({ text: "Pick a source board or add cards in the editor first.", kind: "error" });
-                return;
-            }
-            body.cards = draft.cards.map((card) => ({
-                node_id: card.node_id,
-                session: card.session,
-                task: card.task,
-                mode: card.mode,
-                pinned: card.pinned,
-            }));
+            setTemplateMessage({ text: "Select a source board.", kind: "error" });
+            return;
         }
         const result = await api.request("/api/board-templates", decode, {
             method: "POST",
@@ -319,13 +311,14 @@ export function BoardsView(): React.JSX.Element {
 
     return (
         <section
-            className={`view active boards-view react-view${editorActive ? " editor-open" : ""}`}
+            className={`view active boards-view react-view${editorActive || templatesOpen ? " editor-open" : ""}`}
             data-react-owned="true"
             id="boards-view">
             <div className="workflow-layout">
                 <div className="workflow-main">
-                    <header className="section-heading">
+                    <header className="section-heading page-heading">
                         <div>
+                            <h1>Boards</h1>
                             <p id="boards-summary" className="muted">
                                 {boards.length} boards · {liveCards.length} cards · {pinned.length} pinned
                             </p>
@@ -334,6 +327,7 @@ export function BoardsView(): React.JSX.Element {
                             <button className="button" type="button" onClick={() => void load()}>
                                 Refresh
                             </button>
+                            <button className="button" type="button" onClick={() => setTemplatesOpen(true)}>Templates</button>
                             <button className="button primary" type="button" onClick={() => openEditor()}>
                                 New board
                             </button>
@@ -344,49 +338,12 @@ export function BoardsView(): React.JSX.Element {
                             {message}
                         </div>
                     )}
-                    <section className="workflow-card">
-                        <header>
-                            <div>
-                                <h2>Board scope</h2>
-                                <p>Choose sources for board cards. Live node metrics stay in Dashboard.</p>
-                            </div>
-                        </header>
-                        <div className="board-node-grid">
-                            {nodes.length ? (
-                                nodes.map((node) => (
-                                    <span className={`board-scope-node ${node.online ? "" : "offline"}`} key={node.id}>
-                                        <i aria-hidden="true" />
-                                        <strong>{node.is_self ? `This device · ${node.name}` : node.name}</strong>
-                                        <small>
-                                            {node.role} · {node.sessions?.length ?? 0} workspace
-                                            {node.sessions?.length === 1 ? "" : "s"}
-                                        </small>
-                                    </span>
-                                ))
-                            ) : (
-                                <span className="muted">No nodes known.</span>
-                            )}
-                        </div>
-                        <div className="workflow-targets board-workspace-grid">
-                            {targets.length ? (
-                                targets.map((target) => (
-                                    <button
-                                        className="board-source"
-                                        type="button"
-                                        key={`${target.node_id}-${target.session}`}
-                                        onClick={() => addCard(target)}>
-                                        <strong>{target.workspace_display_name}</strong>
-                                        <span>
-                                            {target.node_name} · {target.tasks?.length ?? 0} tasks
-                                        </span>
-                                    </button>
-                                ))
-                            ) : (
-                                <span className="muted">No workspaces registered.</span>
-                            )}
-                        </div>
-                    </section>
-                    <section className="workflow-card">
+                    <div className="object-tabs" role="tablist" aria-label="Boards" onKeyDown={moveTabFocus}>
+                        <button role="tab" aria-selected={activeView === "pinned"} onClick={() => setActiveView("pinned")}>Pinned <span>{pinned.length}</span></button>
+                        {boards.map((board) => <button key={board.id} role="tab" aria-selected={activeView === board.id} onClick={() => setActiveView(board.id)}>{board.name}</button>)}
+                        <button className="object-tab-create" onClick={() => openEditor()}>＋ New</button>
+                    </div>
+                    {activeView === "pinned" && <section className="workflow-card">
                         <header>
                             <div>
                                 <h2>Pinned tasks</h2>
@@ -416,13 +373,13 @@ export function BoardsView(): React.JSX.Element {
                                 <div className="muted">Pin cards from any board to watch their status here.</div>
                             )}
                         </div>
-                    </section>
+                    </section>}
                     {busy && !boards.length ? (
                         <div className="muted" aria-busy="true">
                             Loading boards…
                         </div>
                     ) : boards.length ? (
-                        boards.map((board) => (
+                        boards.filter((board) => board.id === activeView).map((board) => (
                             <BoardPanel
                                 key={board.id}
                                 board={board}
@@ -452,26 +409,16 @@ export function BoardsView(): React.JSX.Element {
                     editing={selected !== null}
                     draft={draft}
                     targets={targets}
-                    boards={boards}
                     onChange={setDraft}
                     onAdd={addCard}
                     onSave={() => void save()}
                     onCancel={cancelEditor}
                     boardMessage={boardMessage}
-                    templates={templates}
-                    templateName={templateName}
-                    templateId={templateId}
-                    sourceBoardId={sourceBoardId}
-                    templateMessage={templateMessage}
-                    onTemplateName={setTemplateName}
-                    onSourceBoard={setSourceBoardId}
-                    onTemplateSelect={setTemplateId}
-                    onSaveTemplate={() => void saveTemplate()}
-                    onApplyTemplate={() => void applyTemplate()}
-                    onExportTemplate={() => void exportTemplate()}
-                    onImportTemplate={(file) => void importTemplate(file)}
-                    onDeleteTemplate={() => void deleteTemplate()}
                 />
+                <BoardTemplates open={templatesOpen} boards={boards} templates={templates} name={templateName} selected={templateId} source={sourceBoardId} message={templateMessage}
+                    onClose={() => setTemplatesOpen(false)} onName={setTemplateName} onSource={setSourceBoardId} onSelect={setTemplateId}
+                    onSave={() => void saveTemplate()} onApply={() => void applyTemplate()} onExport={() => void exportTemplate()}
+                    onImport={(file) => void importTemplate(file)} onDelete={() => void deleteTemplate()} />
             </div>
         </section>
     );

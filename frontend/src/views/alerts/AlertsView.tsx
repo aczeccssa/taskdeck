@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { Notification, NotificationRule, NotificationsView } from "../../domain/models";
 import { formatTimestamp } from "../../lib/helpers";
+import { moveTabFocus } from "../../lib/tabs";
 import { api } from "../shared/api";
 import { objectDecoder, text, num, bool } from "../shared/decode";
 import { RuleForm } from "./RuleForm";
@@ -37,9 +38,8 @@ export function AlertsView(): React.JSX.Element {
     const [notifications, setNotifications] = useState<Notification[]>([]);
     const [rules, setRules] = useState<NotificationRule[]>([]);
     const [unread, setUnread] = useState(0);
-    const [collapsed, setCollapsed] = useState(
-        () => localStorage.getItem("taskdeck-alert-rules-collapsed") !== "false",
-    );
+    const [tab, setTab] = useState<"inbox" | "rules">("inbox");
+    const [editorOpen, setEditorOpen] = useState(false);
     const [editing, setEditing] = useState<NotificationRule | null>(null);
     const [message, setMessage] = useState("");
     const load = () =>
@@ -76,16 +76,13 @@ export function AlertsView(): React.JSX.Element {
                 objectDecoder((r) => r),
             )
             .then(() => load());
-    const toggle = () => {
-        const next = !collapsed;
-        setCollapsed(next);
-        localStorage.setItem("taskdeck-alert-rules-collapsed", String(next));
-    };
+    const eventName = (value: string) => ({task_started: "Task started", task_exited: "Task exited", task_failed: "Task failed", task_stopped: "Task stopped"})[value] ?? value.replaceAll("_", " ");
     return (
         <section className="view alerts-view active" data-react-owned="true" id="alerts-view">
-            <div className={`alerts-layout${collapsed ? " editor-collapsed" : ""}`}>
+            <div className={`alerts-layout${editorOpen ? "" : " editor-collapsed"}`}>
                 <div className="alerts-main">
-                    <header className="section-heading">
+                    <header className="section-heading page-heading">
+                        <div><h1>Alerts</h1><p className="muted">Review important task events and decide when Taskdeck should notify you.</p></div>
                         <span id="alerts-summary" className="sr-only">
                             {unread} unread notifications
                         </span>
@@ -96,22 +93,16 @@ export function AlertsView(): React.JSX.Element {
                             <button className="button" id="mark-all-read" type="button" onClick={markAll}>
                                 Mark all read
                             </button>
-                            <button
-                                className="button"
-                                id="open-alert-rules"
-                                type="button"
-                                onClick={() => setCollapsed(false)}>
-                                Rules
-                            </button>
                         </div>
                     </header>
-                    <div className="notifications-list" id="notifications-list">
+                    <div className="secondary-tabs" role="tablist" aria-label="Alert views" onKeyDown={moveTabFocus}><button role="tab" aria-selected={tab === "inbox"} onClick={() => setTab("inbox")}>Inbox <span>{unread}</span></button><button role="tab" aria-selected={tab === "rules"} onClick={() => setTab("rules")}>Rules <span>{rules.length}</span></button></div>
+                    {tab === "inbox" && <div className="notifications-list" id="notifications-list">
                         {notifications.length ? (
                             notifications.map((n) => (
                                 <article className={`notification-item ${n.read ? "read" : "unread"}`} key={n.id}>
                                     <header>
                                         <span className={`status-pill ${n.severity === "critical" ? "error" : ""}`}>
-                                            {n.event_type}
+                                            {eventName(n.event_type)}
                                         </span>
                                         <strong>{n.title}</strong>
                                         <span className="muted">{formatTimestamp(n.created_at_ms)}</span>
@@ -152,9 +143,10 @@ export function AlertsView(): React.JSX.Element {
                                 </div>
                             </div>
                         )}
-                    </div>
+                    </div>}
+                    {tab === "rules" && <div className="notification-rules rules-main" id="notification-rules"><div className="list-toolbar"><p className="muted">Rules turn task state changes into an inbox item and, optionally, a webhook delivery.</p><button className="button primary" onClick={() => { setEditing(null); setEditorOpen(true); }}>New rule</button></div>{rules.length ? rules.map((r) => <article className={`rule-card ${r.enabled ? "" : "disabled"}`} key={r.id}><header><div><strong>{r.name}</strong><p>{r.event_types.map(eventName).join(" · ")}</p></div><span className={`status-pill ${r.enabled ? "success" : "muted-pill"}`}>{r.enabled ? "Enabled" : "Paused"}</span><div className="workflow-card-actions"><button className="button compact" onClick={() => { setEditing(r); setEditorOpen(true); }}>Edit</button><button className="button compact danger" onClick={() => void api.request(`/api/notification-rules/${encodeURIComponent(r.id)}`, objectDecoder((x) => x), {method: "DELETE"}).then(() => load())}>Delete</button></div></header><p className="muted">{r.scope_session ? `Workspace ${r.scope_session}${r.scope_task ? ` / ${r.scope_task}` : ""}` : "All workspaces"}{r.webhook_url ? " · Inbox and webhook" : " · Inbox only"}</p></article>) : <div className="empty-state compact"><div><h3>No alert rules</h3><p>Add a rule for failures or important lifecycle changes.</p></div></div>}</div>}
                 </div>
-                <aside className="alerts-editor">
+                {editorOpen && <aside className="alerts-editor">
                     <header>
                         <div>
                             <h2 id="rules-title">Alert rules</h2>
@@ -164,69 +156,29 @@ export function AlertsView(): React.JSX.Element {
                             className="icon-button alerts-editor-toggle"
                             id="toggle-alert-rules"
                             type="button"
-                            aria-expanded={!collapsed}
-                            aria-label={collapsed ? "Expand alert rules" : "Collapse alert rules"}
-                            onClick={toggle}>
+                            aria-expanded={editorOpen}
+                            aria-label="Close alert rule editor"
+                            onClick={() => setEditorOpen(false)}>
                             ×
                         </button>
                     </header>
-                    <div className="notification-rules" id="notification-rules">
-                        {rules.length ? (
-                            rules.map((r) => (
-                                <article className={`rule-card ${r.enabled ? "" : "disabled"}`} key={r.id}>
-                                    <header>
-                                        <strong>{r.name}</strong>
-                                        <span className={`status-pill ${r.enabled ? "" : "muted-pill"}`}>
-                                            {r.enabled ? "enabled" : "disabled"}
-                                        </span>
-                                        <div className="workflow-card-actions">
-                                            <button
-                                                className="button compact"
-                                                type="button"
-                                                onClick={() => setEditing(r)}>
-                                                Edit
-                                            </button>
-                                            <button
-                                                className="button compact danger"
-                                                type="button"
-                                                onClick={() =>
-                                                    void api
-                                                        .request(
-                                                            `/api/notification-rules/${encodeURIComponent(r.id)}`,
-                                                            objectDecoder((x) => x),
-                                                            { method: "DELETE" },
-                                                        )
-                                                        .then(() => load())
-                                                }>
-                                                Delete
-                                            </button>
-                                        </div>
-                                    </header>
-                                    <p className="muted">
-                                        {r.event_types.join(" · ")}
-                                        {r.scope_session ? ` · ${r.scope_session}` : ""}
-                                        {r.webhook_url ? " · webhook" : ""}
-                                    </p>
-                                </article>
-                            ))
-                        ) : (
-                            <div className="muted">No alert rules yet.</div>
-                        )}
-                    </div>
                     <RuleForm
                         rule={editing}
                         message={message}
                         onCancel={() => {
                             setEditing(null);
+                            setEditorOpen(false);
                             setMessage("");
                         }}
                         onSaved={() => {
                             setEditing(null);
+                            setEditorOpen(false);
                             setMessage("Rule saved.");
                             load();
                         }}
+                        onError={setMessage}
                     />
-                </aside>
+                </aside>}
             </div>
         </section>
     );

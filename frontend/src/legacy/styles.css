@@ -4682,6 +4682,121 @@ select option {
     }
 }
 
+/* Final unified-page overrides. Inactive context drawers must not reserve or
+ * paint space; active drawers are viewport rails with one scrolling body. */
+.view:not(.editor-open) .workflow-editor { display: none; }
+.view.editor-open .workflow-editor,
+.alerts-layout:not(.editor-collapsed) .alerts-editor { display: flex; }
+.workflow-editor,
+.alerts-editor { flex-direction: column; overflow: hidden; }
+.workflow-editor > .workflow-member-list,
+.alerts-editor > .settings-form,
+.board-template-editor > .drawer-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+.workflow-editor > .settings-footer,
+.alerts-editor .settings-footer,
+.board-template-editor > .settings-footer { flex: 0 0 auto; margin-top: auto; }
+
+/* Unified cross-page information architecture and interaction surfaces. */
+.nav-group { display: grid; gap: 3px; margin: 0 8px 14px; }
+.nav-label { padding: 0 10px 5px; color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+.sidebar-collapsed .nav-label { height: 1px; overflow: hidden; padding: 0; opacity: 0; }
+.context-control { display: flex; align-items: center; min-width: 0; gap: 4px; }
+.context-control select { min-width: 0; }
+.context-rename { border: 0; background: transparent; color: var(--muted); padding: 5px 7px; font: inherit; font-size: 11px; cursor: pointer; }
+.context-rename:hover { color: var(--text); }
+.context-rename:disabled { opacity: .35; cursor: default; }
+.context-rename-dialog { width: min(440px, calc(100vw - 32px)); padding: 0; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); color: var(--text); box-shadow: 0 24px 70px rgb(0 0 0 / .28); }
+.context-rename-dialog::backdrop { background: rgb(8 10 15 / .5); }
+.context-rename-dialog form { display: grid; gap: 18px; padding: 20px; }
+.context-rename-dialog header, .context-rename-dialog footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.context-rename-dialog header span, .context-identity { color: var(--muted); font-size: 12px; }
+.context-rename-dialog h2 { margin: 3px 0 0; font-size: 18px; }
+.context-rename-dialog footer { justify-content: flex-end; }
+
+.page-heading { align-items: flex-start; min-height: 58px; }
+.page-heading h1 { margin: 0 0 5px; font-size: 22px; line-height: 1.15; }
+.page-heading p { margin: 0; max-width: 720px; }
+.secondary-tabs, .object-tabs { display: flex; align-items: center; gap: 4px; overflow-x: auto; scrollbar-width: thin; }
+.secondary-tabs { width: fit-content; margin-bottom: 16px; padding: 3px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-muted, rgb(127 127 127 / .05)); }
+.secondary-tabs button, .object-tabs button { flex: 0 0 auto; border: 0; background: transparent; color: var(--muted); font: inherit; cursor: pointer; }
+.secondary-tabs button { padding: 7px 12px; border-radius: 6px; }
+.secondary-tabs button[aria-selected="true"] { background: var(--surface); color: var(--text); box-shadow: 0 1px 4px rgb(0 0 0 / .12); }
+.object-tabs { margin-bottom: 18px; padding-bottom: 1px; border-bottom: 1px solid var(--border); }
+.object-tabs button { min-height: 38px; padding: 7px 13px; border-bottom: 2px solid transparent; }
+.object-tabs button[aria-selected="true"] { color: var(--text); border-color: var(--accent); }
+.object-tabs .object-tab-create { color: var(--accent); }
+.workflow-groups { display: block; }
+.workflow-main > .workflow-card { margin-bottom: 16px; }
+
+.workflow-editor, .alerts-editor { position: fixed; z-index: 90; top: var(--topbar-height, 56px); right: 0; bottom: 0; width: min(480px, calc(100vw - 180px)); max-height: none; display: flex; flex-direction: column; overflow: hidden; background: var(--surface); border-left: 1px solid var(--border); box-shadow: -18px 0 50px rgb(0 0 0 / .16); }
+.workflow-editor > header, .alerts-editor > header { flex: 0 0 auto; }
+.workflow-editor > .field, .workflow-editor > .workflow-member-list, .workflow-editor > #add-board-card, .workflow-editor > .settings-message, .workflow-editor > .settings-form, .alerts-editor > .settings-form { margin-left: 20px; margin-right: 20px; }
+.workflow-editor > .workflow-member-list, .alerts-editor > .settings-form, .board-template-editor .drawer-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+.workflow-editor > .settings-footer, .alerts-editor .settings-footer, .board-template-editor > footer { flex: 0 0 auto; position: sticky; bottom: 0; margin: 0; padding: 14px 20px; background: var(--surface); border-top: 1px solid var(--border); }
+.board-card-editor { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 14px; align-items: end; }
+.board-card-editor .check-field { min-height: 36px; }
+.board-card-editor > .icon-button { align-self: end; justify-self: end; }
+.board-template-editor .drawer-body { display: grid; gap: 14px; padding: 18px 20px; }
+
+.settings-view { padding: var(--page-pad); }
+.settings-shell { display: grid; grid-template-columns: 210px minmax(0, 1fr); gap: 22px; align-items: start; }
+.settings-nav { position: sticky; top: 0; display: grid; gap: 3px; padding: 10px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+.settings-nav span { padding: 10px 10px 5px; color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.settings-nav button { border: 0; border-radius: 7px; background: transparent; color: var(--muted); padding: 9px 10px; text-align: left; font: inherit; cursor: pointer; }
+.settings-nav button[aria-current="true"] { background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--text); }
+.settings-content, .settings-content > .settings-panel { min-width: 0; }
+.settings-content > .settings-panel { margin: 0; padding: 22px 24px; }
+.settings-panel details { width: 100%; margin: 14px 0; padding: 12px 14px; border: 1px solid var(--border); border-radius: 9px; }
+.settings-panel summary { cursor: pointer; color: var(--text); font-weight: 650; }
+.settings-panel details[open] summary { margin-bottom: 16px; }
+.workspace-alias-row, .policy-row { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(180px, 1.3fr) auto; gap: 12px; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--border); }
+.workspace-alias-row > div, .policy-row > div:first-child { display: grid; gap: 3px; }
+.workspace-alias-row code, .policy-row span, .policy-row small { color: var(--muted); font-size: 12px; }
+.automation-explainer { display: grid; gap: 4px; margin-bottom: 16px; padding: 14px 16px; border-left: 3px solid var(--accent); border-radius: 7px; background: color-mix(in srgb, var(--accent) 7%, transparent); }
+.automation-explainer span { color: var(--muted); }
+.settings-subpanel { display: grid; gap: 14px; margin-top: 18px; padding: 18px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-muted, rgb(127 127 127 / .04)); }
+.settings-subpanel > header { display: flex; justify-content: space-between; }
+.settings-subpanel h3, .settings-subpanel h4 { margin: 0; }
+.settings-subpanel h4 { padding-top: 5px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .07em; }
+
+.rules-main { display: grid; gap: 10px; }
+.list-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 8px; }
+.rule-card { border-left: 3px solid var(--accent); }
+.rule-card.disabled { border-left-color: var(--muted); opacity: .78; }
+.rule-card header > div:first-child { min-width: 0; }
+.rule-card header p { margin: 4px 0 0; color: var(--muted); }
+.rule-section { display: grid; gap: 10px; margin: 0; padding: 14px; border: 1px solid var(--border); border-radius: 9px; }
+.rule-section legend { padding: 0 6px; font-weight: 700; }
+.rule-section > p { margin: 0; font-size: 12px; }
+.calls-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+.calls-toolbar > * { width: auto; min-width: 0; flex: 1 1 112px; }
+.calls-toolbar > .search-field { flex: 2 1 220px; }
+.calls-toolbar > input { flex-basis: 128px; }
+.calls-toolbar > .button { flex: 0 0 auto; white-space: nowrap; }
+
+@media (max-width: 900px) {
+    .topbar { gap: 6px; }
+    .context-rename { width: 28px; overflow: hidden; color: transparent; position: relative; }
+    .context-rename::after { content: "✎"; color: var(--muted); position: absolute; inset: 5px; text-align: center; }
+    .settings-shell { grid-template-columns: 1fr; }
+    .settings-nav { position: static; grid-template-columns: repeat(5, minmax(max-content, 1fr)); overflow-x: auto; }
+    .settings-nav span { display: none; }
+    .settings-nav button { text-align: center; }
+}
+@media (max-width: 620px) {
+    .workflow-editor, .alerts-editor { top: 0; left: 0; width: 100vw; }
+    .page-heading { flex-wrap: wrap; }
+    .settings-view { padding: 14px; }
+    .settings-content > .settings-panel { padding: 18px 16px; }
+    .workspace-alias-row, .policy-row, .board-card-editor { grid-template-columns: 1fr; }
+    .policy-row .settings-actions { justify-content: flex-start; }
+    .list-toolbar { align-items: flex-start; flex-direction: column; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .workflow-editor, .alerts-editor, .drawer-shell { transition: none !important; }
+}
+
 /* Final interaction pass: the console and controls must belong to the same
  * theme and spacing system as the rest of the application. */
 :root {
@@ -5916,6 +6031,7 @@ dialog.drawer.settings-drawer {
 }
 @media (max-width: 620px) {
     .notification-popover { right: -8px; }
+    .main > .topbar { top: 0; }
 }
 
 /* Settings page matches other views: fill the main column, keep actions compact. */
@@ -6001,4 +6117,52 @@ dialog.drawer.settings-drawer {
         grid-template-columns: minmax(0, 1fr);
         max-width: none;
     }
+}
+
+/* Follow-up: task configuration is a true viewport rail, not a centered dialog. */
+dialog.config-drawer[open] {
+    position: fixed;
+    inset: 0 0 0 auto;
+    width: min(720px, 100vw);
+    height: 100dvh;
+    max-height: none;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    border-left: 1px solid var(--border);
+    border-radius: 0;
+}
+dialog.config-drawer[open] .drawer-shell {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 100%;
+}
+dialog.config-drawer[open] .config-layout {
+    flex: 1 1 auto;
+    min-height: 0;
+    height: auto;
+}
+dialog.config-drawer[open] .config-form {
+    min-height: 0;
+    overflow: hidden;
+}
+dialog.config-drawer[open] .config-form-body {
+    min-height: 0;
+    overflow-y: auto;
+}
+
+.node-manager-list { display: grid; gap: 8px; }
+.node-manager-row { display: flex; align-items: center; gap: 12px; min-width: 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-subtle); }
+.node-manager-row.selected { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 10%, transparent); }
+.node-manager-select { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1; border: 0; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
+.node-manager-select > span:last-child { display: grid; gap: 2px; min-width: 0; }
+.node-manager-select strong, .node-manager-select small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.node-manager-select small { color: var(--muted); font: 11px var(--mono); }
+.node-manager-row .status-dot { flex: 0 0 auto; }
+.field-help { display: block; color: var(--muted); font-size: 11px; }
+
+@media (max-width: 620px) {
+    .node-manager-row { align-items: flex-start; flex-wrap: wrap; }
+    .node-manager-row .button { margin-left: 24px; }
 }

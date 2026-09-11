@@ -13,8 +13,15 @@ const defaults: LegacyApiDependencies = {fetch: (input, init) => globalThis.fetc
 export class LegacyApiAdapter {
  constructor(private readonly dependencies: LegacyApiDependencies = defaults) {}
  async request<T>(url: string, decodeData: Decoder<T>, options?: RequestInit): Promise<LegacyEnvelope<T>> {
-  const response = await this.dependencies.fetch(url, options);
-  if (response.status === 401) { this.dependencies.redirectToLogin(); throw new Error("Authentication required"); }
-  return envelopeOf(decodeData)(await response.json());
+ const response = await this.dependencies.fetch(url, options);
+ if (response.status === 401) { this.dependencies.redirectToLogin(); throw new Error("Authentication required"); }
+  const text = await response.text();
+  let value: unknown;
+  try { value = JSON.parse(text); }
+  catch {
+   if (!response.ok) return {ok: false, message: text.trim() || `Request failed (${response.status})`};
+   throw new BoundaryError("response must be valid JSON");
+  }
+  return envelopeOf(decodeData)(value);
  }
 }

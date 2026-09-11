@@ -60,6 +60,23 @@ pub(crate) async fn list_nodes(State(state): State<DaemonState>) -> Json<Respons
     Json(Response::ok("nodes", state.node_summaries()))
 }
 
+pub(crate) async fn delete_node(
+    State(state): State<DaemonState>,
+    Path(node): Path<String>,
+) -> Json<Response> {
+    if node == "self" || node == state.public_settings().node_id {
+        return Json(Response::error("the local node cannot be disconnected from itself"));
+    }
+    if state.public_settings().role != NodeRole::Leader {
+        return Json(Response::error("only a leader can disconnect a remote node"));
+    }
+    match state.cluster.forget_worker(&node) {
+        Ok(true) => Json(Response::ok("node disconnected", json!({"node": node, "disconnected": true}))),
+        Ok(false) => Json(Response::error(format!("node '{node}' is not registered"))),
+        Err(error) => Json(Response::error(format!("failed to disconnect node: {error:#}"))),
+    }
+}
+
 pub(crate) async fn node_settings(
     State(state): State<DaemonState>,
 

@@ -6,6 +6,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::ws::WebSocketUpgrade;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -185,8 +186,12 @@ pub(crate) async fn list_scaling_policies(State(state): State<DaemonState>) -> J
 pub(crate) async fn create_scaling_policy(
     State(state): State<DaemonState>,
 
-    Json(input): Json<ScalingPolicyInput>,
+    input: std::result::Result<Json<ScalingPolicyInput>, JsonRejection>,
 ) -> Json<Response> {
+    let Json(input) = match input {
+        Ok(input) => input,
+        Err(error) => return Json(Response::error(format!("Invalid scaling policy: {}", error.body_text()))),
+    };
     let started_at_ms = current_millis();
 
     let started = Instant::now();
@@ -219,8 +224,12 @@ pub(crate) async fn update_scaling_policy(
 
     Path(policy): Path<String>,
 
-    Json(input): Json<ScalingPolicyInput>,
+    input: std::result::Result<Json<ScalingPolicyInput>, JsonRejection>,
 ) -> Json<Response> {
+    let Json(input) = match input {
+        Ok(input) => input,
+        Err(error) => return Json(Response::error(format!("Invalid scaling policy: {}", error.body_text()))),
+    };
     let started_at_ms = current_millis();
 
     let started = Instant::now();

@@ -8,11 +8,13 @@ export function RuleForm({
     message,
     onCancel,
     onSaved,
+    onError,
 }: {
     rule: NotificationRule | null;
     message: string;
     onCancel: () => void;
     onSaved: () => void;
+    onError: (message: string) => void;
 }): React.JSX.Element {
     const [name, setName] = useState("");
     const [started, setStarted] = useState(true);
@@ -61,6 +63,7 @@ export function RuleForm({
             )
             .then((r) => {
                 if (r.ok) onSaved();
+                else onError(r.message || "Unable to save rule");
             });
     };
     return (
@@ -75,8 +78,8 @@ export function RuleForm({
                     autoComplete="off"
                 />
             </label>
-            <fieldset className="rule-events">
-                <legend>Events</legend>
+            <fieldset className="rule-events rule-section">
+                <legend>When to alert</legend>
                 {[
                     ["Task started", started, setStarted],
                     ["Task exited", exited, setExited],
@@ -93,7 +96,7 @@ export function RuleForm({
                     </label>
                 ))}
             </fieldset>
-            <div className="field-grid compact-grid">
+            <fieldset className="rule-section"><legend>Scope</legend><p className="muted">Leave both fields empty to watch every task.</p><div className="field-grid compact-grid">
                 <label className="field">
                     <span>Workspace (optional)</span>
                     <input
@@ -113,8 +116,8 @@ export function RuleForm({
                         autoComplete="off"
                     />
                 </label>
-            </div>
-            <label className="field">
+            </div></fieldset>
+            <fieldset className="rule-section"><legend>Delivery</legend><p className="muted">Inbox delivery is always enabled. Add a webhook to POST the same event to another system.</p><label className="field">
                 <span>Webhook URL (optional)</span>
                 <input
                     id="rule-webhook"
@@ -124,7 +127,8 @@ export function RuleForm({
                     placeholder="https://example.com/hook"
                     autoComplete="off"
                 />
-            </label>
+                <small className="field-help">Taskdeck sends a JSON event when this rule matches. Failed deliveries appear in the alert inbox.</small>
+            </label></fieldset>
             <label className="check-field">
                 <input
                     id="rule-enabled"
