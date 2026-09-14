@@ -90,6 +90,7 @@ pub(crate) fn app(state: DaemonState) -> Router {
             get(node_service).post(node_service_action),
         )
         .route("/api/workspaces", get(list_workspaces))
+        .route("/api/workspaces/{session}", delete(remove_workspace))
         .route(
             "/api/workspaces/{session}/alias",
             put(update_workspace_alias),

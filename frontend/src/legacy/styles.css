@@ -6102,6 +6102,62 @@ dialog.drawer.settings-drawer {
     width: 100%;
 }
 
+.settings-layout .token-list {
+    display: grid;
+    gap: 8px;
+    margin: 14px 0;
+}
+
+.settings-layout .token-row {
+    justify-content: space-between;
+}
+
+.settings-layout .token-row > div {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+}
+
+.settings-layout .token-row small {
+    color: var(--muted);
+    margin-left: auto;
+}
+
+.settings-layout .token-row.revoked {
+    opacity: .62;
+}
+
+.settings-layout .token-secret {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin: 14px 0;
+    padding: 14px;
+    border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+    border-radius: var(--radius);
+    background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+}
+
+.settings-layout .token-secret p {
+    margin: 3px 0 8px;
+    color: var(--muted);
+}
+
+.settings-layout .token-secret code {
+    display: block;
+    max-width: min(620px, 52vw);
+    overflow-wrap: anywhere;
+}
+
+.settings-layout .token-create-form {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: end;
+    gap: 12px;
+    max-width: 560px;
+}
+
 @media (max-width: 720px) {
     .settings-layout .settings-panel > header {
         flex-wrap: wrap;
@@ -6115,6 +6171,22 @@ dialog.drawer.settings-drawer {
     .settings-layout .field-grid,
     .settings-layout .field-grid.compact-grid {
         grid-template-columns: minmax(0, 1fr);
+        max-width: none;
+    }
+
+    .settings-layout .token-row,
+    .settings-layout .token-secret,
+    .settings-layout .token-create-form {
+        align-items: stretch;
+        grid-template-columns: minmax(0, 1fr);
+        flex-direction: column;
+    }
+
+    .settings-layout .token-row small {
+        margin-left: 0;
+    }
+
+    .settings-layout .token-secret code {
         max-width: none;
     }
 }

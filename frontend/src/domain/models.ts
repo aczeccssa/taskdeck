@@ -62,7 +62,7 @@ export interface WorkspaceQuotasView { quotas: WorkspaceQuota[]; sessions: strin
 export interface NotificationRule { id: string; name: string; event_types: string[]; scope_session?: string | null; scope_task?: string | null; webhook_url?: string | null; enabled: boolean; created_at_ms: number; updated_at_ms: number }
 export interface Notification { id: number; node_id: string; rule_id?: string | null; rule_name?: string | null; event_type: string; severity: string; session?: string | null; task?: string | null; title: string; message: string; read: boolean; created_at_ms: number }
 export interface NotificationsView { notifications: Notification[]; unread_count: number }
-export interface ApiToken { id: string; name: string; token_prefix: string; created_at_ms: number; last_used_at_ms?: number | null }
+export interface ApiToken { id: string; name: string; token_prefix: string; created_at_ms: number; last_used_at_ms?: number | null; revoked?: boolean }
 export interface ApiTokenCreated extends ApiToken { secret: string }
 export interface ApiTokensView { tokens: ApiToken[] }
 

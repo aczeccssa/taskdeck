@@ -116,6 +116,7 @@ pub(crate) fn macos_plist_path(scope: ServiceScope) -> Result<PathBuf> {
 pub(crate) fn render_macos_plist(label: &str, spec: &ServiceSpec) -> String {
     let home = spec.home.display().to_string();
     let executable = spec.executable.display().to_string();
+    let environment_path = &spec.environment_path;
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -130,6 +131,7 @@ pub(crate) fn render_macos_plist(label: &str, spec: &ServiceSpec) -> String {
   <key>EnvironmentVariables</key>
   <dict>
     <key>TASKDECK_HOME</key><string>{home}</string>
+    <key>PATH</key><string>{environment_path}</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -141,5 +143,6 @@ pub(crate) fn render_macos_plist(label: &str, spec: &ServiceSpec) -> String {
         label = xml_escape(label),
         executable = xml_escape(&executable),
         home = xml_escape(&home),
+        environment_path = xml_escape(environment_path),
     )
 }

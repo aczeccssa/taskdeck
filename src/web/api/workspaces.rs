@@ -125,3 +125,21 @@ pub(crate) async fn update_workspace_alias(
             .await,
     )
 }
+
+pub(crate) async fn remove_workspace(
+    State(state): State<DaemonState>,
+    Path(session): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Response> {
+    let node = match selected_node(&state, &query) {
+        Ok(node) => node,
+        Err(response) => return Json(response),
+    };
+
+    let request = RemoteRequest::RemoveSession { session };
+    Json(
+        state
+            .dispatch_node_with_audit(&node, request.clone(), web_audit_context(&state, &request))
+            .await,
+    )
+}

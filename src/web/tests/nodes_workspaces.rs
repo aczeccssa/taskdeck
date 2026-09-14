@@ -62,6 +62,33 @@ pub(super) async fn workspaces_api_lists_and_updates_aliases_without_changing_se
 }
 
 #[tokio::test]
+pub(super) async fn workspaces_api_removes_an_unavailable_registration() {
+    let state = DaemonState::new();
+    state
+        .store
+        .upsert_registration("stale", &PathBuf::from("/tmp/missing-project"))
+        .unwrap();
+    state
+        .unavailable_sessions
+        .lock()
+        .unwrap()
+        .insert(
+            "stale".to_string(),
+            crate::daemon::UnavailableSession {
+                session: "stale".to_string(),
+                project: PathBuf::from("/tmp/missing-project"),
+                error: "project directory does not exist".to_string(),
+            },
+        );
+
+    let response = http_route(state.clone(), "DELETE", "/api/workspaces/stale", &[], None).await;
+    let parsed = parse_json_response(response).await;
+    assert!(parsed.ok, "{}", parsed.message);
+    assert!(state.store.registrations().unwrap().is_empty());
+    assert!(state.unavailable_sessions.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 
 pub(super) async fn node_settings_api_keeps_token_hidden_and_reports_restart() {
     let state = DaemonState::new();

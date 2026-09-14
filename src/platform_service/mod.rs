@@ -61,6 +61,7 @@ pub struct ServiceStatus {
 struct ServiceSpec {
     pub(crate) executable: PathBuf,
     pub(crate) home: PathBuf,
+    pub(crate) environment_path: String,
 }
 
 #[cfg(test)]
@@ -69,6 +70,7 @@ impl ServiceSpec {
         Self {
             executable: PathBuf::from(executable),
             home: PathBuf::from(home),
+            environment_path: "/usr/local/bin:/usr/bin:/bin".to_string(),
         }
     }
 }
@@ -91,6 +93,7 @@ pub(crate) fn perform(
     requested_home: Option<PathBuf>,
 ) -> Result<ServiceStatus> {
     let executable = std::env::current_exe().context("cannot locate taskdeck executable")?;
+    let environment_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string());
     let home = match requested_home {
         Some(home) => fs::canonicalize(&home)
             .with_context(|| format!("service home '{}' does not exist", home.display()))?,
@@ -108,14 +111,16 @@ pub(crate) fn perform(
             &ServiceSpec {
                 executable: executable.clone(),
                 home,
+                environment_path: environment_path.clone(),
             },
         );
         ServiceSpec {
             executable,
             home: installed_home,
+            environment_path,
         }
     } else {
-        ServiceSpec { executable, home }
+        ServiceSpec { executable, home, environment_path }
     };
     let mut status = match std::env::consts::OS {
         "macos" => macos(scope, action, &spec)?,

@@ -15,6 +15,7 @@ fn renders_macos_plist_with_foreground_daemon_and_home() {
     assert!(plist.contains("<string>/usr/local/bin/taskdeck</string>"));
     assert!(plist.contains("<string>daemon</string>"));
     assert!(plist.contains("TASKDECK_HOME"));
+    assert!(plist.contains("<key>PATH</key><string>/usr/local/bin:/usr/bin:/bin</string>"));
     assert!(plist.contains("/tmp/taskdeck home"));
     assert!(!plist.contains("--background"));
 }
