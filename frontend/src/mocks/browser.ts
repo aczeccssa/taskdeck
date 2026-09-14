@@ -246,7 +246,7 @@ export function installMockApi(): void {
                 running: taskStatus === "running",
                 current: {cpu_percent: 12, memory_bytes: 256000000, process_count: 2},
                 samples: [{timestamp_ms: timestamp - 1000, cpu_percent: 10, memory_bytes: 250000000, process_count: 2}, {timestamp_ms: timestamp, cpu_percent: 12, memory_bytes: 256000000, process_count: 2}],
-                processes: [{pid: 1234, ppid: 1, name: "bun", status: "running", run_time_seconds: 42, cpu_percent: 10, memory_bytes: 128000000, process_count: 1}, {pid: 1235, ppid: 1234, name: "vite", status: "running", run_time_seconds: 40, cpu_percent: 2, memory_bytes: 128000000, process_count: 1}],
+                processes: [{pid: 1234, ppid: 1, name: "bun", status: "running", run_time_seconds: 42, cpu_percent: 10, memory_bytes: 128000000}, {pid: 1235, ppid: 1234, name: "vite", status: "running", run_time_seconds: 40, cpu_percent: 2, memory_bytes: 128000000}],
                 restart_markers_ms: [timestamp - 500]
             });
         }

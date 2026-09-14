@@ -152,7 +152,16 @@ export const decodeMetrics: Decoder<TaskMetricsSnapshot> = (value, path = "metri
         }),
         processes: assertArray(item.processes ?? [], `${path}.processes`).map((entry, index) => {
             const process = record(entry, `${path}.processes[${index}]`);
-            return {...decodeAggregate(process, `${path}.processes[${index}]`), pid: assertNumber(process.pid, `${path}.processes[${index}].pid`), ppid: optionalNumber(process.ppid, `${path}.processes[${index}].ppid`), name: assertString(process.name, `${path}.processes[${index}].name`), status: assertString(process.status, `${path}.processes[${index}].status`), run_time_seconds: assertNumber(process.run_time_seconds, `${path}.processes[${index}].run_time_seconds`)};
+            const processPath = `${path}.processes[${index}]`;
+            return {
+                pid: assertNumber(process.pid, `${processPath}.pid`),
+                ppid: optionalNumber(process.ppid, `${processPath}.ppid`),
+                name: assertString(process.name, `${processPath}.name`),
+                cpu_percent: assertNumber(process.cpu_percent, `${processPath}.cpu_percent`),
+                memory_bytes: assertNumber(process.memory_bytes, `${processPath}.memory_bytes`),
+                status: assertString(process.status, `${processPath}.status`),
+                run_time_seconds: assertNumber(process.run_time_seconds, `${processPath}.run_time_seconds`),
+            };
         }),
         restart_markers_ms: assertArray(item.restart_markers_ms ?? [], `${path}.restart_markers_ms`).map((entry, index) => assertNumber(entry, `${path}.restart_markers_ms[${index}]`)),
     };

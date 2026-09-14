@@ -47,7 +47,7 @@ export interface TaskDependenciesView { dependencies: TaskDependencyView[]; targ
 
 export interface TaskMetricsAggregate { cpu_percent: number; memory_bytes: number; process_count: number }
 export interface TaskMetricsSample extends TaskMetricsAggregate { timestamp_ms: number }
-export interface TaskProcessSnapshot extends TaskMetricsAggregate { pid: number; ppid?: number | null; name: string; status: string; run_time_seconds: number }
+export interface TaskProcessSnapshot { pid: number; ppid?: number | null; name: string; cpu_percent: number; memory_bytes: number; status: string; run_time_seconds: number }
 export interface TaskMetricsSnapshot { sample_interval_ms: number; window_seconds: number; cpu_percent_unit: string; running: boolean; current: TaskMetricsAggregate; samples: TaskMetricsSample[]; processes: TaskProcessSnapshot[]; restart_markers_ms: number[] }
 export interface NodeMetricsSample { timestamp_ms: number; cpu_percent: number; memory_bytes: number; memory_total_bytes: number; running_tasks: number }
 export interface NodeMetricsEntryView { node_id: string; node_name?: string | null; online: boolean; is_self: boolean; current?: NodeMetricsSample | null; samples: NodeMetricsSample[]; session_count: number; task_status_counts: Record<string, number> }
