@@ -52,3 +52,17 @@ fn redacts_nested_sensitive_fields_and_truncates_large_payloads() {
     assert_eq!(sanitized["truncated"], true);
     assert!(sanitized["original_bytes"].as_u64().unwrap() > 64_000);
 }
+
+#[test]
+fn register_request_defaults_allow_empty_for_older_clients() {
+    let parsed =
+        Envelope::parse_line(r#"{"type":"register","project":"/tmp/project","session":null}"#)
+            .unwrap();
+    assert!(matches!(
+        parsed.request,
+        Request::Register {
+            allow_empty: false,
+            ..
+        }
+    ));
+}

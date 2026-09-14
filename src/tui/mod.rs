@@ -188,6 +188,7 @@ pub async fn run(project: &Path, requested_session: Option<String>) -> Result<()
         &Request::Register {
             project: project.to_path_buf(),
             session: requested_session,
+            allow_empty: false,
         },
         AuditSource::Tui,
     )

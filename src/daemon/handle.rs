@@ -50,13 +50,17 @@ use crate::state::{NodeRole, NodeSettings, StateStore};
 pub(super) fn handle(state: &DaemonState, request: Request) -> Result<Response> {
     match request {
         Request::Ping => Ok(Response::empty("pong")),
-        Request::Register { project, session } => {
+        Request::Register {
+            project,
+            session,
+            allow_empty,
+        } => {
             require_local_execution(state)?;
             let _config_mutation = state
                 .config_mutations
                 .lock()
                 .expect("config mutations lock");
-            let definition = config::discover(&project, session.as_deref())?;
+            let definition = config::discover_inner(&project, session.as_deref(), allow_empty)?;
             let name = definition.session.clone();
             let project = definition.project.clone();
             let mut sessions = state.sessions.lock().expect("sessions lock");

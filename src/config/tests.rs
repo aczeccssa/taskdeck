@@ -471,3 +471,40 @@ fn schedule_is_validated_loaded_and_persisted_by_editor() {
     assert!(saved.contains("APP_ENV"));
     assert!(!saved.contains("*/10"));
 }
+
+#[test]
+fn init_project_materializes_vscode_tasks_without_overwriting_source() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join(".vscode")).unwrap();
+    let vscode = r#"{
+        "tasks": [
+            {"label":"api","type":"process","command":"cargo","args":["run"],"options":{"cwd":"."}},
+            {"label":"web","type":"shell","command":"npm","args":["run","dev"]}
+        ]
+    }"#;
+    fs::write(dir.path().join(".vscode/tasks.json"), vscode).unwrap();
+
+    let initialized = init_project(dir.path(), Some("demo")).unwrap();
+    assert_eq!(initialized.session, "demo");
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".vscode/tasks.json")).unwrap(),
+        vscode
+    );
+    let yaml = fs::read_to_string(initialized.config_path).unwrap();
+    assert!(yaml.contains("session: demo"));
+    assert!(yaml.contains("command: cargo"));
+    assert!(yaml.contains("command: npm"));
+    assert!(yaml.contains("task_order:"));
+}
+
+#[test]
+fn init_project_creates_empty_template_and_refuses_overwrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let initialized = init_project(dir.path(), None).unwrap();
+    let yaml = fs::read_to_string(&initialized.config_path).unwrap();
+    assert!(yaml.contains("version: 1"));
+    assert!(yaml.contains("tasks: {}"));
+
+    let error = init_project(dir.path(), None).unwrap_err().to_string();
+    assert!(error.contains("refusing to overwrite"));
+}

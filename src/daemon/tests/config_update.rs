@@ -50,6 +50,7 @@ pub(super) fn update_reloads_a_registered_project_configuration() {
             project: dir.path().to_path_buf(),
 
             session: Some("custom".to_string()),
+            allow_empty: false,
         },
     )
     .unwrap();
@@ -114,6 +115,7 @@ pub(super) fn put_session_config_updates_all_registered_sessions_for_the_project
                 project: dir.path().to_path_buf(),
 
                 session: Some("one".to_string()),
+                allow_empty: false,
             },
         )
         .unwrap()
@@ -127,6 +129,7 @@ pub(super) fn put_session_config_updates_all_registered_sessions_for_the_project
                 project: dir.path().to_path_buf(),
 
                 session: Some("two".to_string()),
+                allow_empty: false,
             },
         )
         .unwrap()
@@ -235,6 +238,7 @@ pub(super) fn put_session_config_reports_new_auto_start_failures() {
                 project: dir.path().to_path_buf(),
 
                 session: Some("demo".to_string()),
+                allow_empty: false,
             },
         )
         .unwrap()
@@ -324,6 +328,7 @@ pub(super) fn put_session_config_reports_stale_revision_conflicts_in_the_respons
                 project: dir.path().to_path_buf(),
 
                 session: Some("one".to_string()),
+                allow_empty: false,
             },
         )
         .unwrap()
@@ -402,6 +407,7 @@ pub(super) fn concurrent_same_revision_puts_allow_exactly_one_winner() {
                 project: dir.path().to_path_buf(),
 
                 session: Some("one".to_string()),
+                allow_empty: false,
             },
         )
         .unwrap()
@@ -524,6 +530,7 @@ pub(super) fn put_session_config_detects_external_edit_before_finalize_without_u
                 project: dir.path().to_path_buf(),
 
                 session: Some("one".to_string()),
+                allow_empty: false,
             },
         )
         .unwrap()
@@ -622,6 +629,7 @@ pub(super) fn register_and_update_wait_for_the_config_mutation_lock() {
                 project: register_project,
 
                 session: Some("one".to_string()),
+                allow_empty: false,
             },
         )
         .unwrap();
@@ -698,6 +706,7 @@ pub(super) fn put_session_config_commits_then_reconciles_remaining_sessions_and_
                     project: dir.path().to_path_buf(),
 
                     session: Some(session.to_string()),
+                    allow_empty: false,
                 },
             )
             .unwrap()

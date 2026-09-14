@@ -36,6 +36,8 @@ pub(crate) struct Cli {
     project: PathBuf,
     #[arg(long, global = true)]
     session: Option<String>,
+    #[arg(long, global = true, help = "Output machine-readable JSON")]
+    json: bool,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -62,6 +64,8 @@ pub(crate) enum Commands {
     },
     /// Open the terminal interface (default command).
     Tui,
+    /// Initialize taskdeck.yaml and register the current project.
+    Init,
     /// Register a project without opening the TUI.
     Register,
     /// Reload configuration for a registered project.
@@ -100,6 +104,8 @@ pub(crate) enum Commands {
     },
     /// Stop all tasks and remove a session.
     Remove,
+    /// Stop all tasks and unregister a session.
+    Unregister,
     /// Print Web UI and MCP endpoints.
     Endpoints,
     /// Stop the global daemon and every managed task.
@@ -241,31 +247,38 @@ fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    let json = cli.json;
+    if matches!(&cli.command, Some(Commands::Unregister)) && cli.session.is_none() {
+        bail!("--session is required for unregister");
+    }
     if let Some(Commands::Daemon { web_port, .. }) = &cli.command {
         return daemon::run(*web_port).await;
     }
     if let Some(Commands::Auth { command }) = cli.command {
-        return run_auth_command(command).await;
+        return run_auth_command(command, json).await;
     }
     if let Some(Commands::Node { command }) = cli.command {
-        return run_node_command(command).await;
+        return run_node_command(command, json).await;
     }
     if let Some(Commands::Service { command }) = cli.command {
-        return run_service_command(command).await;
+        return run_service_command(command, json).await;
     }
 
     ensure_daemon().await?;
     if let Some(Commands::Workspace { command }) = cli.command {
-        return run_workspace_command(command).await;
+        return run_workspace_command(command, json).await;
     }
     match cli.command.unwrap_or(Commands::Tui) {
         Commands::Tui => tui::run(&cli.project, cli.session).await,
+        Commands::Init => run_init_command(&cli.project, cli.session.as_deref(), json).await,
         Commands::Register => print_response(
             daemon::request(&Request::Register {
                 project: cli.project,
                 session: cli.session,
+                allow_empty: false,
             })
             .await?,
+            json,
         ),
         Commands::Update => print_response(
             daemon::request(&Request::Update {
@@ -273,8 +286,9 @@ async fn run(cli: Cli) -> Result<()> {
                 session: cli.session,
             })
             .await?,
+            json,
         ),
-        Commands::List => print_response(daemon::request(&Request::ListSessions).await?),
+        Commands::List => run_list_command(json).await,
         Commands::Status { tail } => {
             let session = resolve_session(cli.session, Some(&cli.project)).await?;
             print_response(
@@ -283,18 +297,39 @@ async fn run(cli: Cli) -> Result<()> {
                     tail: Some(tail),
                 })
                 .await?,
+                json,
             )
         }
-        Commands::Start { task } => control(cli.session, &cli.project, task, Action::Start).await,
-        Commands::Pause { task } => control(cli.session, &cli.project, task, Action::Pause).await,
-        Commands::Resume { task } => control(cli.session, &cli.project, task, Action::Resume).await,
-        Commands::Restart { task } => {
-            control(cli.session, &cli.project, task, Action::Restart).await
+        Commands::Start { task } => {
+            control(cli.session, &cli.project, task, Action::Start, json).await
         }
-        Commands::Stop { task } => control(cli.session, &cli.project, task, Action::Stop).await,
+        Commands::Pause { task } => {
+            control(cli.session, &cli.project, task, Action::Pause, json).await
+        }
+        Commands::Resume { task } => {
+            control(cli.session, &cli.project, task, Action::Resume, json).await
+        }
+        Commands::Restart { task } => {
+            control(cli.session, &cli.project, task, Action::Restart, json).await
+        }
+        Commands::Stop { task } => {
+            control(cli.session, &cli.project, task, Action::Stop, json).await
+        }
         Commands::Remove => {
             let session = resolve_session(cli.session, Some(&cli.project)).await?;
-            print_response(daemon::request(&Request::RemoveSession { session }).await?)
+            print_response(
+                daemon::request(&Request::RemoveSession { session }).await?,
+                json,
+            )
+        }
+        Commands::Unregister => {
+            let session = cli
+                .session
+                .context("--session is required for unregister")?;
+            print_response(
+                daemon::request(&Request::RemoveSession { session }).await?,
+                json,
+            )
         }
         Commands::Endpoints => {
             let settings = daemon::configured_settings()?;
@@ -303,12 +338,38 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 settings.bind_host.as_str()
             };
-            println!("Web UI: http://{}:{}", display_host, settings.web_port);
-            println!("MCP:    http://{}:{}/mcp", display_host, settings.web_port);
-            println!("IPC:    {}", daemon::socket_path()?.display());
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "web_ui": format!("http://{}:{}", display_host, settings.web_port),
+                        "mcp": format!("http://{}:{}/mcp", display_host, settings.web_port),
+                        "ipc": daemon::socket_path()?.display().to_string(),
+                    })
+                );
+            } else {
+                print_table(
+                    "ENDPOINTS",
+                    &["NAME", "URL"],
+                    &[
+                        vec![
+                            "Web UI".to_string(),
+                            format!("http://{}:{}", display_host, settings.web_port),
+                        ],
+                        vec![
+                            "MCP".to_string(),
+                            format!("http://{}:{}/mcp", display_host, settings.web_port),
+                        ],
+                        vec![
+                            "IPC".to_string(),
+                            daemon::socket_path()?.display().to_string(),
+                        ],
+                    ],
+                );
+            }
             Ok(())
         }
-        Commands::Shutdown => print_response(daemon::request(&Request::Shutdown).await?),
+        Commands::Shutdown => print_response(daemon::request(&Request::Shutdown).await?, json),
         Commands::Daemon { .. }
         | Commands::Node { .. }
         | Commands::Auth { .. }
@@ -333,6 +394,18 @@ mod tests {
             cli.project,
             std::env::current_dir().unwrap().canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn parses_new_cli_commands_and_json_flag() {
+        let init = Cli::try_parse_from(["taskdeck", "--json", "init"]).unwrap();
+        assert!(init.json);
+        assert!(matches!(init.command, Some(Commands::Init)));
+
+        let unregister =
+            Cli::try_parse_from(["taskdeck", "unregister", "--session", "api"]).unwrap();
+        assert!(matches!(unregister.command, Some(Commands::Unregister)));
+        assert_eq!(unregister.session.as_deref(), Some("api"));
     }
 
     #[test]

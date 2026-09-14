@@ -1,228 +1,224 @@
 //! CLI subcommand runners.
 
-use crate::daemon::{
-    self, configured_settings, is_running, open_daemon_log, request, root_path, socket_path,
-};
+use crate::config;
+use crate::daemon::{self, request};
 use crate::platform_service::{ServiceAction, service_control, service_status};
-use crate::protocol::{Action, Request, Response};
-use crate::state::{LeaderMode, NodeRole, NodeSettingsUpdate, StateStore};
+use crate::protocol::{Action, Request};
+use crate::state::{NodeSettingsUpdate, StateStore};
 use anyhow::{Context, Result, bail};
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use super::{AuthCommands, Cli, Commands, NodeCommands, ServiceCommands, WorkspaceCommands};
+use super::{AuthCommands, NodeCommands, ServiceCommands, WorkspaceCommands};
 
-pub(crate) async fn run_workspace_command(command: WorkspaceCommands) -> Result<()> {
-    match command {
-        WorkspaceCommands::List => {
-            print_response(daemon::request(&Request::ListWorkspaces).await?)?;
-        }
+mod output;
+pub(crate) use output::{print_message, print_response, print_service, print_table, print_value};
 
-        WorkspaceCommands::SetAlias { session, alias } => {
-            print_response(
-                daemon::request(&Request::SetWorkspaceAlias {
-                    session,
-
-                    alias: Some(alias),
-                })
-                .await?,
-            )?;
-        }
-
-        WorkspaceCommands::ClearAlias { session } => {
-            print_response(
-                daemon::request(&Request::SetWorkspaceAlias {
-                    session,
-
-                    alias: None,
-                })
-                .await?,
-            )?;
-        }
+pub(crate) async fn run_list_command(json: bool) -> Result<()> {
+    if json {
+        return print_response(request(&Request::ListSessions).await?, true);
     }
 
+    let response = request(&Request::ListSessions).await?;
+    if !response.ok {
+        return print_response(response, false);
+    }
+    let names = response
+        .data
+        .as_ref()
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let registrations = StateStore::open(&daemon::root_path()?)?.registrations()?;
+    let rows = names
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(|session| {
+            let status = registrations
+                .iter()
+                .find(|registration| registration.session == session)
+                .map(|registration| {
+                    if config::discover_inner(&registration.project, Some(session), true).is_ok() {
+                        "available"
+                    } else {
+                        "unavailable"
+                    }
+                })
+                .unwrap_or("unknown");
+            vec![session.to_string(), status.to_string()]
+        })
+        .collect::<Vec<_>>();
+    print_table("SESSIONS", &["SESSION", "STATUS/AVAILABILITY"], &rows);
     Ok(())
 }
 
-pub(crate) fn print_service(
-    status: anyhow::Result<crate::platform_service::ServiceStatus>,
-) -> Result<()> {
-    let status = status.map_err(|error| anyhow::anyhow!("{error:#}"))?;
-
-    println!("{}", serde_json::to_string_pretty(&status)?);
-
-    Ok(())
+pub(crate) async fn run_workspace_command(command: WorkspaceCommands, json: bool) -> Result<()> {
+    let response = match command {
+        WorkspaceCommands::List => request(&Request::ListWorkspaces).await?,
+        WorkspaceCommands::SetAlias { session, alias } => {
+            request(&Request::SetWorkspaceAlias {
+                session,
+                alias: Some(alias),
+            })
+            .await?
+        }
+        WorkspaceCommands::ClearAlias { session } => {
+            request(&Request::SetWorkspaceAlias {
+                session,
+                alias: None,
+            })
+            .await?
+        }
+    };
+    print_response(response, json)
 }
 
-pub(crate) async fn run_service_command(command: ServiceCommands) -> Result<()> {
+pub(crate) async fn run_service_command(command: ServiceCommands, json: bool) -> Result<()> {
     match command {
         ServiceCommands::Status { scope } => {
-            print_service(tokio::task::spawn_blocking(move || service_status(scope)).await?)?;
+            print_service(
+                tokio::task::spawn_blocking(move || service_status(scope)).await?,
+                json,
+            )?;
         }
-
         ServiceCommands::Install { scope, home } => {
             print_service(
                 tokio::task::spawn_blocking(move || {
                     service_control(scope, ServiceAction::Install, home)
                 })
                 .await?,
+                json,
             )?;
         }
-
         ServiceCommands::Uninstall { scope } => {
             print_service(
                 tokio::task::spawn_blocking(move || {
                     service_control(scope, ServiceAction::Uninstall, None)
                 })
                 .await?,
+                json,
             )?;
         }
-
         ServiceCommands::Start { scope } => {
             print_service(
                 tokio::task::spawn_blocking(move || {
                     service_control(scope, ServiceAction::Start, None)
                 })
                 .await?,
+                json,
             )?;
         }
-
         ServiceCommands::Stop { scope } => {
             print_service(
                 tokio::task::spawn_blocking(move || {
                     service_control(scope, ServiceAction::Stop, None)
                 })
                 .await?,
+                json,
             )?;
         }
     }
-
     Ok(())
 }
 
-pub(crate) async fn run_auth_command(command: AuthCommands) -> Result<()> {
-    let root = daemon::root_path()?;
-
-    let store = StateStore::open(&root)?;
-
+pub(crate) async fn run_auth_command(command: AuthCommands, json: bool) -> Result<()> {
+    let store = StateStore::open(&daemon::root_path()?)?;
     match command {
         AuthCommands::Status => {
             let settings = store.auth_settings()?;
-
-            println!("{}", serde_json::to_string_pretty(&settings.public())?);
+            print_config_value(&settings.public(), "AUTH", json)?;
         }
-
         AuthCommands::Enable { generate } => {
             let generated = generate.then(|| uuid::Uuid::new_v4().simple().to_string());
-
             if let Some(key) = &generated {
                 store.set_access_key(key)?;
-            } else if !generate && std::env::var_os("TASKDECK_ACCESS_KEY").is_none() {
+            } else if std::env::var_os("TASKDECK_ACCESS_KEY").is_none() {
                 bail!("provide TASKDECK_ACCESS_KEY or pass --generate");
             }
-
             let settings = store.configure_auth(true)?;
-
-            println!("{}", serde_json::to_string_pretty(&settings.public())?);
-
+            print_config_value(&settings.public(), "AUTH", json)?;
             if let Some(key) = generated {
-                println!("access key: {key}");
+                if json {
+                    println!("access key: {key}");
+                } else {
+                    print_table("ACCESS KEY", &["KEY"], &[vec![key]]);
+                }
             }
-
             if daemon::is_running().await {
-                let _ = daemon::request(&Request::Shutdown).await;
+                let _ = request(&Request::Shutdown).await;
             }
         }
-
         AuthCommands::Disable => {
             let settings = store.configure_auth(false)?;
-
-            println!("{}", serde_json::to_string_pretty(&settings.public())?);
+            print_config_value(&settings.public(), "AUTH", json)?;
         }
-
         AuthCommands::SetKey => {
             let mut line = String::new();
-
             std::io::Write::write_all(&mut std::io::stderr(), b"Enter new access key: ")?;
-
             std::io::stdin().read_line(&mut line)?;
-
-            let key = line.trim();
-
-            store.set_access_key(key)?;
-
-            println!("access key updated");
+            store.set_access_key(line.trim())?;
+            if json {
+                println!("access key updated");
+            } else {
+                print_message("access key updated");
+            }
         }
     }
-
     Ok(())
 }
 
-pub(crate) async fn run_node_command(command: NodeCommands) -> Result<()> {
-    let root = daemon::root_path()?;
+fn print_config_value<T: serde::Serialize>(value: &T, title: &str, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(value)?);
+    } else {
+        print_value(&serde_json::to_value(value)?, title);
+    }
+    Ok(())
+}
 
-    let store = StateStore::open(&root)?;
-
+pub(crate) async fn run_node_command(command: NodeCommands, json: bool) -> Result<()> {
+    let store = StateStore::open(&daemon::root_path()?)?;
     match command {
         NodeCommands::Show => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&store.node_settings()?.public())?
-            );
+            let settings = store.node_settings()?.public();
+            print_config_value(&settings, "NODE", json)?;
         }
-
         NodeCommands::Configure {
             role,
-
             leader_mode,
-
             name,
-
             leader_url,
-
             clear_leader,
-
             token,
-
             clear_token,
-
             bind_host,
-
             web_port,
         } => {
             let settings = store.configure(NodeSettingsUpdate {
                 role,
-
                 leader_mode,
-
                 name,
-
                 leader_url: if clear_leader {
                     Some(None)
                 } else {
                     leader_url.map(Some)
                 },
-
                 enrollment_token: if clear_token {
                     Some(None)
                 } else {
                     token.map(Some)
                 },
-
                 bind_host,
-
                 web_port,
             })?;
-
             if daemon::is_running().await {
-                let _ = daemon::request(&Request::Shutdown).await;
+                let _ = request(&Request::Shutdown).await;
             }
-
-            println!("{}", serde_json::to_string_pretty(&settings.public())?);
+            print_config_value(&settings.public(), "NODE", json)?;
         }
     }
-
     Ok(())
 }
 
@@ -234,6 +230,7 @@ pub(crate) async fn control(
     task: Option<String>,
 
     action: Action,
+    json: bool,
 ) -> Result<()> {
     let session = resolve_session(requested_session, Some(project)).await?;
 
@@ -246,7 +243,43 @@ pub(crate) async fn control(
             action,
         })
         .await?,
+        json,
     )
+}
+
+pub(crate) async fn run_init_command(
+    project: &Path,
+    requested_session: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let initialized = config::init_project(project, requested_session)?;
+    let response = match request(&Request::Register {
+        project: initialized.project.clone(),
+        session: Some(initialized.session.clone()),
+        allow_empty: true,
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = fs::remove_file(&initialized.config_path);
+            return Err(error);
+        }
+    };
+    if !response.ok {
+        let _ = fs::remove_file(&initialized.config_path);
+    }
+    if !json {
+        print_table(
+            "INIT",
+            &["SESSION", "CONFIG"],
+            &[vec![
+                initialized.session,
+                initialized.config_path.display().to_string(),
+            ]],
+        );
+    }
+    print_response(response, json)
 }
 
 pub(crate) async fn resolve_session(
@@ -263,6 +296,7 @@ pub(crate) async fn resolve_session(
             project: project.to_path_buf(),
 
             session: None,
+            allow_empty: false,
         })
         .await?;
 
@@ -281,20 +315,6 @@ pub(crate) async fn resolve_session(
     }
 
     bail!("--session is required")
-}
-
-pub(crate) fn print_response(response: Response) -> Result<()> {
-    if !response.ok {
-        bail!(response.message);
-    }
-
-    if let Some(data) = response.data {
-        println!("{}", serde_json::to_string_pretty(&data)?);
-    } else {
-        println!("{}", response.message);
-    }
-
-    Ok(())
 }
 
 pub(crate) async fn ensure_daemon() -> Result<()> {

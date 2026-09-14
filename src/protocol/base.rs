@@ -136,6 +136,8 @@ pub enum Request {
     Register {
         project: PathBuf,
         session: Option<String>,
+        #[serde(default)]
+        allow_empty: bool,
     },
     Update {
         project: PathBuf,

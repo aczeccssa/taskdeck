@@ -92,6 +92,75 @@ pub fn discover(project: &Path, requested_session: Option<&str>) -> Result<Proje
     discover_inner(project, requested_session, false)
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct InitializedProject {
+    pub project: PathBuf,
+    pub session: String,
+    pub config_path: PathBuf,
+}
+
+/// Create a new taskdeck.yaml from the project's VS Code tasks, or an empty
+/// taskdeck project when no VS Code task file exists.
+pub(crate) fn init_project(
+    project: &Path,
+    requested_session: Option<&str>,
+) -> Result<InitializedProject> {
+    let project = project
+        .canonicalize()
+        .with_context(|| format!("project directory does not exist: {}", project.display()))?;
+    let config_path = project.join(PROJECT_CONFIG);
+    if config_path.exists() {
+        bail!(
+            "{} already exists; refusing to overwrite",
+            config_path.display()
+        );
+    }
+
+    let (vscode_tasks, vscode_order, _) = load_vscode_tasks(&project)?;
+    let default_session = project
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("project");
+    let session = requested_session
+        .map(str::to_owned)
+        .unwrap_or_else(|| default_session.to_owned());
+    validate_session_name(&session)?;
+
+    let mut root = Mapping::new();
+    root.insert(yaml_key("version"), Value::from(1u32));
+    root.insert(yaml_key("session"), yaml_string(&session));
+    root.insert(
+        yaml_key("task_order"),
+        Value::Sequence(vscode_order.iter().cloned().map(Value::String).collect()),
+    );
+
+    let mut task_entries = Mapping::new();
+    for label in &vscode_order {
+        if let Some(task) = vscode_tasks.get(label) {
+            task_entries.insert(
+                yaml_key(label),
+                Value::Mapping(build_yaml_task_mapping(task, Mapping::new())),
+            );
+        }
+    }
+    root.insert(yaml_key("tasks"), Value::Mapping(task_entries));
+
+    let serialized = serde_yaml::to_string(&Value::Mapping(root))
+        .context("failed to serialize initialized taskdeck.yaml")?;
+    let temp_path = write_temp_config_file(&config_path, &serialized)?;
+    if let Err(error) = rename_temp_file(&temp_path, &config_path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    sync_parent_directory(&config_path)?;
+
+    Ok(InitializedProject {
+        project,
+        session,
+        config_path,
+    })
+}
+
 pub(crate) fn discover_inner(
     project: &Path,
     requested_session: Option<&str>,

@@ -100,10 +100,44 @@ pub(super) fn pure_master_rejects_local_registration() {
             project: PathBuf::from("/tmp/missing"),
 
             session: None,
+            allow_empty: false,
         },
     );
 
     assert!(!response.ok);
 
     assert!(response.message.contains("pure master"));
+}
+
+#[test]
+pub(super) fn empty_projects_require_explicit_registration_opt_in() {
+    let project = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("taskdeck.yaml"),
+        "version: 1\ntasks: {}\n",
+    )
+    .unwrap();
+    let state = DaemonState::new();
+
+    let rejected = dispatch(
+        &state,
+        Request::Register {
+            project: project.path().to_path_buf(),
+            session: Some("empty".to_string()),
+            allow_empty: false,
+        },
+    );
+    assert!(!rejected.ok);
+    assert!(rejected.message.contains("no tasks found"));
+
+    let registered = dispatch(
+        &state,
+        Request::Register {
+            project: project.path().to_path_buf(),
+            session: Some("empty".to_string()),
+            allow_empty: true,
+        },
+    );
+    assert!(registered.ok);
+    assert!(state.sessions.lock().unwrap().contains_key("empty"));
 }

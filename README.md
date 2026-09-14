@@ -49,6 +49,9 @@ performance history whenever it restarts; the default preserves history and
 marks restarts in the performance charts.
 
 ```bash
+# Create taskdeck.yaml (migrating .vscode/tasks.json when present) and register.
+taskdeck init --project /path/to/project --session api
+# Register an existing configuration without creating files.
 taskdeck register --project /path/to/project --session api
 taskdeck update --project /path/to/project --session api
 taskdeck list
@@ -62,7 +65,16 @@ taskdeck resume --session api --task "Run Backend API"
 taskdeck restart --session api --task "Run Backend API"
 taskdeck stop --session api
 taskdeck remove --session api
+# Equivalent explicit registration cleanup; --session is required.
+taskdeck unregister --session api
 ```
+
+CLI commands print human-readable tables by default. Use the global `--json`
+flag for the original machine-readable response format, for example
+`taskdeck --json list` or `taskdeck status --session api --json`. `init` refuses
+to overwrite an existing `taskdeck.yaml` and leaves `.vscode/tasks.json`
+untouched; `remove` remains available as a compatibility alias for the
+unregister operation.
 
 A workspace alias is only a display name in the Web UI, CLI, and TUI. The
 stable `session` identifier, project path, `taskdeck.yaml`, and MCP arguments
