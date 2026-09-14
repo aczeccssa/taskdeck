@@ -6238,3 +6238,22 @@ dialog.config-drawer[open] .config-form-body {
     .node-manager-row { align-items: flex-start; flex-wrap: wrap; }
     .node-manager-row .button { margin-left: 24px; }
 }
+
+
+/* Keep unread state discoverable even when the Alerts page is not open. */
+.nav-button { position: relative; }
+.nav-alert-indicator {
+    width: 7px;
+    height: 7px;
+    flex: 0 0 auto;
+    margin-left: auto;
+    border-radius: 50%;
+    background: var(--danger);
+    box-shadow: 0 0 0 3px color-mix(in oklab, var(--danger) 14%, transparent);
+}
+.shell.sidebar-collapsed .nav-alert-indicator {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    margin-left: 0;
+}

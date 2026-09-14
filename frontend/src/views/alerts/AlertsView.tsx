@@ -74,8 +74,17 @@ export function AlertsView(): React.JSX.Element {
             .request(
                 "/api/notifications/read",
                 objectDecoder((r) => r),
+                {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ all: true }),
+                },
             )
-            .then(() => load());
+            .then((result) => {
+                if (!result.ok) return;
+                window.dispatchEvent(new CustomEvent("taskdeck:notifications-changed"));
+                return load();
+            });
     const eventName = (value: string) => ({task_started: "Task started", task_exited: "Task exited", task_failed: "Task failed", task_stopped: "Task stopped"})[value] ?? value.replaceAll("_", " ");
     return (
         <section className="view alerts-view active" data-react-owned="true" id="alerts-view">

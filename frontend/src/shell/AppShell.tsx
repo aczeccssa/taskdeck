@@ -1,4 +1,4 @@
-import {useCallback, useEffect, useState} from "react";
+import {useCallback, useEffect, useRef, useState} from "react";
 import {Chart3, ClipboardText3, Code4, Diagram, DocumentText, Kanban, Notification2, Settings4, Task} from "reicon-react";
 import {UI_ICON_STROKE_WIDTH} from "../components/ReiconNavigation";
 import {Outlet, useLocation, useNavigate} from "react-router-dom";
@@ -93,14 +93,7 @@ export function AppShell(): React.JSX.Element {
         showToast(next === "zh" ? "语言：中文" : "Language: English");
     };
 
-    const loadUnread = useCallback(async (): Promise<void> => {
-        const result = await api.request("/api/notifications?limit=1", (value) => {
-            const record = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
-            return typeof record.unread_count === "number" ? record.unread_count : 0;
-        });
-        if (result.ok && result.data !== undefined) setUnread(result.data);
-    }, []);
-
+    const previousUnread = useRef<number | null>(null);
     const loadRecent = useCallback(async (): Promise<void> => {
         const result = await api.request("/api/notifications?limit=200", (value) => {
             const record = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
@@ -109,8 +102,30 @@ export function AppShell(): React.JSX.Element {
         if (!result.ok || result.data === undefined) return;
         const notifications = result.data;
         setRecent([...notifications].sort((a, b) => b.created_at_ms - a.created_at_ms).slice(0, POPOVER_LIMIT));
-        setUnread(result.data.filter((item) => !item.read).length);
+        const count = result.data.filter((item) => !item.read).length;
+        previousUnread.current = count;
+        setUnread(count);
     }, []);
+
+    const loadUnread = useCallback(async (): Promise<void> => {
+        const result = await api.request("/api/notifications?limit=1", (value) => {
+            const record = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
+            return typeof record.unread_count === "number" ? record.unread_count : 0;
+        });
+        if (!result.ok || result.data === undefined) return;
+        const count = result.data;
+        const changed = previousUnread.current !== null && count > previousUnread.current;
+        previousUnread.current = count;
+        setUnread(count);
+        if (changed) {
+            window.dispatchEvent(new CustomEvent("taskdeck:notifications-changed"));
+            void loadRecent();
+            showToast("New task alert received");
+            if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+                new Notification("Taskdeck alert", {body: "A task lifecycle alert needs your attention."});
+            }
+        }
+    }, [loadRecent]);
 
     useEffect(() => { window.__taskdeckReactShell = true; return () => { delete window.__taskdeckReactShell; }; }, []);
     useEffect(() => {
@@ -122,7 +137,11 @@ export function AppShell(): React.JSX.Element {
     const togglePopover = (): void => {
         const next = !popoverOpen;
         setPopoverOpen(next);
-        if (next) void loadRecent();
+        if (next) {
+            void loadRecent();
+            if (typeof Notification !== "undefined" && Notification.permission === "default" && window.isSecureContext)
+                void Notification.requestPermission();
+        }
     };
 
     const markPopoverRead = async (id: number): Promise<void> => {
@@ -149,9 +168,10 @@ export function AppShell(): React.JSX.Element {
             <nav className="nav" aria-label="Primary navigation">
                 {navigation.map((group) => <div className="nav-group" key={group.label}>
                     <div className="nav-label">{group.label}</div>
-                    {group.items.map(({view, label, icon: Icon}) => <button className={`nav-button${currentView === view ? " active" : ""}`} key={view} type="button" data-view={view} aria-label={label} title={label} onClick={() => window.dispatchEvent(new CustomEvent("taskdeck:route-request", {detail: view}))}>
+                    {group.items.map(({view, label, icon: Icon}) => <button className={`nav-button${currentView === view ? " active" : ""}`} key={view} type="button" data-view={view} aria-label={view === "alerts" && unread ? `${label}, ${unread} unread` : label} title={label} onClick={() => window.dispatchEvent(new CustomEvent("taskdeck:route-request", {detail: view}))}>
                         <i className="nav-reicon" aria-hidden="true"><Icon className="ui-icon ui-icon--navigation" size={18} strokeWidth={UI_ICON_STROKE_WIDTH} weight="Outline" aria-hidden/></i>
                         <span data-i18n={`nav.${view}`}>{navLabel(view, label)}</span>
+                        {view === "alerts" && unread ? <i className="nav-alert-indicator" aria-hidden="true"/> : null}
                     </button>)}
                 </div>)}
             </nav>

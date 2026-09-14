@@ -11,7 +11,7 @@ mod gates;
 mod handle;
 mod inventory;
 mod metrics;
-mod notifications;
+pub(crate) mod notifications;
 mod process_tree;
 mod sampler;
 mod scaling;

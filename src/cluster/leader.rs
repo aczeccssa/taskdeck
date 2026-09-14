@@ -15,6 +15,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use uuid::Uuid;
 
+use crate::daemon::notifications::{
+    collect_inventory_transitions, emit_transition_notifications_for_node,
+};
 use crate::daemon::{DaemonState, dispatch_async_with_audit};
 use crate::protocol::NodeMetricsSample;
 use crate::protocol::{
@@ -140,7 +143,10 @@ impl LeaderCluster {
     pub fn forget_worker(&self, node_id: &str) -> Result<bool> {
         let sender = {
             let mut inner = self.inner.lock().expect("leader cluster lock");
-            inner.workers.remove(node_id).and_then(|worker| worker.sender)
+            inner
+                .workers
+                .remove(node_id)
+                .and_then(|worker| worker.sender)
         };
         if let Some(sender) = sender {
             let _ = sender.try_send(AgentMessage::Error {
@@ -171,21 +177,25 @@ impl LeaderCluster {
         if let Some(sample) = node_metrics {
             self.node_metrics.push(node_id, sample);
         }
-        let (name, inventory_json) = {
+        let (name, inventory_json, transitions) = {
             let mut inner = self.inner.lock().expect("leader cluster lock");
             let worker = inner
                 .workers
                 .get_mut(node_id)
                 .with_context(|| format!("worker '{node_id}' is not connected"))?;
+            let transitions = collect_inventory_transitions(&worker.inventory, &sessions);
             worker.last_seen_ms = now;
             worker.inventory = sessions;
             (
                 worker.name.clone(),
                 serde_json::to_string(&worker.inventory)?,
+                transitions,
             )
         };
         self.store
-            .upsert_worker(node_id, &name, now, &inventory_json)
+            .upsert_worker(node_id, &name, now, &inventory_json)?;
+        emit_transition_notifications_for_node(self.store.clone(), node_id, &transitions);
+        Ok(())
     }
 
     pub(super) fn heartbeat(&self, node_id: &str, timestamp_ms: u64) {

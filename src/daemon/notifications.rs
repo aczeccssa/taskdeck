@@ -48,14 +48,26 @@ use crate::service;
 use crate::state::{NodeRole, NodeSettings, StateStore};
 
 pub(super) fn emit_transition_notifications(state: &DaemonState, transitions: &[RunTransition]) {
-    let rules: Vec<NotificationRule> = match state.store.notification_rules() {
+    let node_id = state.public_settings().node_id;
+    emit_transition_notifications_for_node(state.store.clone(), &node_id, transitions);
+}
+
+/// Records matching lifecycle notifications on behalf of a local or remote executor.
+///
+/// The leader uses this for worker inventory transitions so alert rules configured in
+/// the leader Web UI apply to work running on every connected worker.
+pub(crate) fn emit_transition_notifications_for_node(
+    store: Arc<StateStore>,
+    node_id: &str,
+    transitions: &[RunTransition],
+) {
+    let rules: Vec<NotificationRule> = match store.notification_rules() {
         Ok(rules) => rules.into_iter().filter(|rule| rule.enabled).collect(),
         Err(_) => return,
     };
     if rules.is_empty() {
         return;
     }
-    let node_id = state.public_settings().node_id;
     for transition in transitions {
         let (event_type, severity, session, task, title, message, details) = match transition {
             RunTransition::Started(session, snapshot, trigger) => (
@@ -122,8 +134,8 @@ pub(super) fn emit_transition_notifications(state: &DaemonState, transitions: &[
             {
                 continue;
             }
-            match state.store.insert_notification(
-                &node_id,
+            match store.insert_notification(
+                node_id,
                 Some(&rule.id),
                 Some(&rule.name),
                 event_type,
@@ -139,7 +151,8 @@ pub(super) fn emit_transition_notifications(state: &DaemonState, transitions: &[
             }
             if let Some(webhook_url) = &rule.webhook_url {
                 spawn_webhook_delivery(
-                    state,
+                    store.clone(),
+                    node_id.to_string(),
                     webhook_url.clone(),
                     event_type,
                     severity,
@@ -156,7 +169,8 @@ pub(super) fn emit_transition_notifications(state: &DaemonState, transitions: &[
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_webhook_delivery(
-    state: &DaemonState,
+    store: Arc<StateStore>,
+    node_id: String,
     url: String,
     event_type: &str,
     severity: &str,
@@ -170,7 +184,7 @@ pub(super) fn spawn_webhook_delivery(
         "kind": "taskdeck.notification",
         "event_type": event_type,
         "severity": severity,
-        "node_id": state.public_settings().node_id,
+        "node_id": node_id,
         "session": session,
         "task": task,
         "title": title,
@@ -178,7 +192,6 @@ pub(super) fn spawn_webhook_delivery(
         "details": details,
         "timestamp_ms": current_timestamp_ms(),
     });
-    let store = state.store.clone();
     let event_type = event_type.to_string();
     thread::spawn(move || {
         let agent = ureq::AgentBuilder::new()
@@ -193,7 +206,7 @@ pub(super) fn spawn_webhook_delivery(
         }
     });
 }
-pub(super) enum RunTransition {
+pub(crate) enum RunTransition {
     Started(String, Box<crate::protocol::TaskSnapshot>, String),
     Finished {
         session: String,
@@ -224,7 +237,7 @@ pub(super) fn trigger_for(
         })
 }
 
-pub(super) fn finished_run_details(
+pub(crate) fn finished_run_details(
     session: &str,
     task_snapshot: &crate::protocol::TaskSnapshot,
 ) -> RunTransition {
@@ -247,6 +260,71 @@ pub(super) fn finished_run_details(
             None
         },
     }
+}
+
+/// Derives lifecycle transitions from two worker inventory snapshots.
+///
+/// Worker snapshots are the leader's only view of remote task state. Applying the
+/// same generation/status rules as the local sampler keeps leader alert rules and
+/// the central inbox authoritative for remote executors too.
+pub(crate) fn collect_inventory_transitions(
+    previous: &[crate::protocol::SessionSnapshot],
+    current: &[crate::protocol::SessionSnapshot],
+) -> Vec<RunTransition> {
+    let previous_tasks = previous
+        .iter()
+        .flat_map(|session| {
+            session
+                .tasks
+                .values()
+                .map(move |task| ((session.name.clone(), task.label.clone()), task.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut transitions = Vec::new();
+    for session in current {
+        for task_snapshot in session.tasks.values() {
+            let previous = previous_tasks.get(&(session.name.clone(), task_snapshot.label.clone()));
+            let previous_generation = previous.map(|task| task.run_generation);
+            let generation_changed = previous_generation != Some(task_snapshot.run_generation);
+            let previous_active = previous.is_some_and(|task| {
+                matches!(task.status, TaskStatus::Running | TaskStatus::Paused)
+            });
+            let current_finished = matches!(
+                task_snapshot.status,
+                TaskStatus::Exited | TaskStatus::Failed | TaskStatus::Idle
+            );
+            let generation = task_snapshot.run_generation;
+
+            if generation > 0 && generation_changed && previous_active {
+                transitions.push(RunTransition::Finished {
+                    session: session.name.clone(),
+                    task: task_snapshot.label.clone(),
+                    generation: previous_generation.expect("previous generation"),
+                    status: "stopped".to_string(),
+                    exit_code: None,
+                    error_message: None,
+                });
+            }
+            if generation > 0 && generation_changed {
+                let trigger = if task_snapshot.auto_start {
+                    "auto_start"
+                } else {
+                    "manual"
+                };
+                transitions.push(RunTransition::Started(
+                    session.name.clone(),
+                    Box::new(task_snapshot.clone()),
+                    trigger.to_string(),
+                ));
+                if current_finished {
+                    transitions.push(finished_run_details(&session.name, task_snapshot));
+                }
+            } else if generation > 0 && previous_active && current_finished {
+                transitions.push(finished_run_details(&session.name, task_snapshot));
+            }
+        }
+    }
+    transitions
 }
 
 pub(super) fn collect_run_transitions(
