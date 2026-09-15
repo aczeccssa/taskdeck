@@ -159,10 +159,7 @@ impl StateStore {
     pub fn valid_auth_session(&self, token: Option<&str>) -> bool {
         let Some(token) = token else { return false };
         let now = current_timestamp_ms();
-        let connection = match self.connection.try_lock() {
-            Ok(connection) => connection,
-            Err(_) => return false,
-        };
+        let connection = self.connection.lock().expect("state store lock");
         let _ = connection.execute(
             "DELETE FROM auth_sessions WHERE expires_at_ms <= ?1",
             params![now as i64],
