@@ -54,6 +54,53 @@ fn task_run_generation_reuse_after_restart_is_not_deduplicated() {
 }
 
 #[test]
+fn failed_task_run_attempt_is_persisted_as_terminal_history() {
+    let store = StateStore::open_in_memory().unwrap();
+    let node_id = store.node_settings().unwrap().node_id;
+    let snapshot = crate::protocol::TaskSnapshot {
+        label: "cleanup".into(),
+        status: TaskStatus::Idle,
+        pid: None,
+        command: "missing-command".into(),
+        cwd: PathBuf::from("/tmp"),
+        auto_start: false,
+        last_exit: None,
+        exit_code: None,
+        logs: vec![],
+        run_generation: 1,
+        started_at_ms: 0,
+        schedule: Some("* * * * *".into()),
+        service: Default::default(),
+    };
+    let record = store
+        .record_task_run_failure(
+            &node_id,
+            &snapshot,
+            "cron",
+            "demo",
+            "failed to spawn scheduled task",
+        )
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(record.status, "failed");
+    assert!(record.finished_at_ms.is_some());
+    assert_eq!(record.error_message.as_deref(), Some("failed to spawn scheduled task"));
+    let runs = store
+        .list_task_runs(&TaskRunFilter {
+            session: Some("demo".into()),
+            task: Some("cleanup".into()),
+            status: Some("failed".into()),
+            trigger: Some("cron".into()),
+            page: 1,
+            page_size: 20,
+        })
+        .unwrap();
+    assert_eq!(runs.total, 1);
+    assert!(runs.items[0].duration_ms.is_some());
+}
+
+#[test]
 fn task_runs_and_mcp_calls_survive_reopening() {
     let dir = tempfile::tempdir().unwrap();
     let node_id = StateStore::open(dir.path())

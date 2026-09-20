@@ -48,6 +48,33 @@ use crate::runtime::{SessionRuntime, Sessions};
 use crate::service;
 use crate::state::{NodeRole, NodeSettings, StateStore};
 
+fn record_scheduled_failure(state: &DaemonState, key: &ScheduleKey, error: impl Into<String>) {
+    let error = error.into();
+    let snapshot = state
+        .sessions
+        .lock()
+        .ok()
+        .and_then(|mut sessions| sessions.get_mut(&key.session)?.snapshot(0).ok())
+        .and_then(|session| session.tasks.into_values().find(|task| task.label == key.task));
+    if let Some(snapshot) = snapshot {
+        let node_id = state.public_settings().node_id;
+        if let Err(persist_error) = state.store.record_task_run_failure(
+            &node_id,
+            &snapshot,
+            "cron",
+            &key.session,
+            error,
+        ) {
+            eprintln!("failed to persist scheduled failure: {persist_error:#}");
+        }
+    }
+    state
+        .run_triggers
+        .lock()
+        .expect("run trigger lock")
+        .remove(key);
+}
+
 pub(super) fn spawn_task_scheduler(state: DaemonState) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut last_processed_second = current_timestamp_ms() / 1000;
@@ -120,8 +147,13 @@ pub(super) fn spawn_task_scheduler(state: DaemonState) -> thread::JoinHandle<()>
                         serde_json::json!({
                             "session": key.session,
                             "task": key.task,
-                            "reason": reason,
+                            "reason": reason.clone(),
                         }),
+                    );
+                    record_scheduled_failure(
+                        &state,
+                        &key,
+                        format!("scheduled start blocked: {reason}"),
                     );
                     continue;
                 }
@@ -177,6 +209,11 @@ pub(super) fn spawn_task_scheduler(state: DaemonState) -> thread::JoinHandle<()>
                     }
                     Some(Ok(false)) => {
                         drop(sessions);
+                        state
+                            .run_triggers
+                            .lock()
+                            .expect("run trigger lock")
+                            .remove(&key);
                         let _ = state.store.record_event(
                             "scheduler",
                             "scheduled task already running; execution skipped",
@@ -202,6 +239,7 @@ pub(super) fn spawn_task_scheduler(state: DaemonState) -> thread::JoinHandle<()>
                     Some(Err(error)) => {
                         let error_message = error.to_string();
                         drop(sessions);
+                        record_scheduled_failure(&state, &key, error_message.clone());
                         let _ = state.store.record_event(
                             "scheduler",
                             "scheduled task failed to start",
@@ -224,7 +262,10 @@ pub(super) fn spawn_task_scheduler(state: DaemonState) -> thread::JoinHandle<()>
                             None,
                         );
                     }
-                    None => {}
+                    None => {
+                        drop(sessions);
+                        record_scheduled_failure(&state, &key, "scheduled session disappeared");
+                    }
                 }
             }
         }

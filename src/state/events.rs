@@ -88,18 +88,23 @@ impl StateStore {
         let command = snapshot.command.clone();
         let cwd = snapshot.cwd.to_string_lossy().into_owned();
         let connection = self.connection.lock().expect("state store lock");
-        let _timestamp = finished_at_ms.unwrap_or_else(current_timestamp_ms);
-        connection.execute("INSERT INTO task_runs(node_id,session,task,trigger,status,started_at_ms,finished_at_ms,duration_ms,command,cwd,pid,run_generation,exit_code,error_message) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)", params![node_id,session,snapshot.label,trigger,if finished_at_ms.is_some() {"failed"} else {"running"},snapshot.started_at_ms as i64,finished_at_ms.map(|v| v as i64),None::<i64>,command,cwd,snapshot.pid.map(|v| v as i64),snapshot.run_generation as i64,None::<i64>,error_message])?;
+        let status = if finished_at_ms.is_some() {
+            "failed"
+        } else {
+            "running"
+        };
+        let duration_ms = finished_at_ms.map(|value| value.saturating_sub(snapshot.started_at_ms));
+        connection.execute("INSERT INTO task_runs(node_id,session,task,trigger,status,started_at_ms,finished_at_ms,duration_ms,command,cwd,pid,run_generation,exit_code,error_message) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)", params![node_id,session,snapshot.label,trigger,status,snapshot.started_at_ms as i64,finished_at_ms.map(|v| v as i64),duration_ms.map(|v| v as i64),command,cwd,snapshot.pid.map(|v| v as i64),snapshot.run_generation as i64,None::<i64>,error_message])?;
         Ok(Some(TaskRunRecord {
             id: connection.last_insert_rowid() as u64,
             node_id: node_id.to_string(),
             session: session.to_string(),
             task: snapshot.label.clone(),
             trigger: trigger.to_string(),
-            status: "running".into(),
+            status: status.to_string(),
             started_at_ms: snapshot.started_at_ms,
             finished_at_ms,
-            duration_ms: None,
+            duration_ms,
             command,
             cwd: snapshot.cwd.clone(),
             pid: snapshot.pid,
@@ -107,6 +112,27 @@ impl StateStore {
             exit_code: None,
             error_message,
         }))
+    }
+
+    pub fn record_task_run_failure(
+        &self,
+        node_id: &str,
+        snapshot: &crate::protocol::TaskSnapshot,
+        trigger: &str,
+        session: &str,
+        error_message: impl Into<String>,
+    ) -> Result<Option<TaskRunRecord>> {
+        let finished_at_ms = current_timestamp_ms();
+        let mut attempt = snapshot.clone();
+        attempt.started_at_ms = finished_at_ms;
+        self.start_task_run(
+            node_id,
+            &attempt,
+            trigger,
+            session,
+            Some(error_message.into()),
+            Some(finished_at_ms),
+        )
     }
 
     /// Avoid the scheduler/history sampler double-write without treating a
