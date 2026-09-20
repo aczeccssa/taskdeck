@@ -206,6 +206,8 @@ pub(crate) enum ServiceCommands {
 pub(crate) enum NodeCommands {
     /// Print the persisted node role and connection settings.
     Show,
+    /// Run a full SQLite integrity check on the state database.
+    IntegrityCheck,
     /// Configure this installation as a worker or leader.
     Configure {
         #[arg(long)]

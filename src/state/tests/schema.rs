@@ -1,6 +1,11 @@
 //! schema domain state tests.
 
+use std::fs::OpenOptions;
 use std::path::Path;
+use std::sync::mpsc;
+use std::time::Duration;
+
+use fs2::FileExt;
 
 use super::super::schema::SCHEMA_VERSION;
 use super::super::util::*;
@@ -78,6 +83,34 @@ fn schema_one_preserves_a_custom_bind_host() {
 
     let migrated = StateStore::open(dir.path()).unwrap();
     assert_eq!(migrated.node_settings().unwrap().bind_host, "192.168.1.20");
+}
+
+#[test]
+fn opening_current_database_does_not_wait_for_migration_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    StateStore::open(dir.path()).unwrap();
+    let lock_path = dir.path().join("state-migration.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+
+    let (sender, receiver) = mpsc::channel();
+    let root = dir.path().to_path_buf();
+    std::thread::spawn(move || sender.send(StateStore::open(&root).is_ok()).unwrap());
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_millis(250)).unwrap(),
+        true
+    );
+}
+
+#[test]
+fn integrity_check_is_available_as_an_explicit_operation() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = StateStore::open(dir.path()).unwrap();
+    store.integrity_check().unwrap();
 }
 
 #[test]

@@ -16,9 +16,19 @@ pub(crate) const SCHEMA_VERSION: &str = "8";
 impl StateStore {
     pub fn open(root: &Path) -> Result<Self> {
         fs::create_dir_all(root).with_context(|| format!("failed to create {}", root.display()))?;
-        let _migration_lock = acquire_migration_lock(root)?;
         let database = root.join(DATABASE_FILE);
-        let legacy_version = probe_existing_database(&database)?;
+        let initial_version = probe_existing_database(&database, false)?;
+        let needs_migration_lock = !database.exists()
+            || initial_version.is_none()
+            || initial_version.is_some_and(|version| version < current_schema_version());
+        let _migration_lock = needs_migration_lock
+            .then(|| acquire_migration_lock(root))
+            .transpose()?;
+        let legacy_version = if needs_migration_lock {
+            probe_existing_database(&database, true)?
+        } else {
+            initial_version
+        };
         let connection = Connection::open(&database)
             .with_context(|| format!("failed to open {}/{}", root.display(), DATABASE_FILE))?;
         if let Some(version) = legacy_version.filter(|version| *version < current_schema_version())
@@ -274,6 +284,17 @@ impl StateStore {
         store.initialize()?;
         Ok(store)
     }
+
+    pub fn integrity_check(&self) -> Result<()> {
+        let connection = self.connection.lock().expect("state store lock");
+        let integrity: String =
+            connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if integrity == "ok" {
+            Ok(())
+        } else {
+            bail!("state database failed integrity check: {integrity}");
+        }
+    }
 }
 
 fn current_schema_version() -> u32 {
@@ -293,18 +314,21 @@ fn acquire_migration_lock(root: &Path) -> Result<File> {
     Ok(lock)
 }
 
-fn probe_existing_database(path: &Path) -> Result<Option<u32>> {
+fn probe_existing_database(path: &Path, verify_integrity: bool) -> Result<Option<u32>> {
     if !path.exists() {
         return Ok(None);
     }
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("failed to open {} read-only", path.display()))?;
-    let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-    if integrity != "ok" {
-        bail!(
-            "state database {} failed integrity check: {integrity}",
-            path.display()
-        );
+    if verify_integrity {
+        let integrity: String =
+            connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if integrity != "ok" {
+            bail!(
+                "state database {} failed integrity check: {integrity}",
+                path.display()
+            );
+        }
     }
     let object_count: i64 = connection.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table', 'index', 'view', 'trigger')",

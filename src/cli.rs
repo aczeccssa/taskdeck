@@ -211,6 +211,17 @@ pub(crate) async fn run_node_command(command: NodeCommands, json: bool) -> Resul
             let settings = store.node_settings()?.public();
             print_config_value(&settings, "NODE", json)?;
         }
+        NodeCommands::IntegrityCheck => {
+            store.integrity_check()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"ok": true, "message": "state database integrity check passed"})
+                );
+            } else {
+                print_message("state database integrity check passed");
+            }
+        }
         NodeCommands::Configure {
             role,
             leader_mode,
