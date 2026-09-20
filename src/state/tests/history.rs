@@ -6,6 +6,54 @@ use super::super::*;
 use crate::protocol::*;
 
 #[test]
+fn task_run_generation_reuse_after_restart_is_not_deduplicated() {
+    let store = StateStore::open_in_memory().unwrap();
+    let node_id = store.node_settings().unwrap().node_id;
+    let snapshot = crate::protocol::TaskSnapshot {
+        label: "cleanup".into(),
+        status: TaskStatus::Running,
+        pid: Some(9),
+        command: "echo done".into(),
+        cwd: PathBuf::from("/tmp"),
+        auto_start: false,
+        last_exit: None,
+        exit_code: None,
+        logs: vec![],
+        run_generation: 1,
+        started_at_ms: 100,
+        schedule: Some("* * * * *".into()),
+        service: Default::default(),
+    };
+    store
+        .record_task_run_start(&node_id, &snapshot, "cron", "demo")
+        .unwrap();
+
+    // Runtime generations restart at one when the daemon is restarted. The
+    // persisted start timestamp is the stable identity for the new attempt.
+    let restarted_snapshot = crate::protocol::TaskSnapshot {
+        started_at_ms: 200,
+        ..snapshot
+    };
+    store
+        .record_task_run_start(&node_id, &restarted_snapshot, "cron", "demo")
+        .unwrap();
+
+    let runs = store
+        .list_task_runs(&TaskRunFilter {
+            session: Some("demo".into()),
+            task: Some("cleanup".into()),
+            status: None,
+            trigger: None,
+            page: 1,
+            page_size: 20,
+        })
+        .unwrap();
+    assert_eq!(runs.total, 2);
+    assert_eq!(runs.items[0].started_at_ms, 200);
+    assert_eq!(runs.items[1].started_at_ms, 100);
+}
+
+#[test]
 fn task_runs_and_mcp_calls_survive_reopening() {
     let dir = tempfile::tempdir().unwrap();
     let node_id = StateStore::open(dir.path())

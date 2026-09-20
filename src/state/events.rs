@@ -109,15 +109,22 @@ impl StateStore {
         }))
     }
 
+    /// Avoid the scheduler/history sampler double-write without treating a
+    /// runtime-local generation as globally unique across daemon restarts.
     pub fn has_task_run(
         &self,
         node_id: &str,
         session: &str,
         task: &str,
         run_generation: u64,
+        started_at_ms: u64,
     ) -> Result<bool> {
         let connection = self.connection.lock().expect("state store lock");
-        let count:i64=connection.query_row("SELECT COUNT(*) FROM task_runs WHERE node_id=?1 AND session=?2 AND task=?3 AND run_generation=?4",params![node_id,session,task,run_generation as i64],|row|row.get(0))?;
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM task_runs WHERE node_id=?1 AND session=?2 AND task=?3 AND run_generation=?4 AND started_at_ms=?5",
+            params![node_id, session, task, run_generation as i64, started_at_ms as i64],
+            |row| row.get(0),
+        )?;
         Ok(count > 0)
     }
 
@@ -128,7 +135,13 @@ impl StateStore {
         trigger: &str,
         session: &str,
     ) -> Result<Option<TaskRunRecord>> {
-        if self.has_task_run(node_id, session, &snapshot.label, snapshot.run_generation)? {
+        if self.has_task_run(
+            node_id,
+            session,
+            &snapshot.label,
+            snapshot.run_generation,
+            snapshot.started_at_ms,
+        )? {
             return Ok(None);
         }
         self.start_task_run(node_id, snapshot, trigger, session, None, None)
