@@ -143,3 +143,42 @@ fn audit_retention_bounds_unreplicated_replication_queue() {
     );
     assert!(store.audit_detail("pending-10000").unwrap().is_none());
 }
+
+#[test]
+fn audit_search_index_keeps_large_payloads_bounded() {
+    let store = StateStore::open_in_memory().unwrap();
+    let mut record = sample_audit("large", true);
+    record.request = serde_json::json!({"needle": "visible", "blob": "x".repeat(20_000)});
+    record.response = serde_json::json!({"blob": "y".repeat(20_000)});
+    record.details = serde_json::json!({"blob": "z".repeat(20_000)});
+    store.record_audit(record).unwrap();
+
+    let connection = store.connection.lock().unwrap();
+    let (request_bytes, response_bytes, details_bytes, search_bytes): (i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT length(request_json), length(response_json), length(details_json), length(searchable_text) FROM audit_records WHERE audit_id='large'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert!(request_bytes <= crate::protocol::AUDIT_PAYLOAD_LIMIT_BYTES as i64);
+    assert!(response_bytes <= crate::protocol::AUDIT_PAYLOAD_LIMIT_BYTES as i64);
+    assert!(details_bytes <= crate::protocol::AUDIT_PAYLOAD_LIMIT_BYTES as i64);
+    assert!(search_bytes <= 14_000);
+    drop(connection);
+
+    let page = store
+        .list_audit(&AuditFilter {
+            q: Some("action".into()),
+            source: None,
+            status: None,
+            node: None,
+            session: None,
+            task: None,
+            operation: None,
+            page: 1,
+            page_size: 20,
+        })
+        .unwrap();
+    assert_eq!(page.total, 1);
+}

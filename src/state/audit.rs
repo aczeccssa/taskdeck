@@ -9,6 +9,8 @@ use super::util::*;
 use super::{AUDIT_REPLICATION_QUEUE_LIMIT, AUDIT_RETENTION_LIMIT, StateStore};
 use crate::protocol::*;
 
+const AUDIT_SEARCH_EXCERPT_BYTES: usize = 4 * 1024;
+
 impl StateStore {
     pub fn record_audit(&self, mut record: AuditRecord) -> Result<AuditRecord> {
         record.request = sanitize_audit_value(&record.request);
@@ -257,10 +259,21 @@ pub(super) fn build_audit_search_text(
         record.task.as_deref().unwrap_or(""),
         record.status.as_str(),
         record.error.as_deref().unwrap_or(""),
-        request_json,
-        response_json,
-        details_json,
+        audit_search_excerpt(request_json),
+        audit_search_excerpt(response_json),
+        audit_search_excerpt(details_json),
     ))
+}
+
+fn audit_search_excerpt(value: &str) -> String {
+    if value.len() <= AUDIT_SEARCH_EXCERPT_BYTES {
+        return value.to_string();
+    }
+    let mut end = AUDIT_SEARCH_EXCERPT_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 pub(super) fn parse_audit_source(value: String) -> rusqlite::Result<AuditSource> {

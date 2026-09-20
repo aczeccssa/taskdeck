@@ -147,3 +147,71 @@ pub(super) fn dispatch_with_audit_records_success_and_error_sources() {
             .contains("missing")
     );
 }
+
+#[test]
+pub(super) fn successful_web_polling_requests_are_not_audited() {
+    let state = DaemonState::new();
+    let context = AuditContext::new(AuditSource::Web, AuditTransport::Http);
+    let response = Response::empty("poll");
+
+    for request in [
+        Request::Snapshot {
+            session: "dashboard".to_string(),
+            tail: Some(50),
+        },
+        Request::TaskLogs {
+            session: "dashboard".to_string(),
+            task: "api".to_string(),
+            after: None,
+            limit: 50,
+        },
+        Request::TaskMetrics {
+            session: "dashboard".to_string(),
+            task: "api".to_string(),
+            window_seconds: 600,
+        },
+    ] {
+        record_request_audit(
+            &state,
+            &request,
+            context.clone(),
+            None,
+            1,
+            1,
+            AuditStatus::Success,
+            None,
+            &response,
+            json!({}),
+        );
+    }
+
+    let filter = crate::protocol::AuditFilter {
+        q: None,
+        source: None,
+        status: None,
+        node: None,
+        session: None,
+        task: None,
+        operation: None,
+        page: 1,
+        page_size: 20,
+    };
+    assert_eq!(state.store.list_audit(&filter).unwrap().total, 0);
+
+    record_request_audit(
+        &state,
+        &Request::Snapshot {
+            session: "dashboard".to_string(),
+            tail: Some(50),
+        },
+        context,
+        None,
+        1,
+        1,
+        AuditStatus::Error,
+        None,
+        &Response::error("poll failed"),
+        json!({}),
+    );
+    assert_eq!(state.store.list_audit(&filter).unwrap().total, 1);
+}

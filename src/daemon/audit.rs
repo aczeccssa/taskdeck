@@ -118,6 +118,9 @@ pub(super) fn record_request_audit(
     response: &Response,
     mut details: serde_json::Value,
 ) {
+    if !should_persist_request_audit(request, &context, status) {
+        return;
+    }
     if let Some(origin_audit_id) = context.origin_audit_id.as_deref() {
         if let Some(object) = details.as_object_mut() {
             object.insert(
@@ -150,6 +153,19 @@ pub(super) fn record_request_audit(
     ) {
         eprintln!("failed to persist audit record: {error:#}");
     }
+}
+
+pub(super) fn should_persist_request_audit(
+    request: &Request,
+    context: &AuditContext,
+    status: AuditStatus,
+) -> bool {
+    !(context.source == AuditSource::Web
+        && status == AuditStatus::Success
+        && matches!(
+            request,
+            Request::Snapshot { .. } | Request::TaskLogs { .. } | Request::TaskMetrics { .. }
+        ))
 }
 
 pub(super) fn truncate_error_summary(message: &str) -> String {
