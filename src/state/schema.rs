@@ -39,8 +39,9 @@ impl StateStore {
         {
             create_backup(&connection, root, version)?;
         }
-        connection.execute_batch(
-            "PRAGMA journal_mode=WAL;
+        if needs_migration_lock {
+            connection.execute_batch(
+                "PRAGMA journal_mode=WAL;
              PRAGMA foreign_keys=ON;
              CREATE TABLE IF NOT EXISTS metadata (
                  key TEXT PRIMARY KEY,
@@ -279,15 +280,25 @@ impl StateStore {
                  last_action_ms INTEGER,
                  created_at_ms INTEGER NOT NULL,
                  updated_at_ms INTEGER NOT NULL
-             );",
-        )?;
+                 );",
+            )?;
+        } else {
+            // The current schema is already initialized; only set this
+            // connection-local pragma without touching database metadata.
+            connection.execute_batch("PRAGMA foreign_keys=ON;")?;
+        }
         restrict_database_permissions(&database)?;
         restrict_database_sidecar_permissions(&database)?;
         let store = Self {
             connection: Mutex::new(connection),
             root: Some(root.to_path_buf()),
         };
-        store.initialize()?;
+        // A current database has already completed all schema/metadata
+        // initialization. Avoid mutating it on every CLI open so concurrent
+        // current-schema readers do not race through migration code.
+        if needs_migration_lock {
+            store.initialize()?;
+        }
         Ok(store)
     }
 
