@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use super::pagination::*;
 use super::util::*;
-use super::{AUDIT_RETENTION_LIMIT, StateStore};
+use super::{AUDIT_REPLICATION_QUEUE_LIMIT, AUDIT_RETENTION_LIMIT, StateStore};
 use crate::protocol::*;
 
 impl StateStore {
@@ -190,7 +190,7 @@ impl StateStore {
 
     pub fn prune_audit_records(&self) -> Result<usize> {
         let connection = self.connection.lock().expect("state store lock");
-        let deleted = connection.execute(
+        let deleted_replicated = connection.execute(
             "DELETE FROM audit_records
              WHERE replicated_at_ms IS NOT NULL
                AND audit_id IN (
@@ -201,7 +201,18 @@ impl StateStore {
                )",
             params![AUDIT_RETENTION_LIMIT as i64],
         )?;
-        Ok(deleted)
+        let deleted_unreplicated = connection.execute(
+            "DELETE FROM audit_records
+             WHERE replicated_at_ms IS NULL
+               AND audit_id IN (
+                    SELECT audit_id FROM audit_records
+                    WHERE replicated_at_ms IS NULL
+                    ORDER BY timestamp_ms ASC, audit_id ASC
+                    LIMIT -1 OFFSET ?1
+               )",
+            params![AUDIT_REPLICATION_QUEUE_LIMIT as i64],
+        )?;
+        Ok(deleted_replicated + deleted_unreplicated)
     }
 }
 

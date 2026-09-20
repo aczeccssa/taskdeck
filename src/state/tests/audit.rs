@@ -106,3 +106,40 @@ fn audit_retention_keeps_unreplicated_records() {
     assert_eq!(page.total, AUDIT_RETENTION_LIMIT);
     assert!(store.audit_detail("pending").unwrap().is_none());
 }
+
+#[test]
+fn audit_retention_bounds_unreplicated_replication_queue() {
+    let store = StateStore::open_in_memory().unwrap();
+    {
+        let mut connection = store.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        for index in 0..(AUDIT_REPLICATION_QUEUE_LIMIT + 5) {
+            let audit_id = format!("pending-{index}");
+            transaction
+                .execute(
+                    "INSERT INTO audit_records(
+                        audit_id,correlation_id,timestamp_ms,duration_ms,source,transport,
+                        origin_node_id,executor_node_id,request_kind,operation,session,task,
+                        status,success,error,request_json,response_json,details_json,searchable_text,
+                        replicated_at_ms
+                    ) VALUES (?1,?2,?3,5,'cli','ipc','worker-1','worker-1','action','start',
+                        'demo','api','success',1,NULL,'{}','{}','{}','start',NULL)",
+                    rusqlite::params![audit_id, format!("corr-{index}"), index as i64],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+    }
+    store.prune_audit_records().unwrap();
+
+    let pending = store
+        .unreplicated_audit_records(AUDIT_REPLICATION_QUEUE_LIMIT + 5)
+        .unwrap();
+    assert_eq!(pending.len(), AUDIT_REPLICATION_QUEUE_LIMIT);
+    assert_eq!(pending.first().unwrap().audit_id, "pending-0");
+    assert_eq!(
+        pending.last().unwrap().audit_id,
+        format!("pending-{}", AUDIT_REPLICATION_QUEUE_LIMIT - 1)
+    );
+    assert!(store.audit_detail("pending-10000").unwrap().is_none());
+}
