@@ -51,9 +51,10 @@ pub const DEFAULT_WEB_PORT: u16 = 9837;
 pub const AUTH_SESSION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 pub const AUDIT_RETENTION_LIMIT: usize = 10_000;
 /// Keep the oldest pending records available for a future worker-to-leader sync.
-/// Replicated history and this queue are pruned independently, so the audit
-/// table is bounded by at most both limits combined.
 pub const AUDIT_REPLICATION_QUEUE_LIMIT: usize = 10_000;
+/// Keep the newest pending records visible in the local audit history while a
+/// worker is offline; the middle of an over-capacity backlog is discarded.
+pub const AUDIT_LOCAL_DISPLAY_LIMIT: usize = 10_000;
 pub const WORKFLOW_REVISION_RETENTION_LIMIT: usize = 50;
 pub const NOTIFICATION_RETENTION_LIMIT: usize = 1_000;
 

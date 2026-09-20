@@ -6,7 +6,9 @@ use uuid::Uuid;
 
 use super::pagination::*;
 use super::util::*;
-use super::{AUDIT_REPLICATION_QUEUE_LIMIT, AUDIT_RETENTION_LIMIT, StateStore};
+use super::{
+    AUDIT_LOCAL_DISPLAY_LIMIT, AUDIT_REPLICATION_QUEUE_LIMIT, AUDIT_RETENTION_LIMIT, StateStore,
+};
 use crate::protocol::*;
 
 const AUDIT_SEARCH_EXCERPT_BYTES: usize = 4 * 1024;
@@ -206,13 +208,25 @@ impl StateStore {
         let deleted_unreplicated = connection.execute(
             "DELETE FROM audit_records
              WHERE replicated_at_ms IS NULL
-               AND audit_id IN (
-                    SELECT audit_id FROM audit_records
-                    WHERE replicated_at_ms IS NULL
-                    ORDER BY timestamp_ms ASC, audit_id ASC
-                    LIMIT -1 OFFSET ?1
+               AND audit_id NOT IN (
+                    SELECT audit_id FROM (
+                        SELECT audit_id FROM audit_records
+                        WHERE replicated_at_ms IS NULL
+                        ORDER BY timestamp_ms ASC, audit_id ASC
+                        LIMIT ?1
+                    )
+                    UNION
+                    SELECT audit_id FROM (
+                        SELECT audit_id FROM audit_records
+                        WHERE replicated_at_ms IS NULL
+                        ORDER BY timestamp_ms DESC, audit_id DESC
+                        LIMIT ?2
+                    )
                )",
-            params![AUDIT_REPLICATION_QUEUE_LIMIT as i64],
+            params![
+                AUDIT_REPLICATION_QUEUE_LIMIT as i64,
+                AUDIT_LOCAL_DISPLAY_LIMIT as i64,
+            ],
         )?;
         Ok(deleted_replicated + deleted_unreplicated)
     }

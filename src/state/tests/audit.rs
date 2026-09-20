@@ -113,7 +113,7 @@ fn audit_retention_bounds_unreplicated_replication_queue() {
     {
         let mut connection = store.connection.lock().unwrap();
         let transaction = connection.transaction().unwrap();
-        for index in 0..(AUDIT_REPLICATION_QUEUE_LIMIT + 5) {
+        for index in 0..(AUDIT_REPLICATION_QUEUE_LIMIT + AUDIT_LOCAL_DISPLAY_LIMIT + 5) {
             let audit_id = format!("pending-{index}");
             transaction
                 .execute(
@@ -133,7 +133,7 @@ fn audit_retention_bounds_unreplicated_replication_queue() {
     store.prune_audit_records().unwrap();
 
     let pending = store
-        .unreplicated_audit_records(AUDIT_REPLICATION_QUEUE_LIMIT + 5)
+        .unreplicated_audit_records(AUDIT_REPLICATION_QUEUE_LIMIT)
         .unwrap();
     assert_eq!(pending.len(), AUDIT_REPLICATION_QUEUE_LIMIT);
     assert_eq!(pending.first().unwrap().audit_id, "pending-0");
@@ -142,6 +142,24 @@ fn audit_retention_bounds_unreplicated_replication_queue() {
         format!("pending-{}", AUDIT_REPLICATION_QUEUE_LIMIT - 1)
     );
     assert!(store.audit_detail("pending-10000").unwrap().is_none());
+    assert!(
+        store
+            .audit_detail(&format!("pending-{}", AUDIT_REPLICATION_QUEUE_LIMIT + AUDIT_LOCAL_DISPLAY_LIMIT + 4))
+            .unwrap()
+            .is_some()
+    );
+    let connection = store.connection.lock().unwrap();
+    let total: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM audit_records WHERE replicated_at_ms IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        total,
+        (AUDIT_REPLICATION_QUEUE_LIMIT + AUDIT_LOCAL_DISPLAY_LIMIT) as i64
+    );
 }
 
 #[test]
