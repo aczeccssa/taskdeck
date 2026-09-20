@@ -58,5 +58,17 @@ pub struct StateStore {
     pub(super) root: Option<PathBuf>,
 }
 
+impl StateStore {
+    pub fn metadata(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let connection = self.connection.lock().expect("state database lock");
+        util::get_metadata(&connection, key)
+    }
+
+    pub fn set_metadata(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let connection = self.connection.lock().expect("state database lock");
+        util::set_metadata(&connection, key, value)
+    }
+}
+
 #[cfg(test)]
 mod tests;

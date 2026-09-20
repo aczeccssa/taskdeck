@@ -66,6 +66,7 @@ export function AppShell(): React.JSX.Element {
     const [unread, setUnread] = useState<number | null>(null);
     const [recent, setRecent] = useState<Notification[]>([]);
     const [popoverOpen, setPopoverOpen] = useState(false);
+    const [update, setUpdate] = useState<{available: boolean; latest_version?: string; release_url?: string} | null>(null);
     const selection = useSelection();
 
     const toggleSidebar = (): void => {
@@ -133,6 +134,11 @@ export function AppShell(): React.JSX.Element {
         const timer = window.setInterval(() => void loadUnread(), 5000);
         return () => window.clearInterval(timer);
     }, [loadUnread]);
+    useEffect(() => {
+        void fetch("/api/update", {credentials: "same-origin"}).then((response) => response.json() as Promise<{data?: {available?: boolean; latest_version?: string; release_url?: string}}>).then((result) => {
+            if (result.data?.available) setUpdate({available: true, latest_version: result.data.latest_version, release_url: result.data.release_url});
+        }).catch(() => undefined);
+    }, []);
 
     const togglePopover = (): void => {
         const next = !popoverOpen;
@@ -214,6 +220,7 @@ export function AppShell(): React.JSX.Element {
                         <button className="notification-popover-all" id="notification-popover-all" type="button" onClick={openAllNotifications}>View all notifications</button>
                     </div>
                 </div>
+                {update?.available && <a className="update-pill" href={update.release_url ?? "https://github.com/aczeccssa/taskdeck/releases"} target="_blank" rel="noreferrer">Update {update.latest_version}</a>}
                 <button className="icon-button lang-toggle" id="lang" type="button" aria-label="Switch language" title="Switch language" onClick={toggleLanguage}>{language === "en" ? "EN" : "中"}</button>
                 <button className="icon-button theme-toggle" id="theme" type="button" aria-label={`Color theme: ${theme}`} title={`Color theme: ${theme}`} onClick={cycleTheme}><span id="theme-icon" aria-hidden="true"><ThemeIcon/></span></button>
             </header>

@@ -1,0 +1,127 @@
+version: 1
+session: taskdeck
+workspace_env:
+  # Taskdeck may run as an elevated/background daemon without the interactive
+  # user's PATH. Keep the toolchain locations available to every task.
+  PATH: "C:/Program Files/nodejs;C:/Users/22407/.cargo/bin;C:/Windows/System32;C:/Windows;C:/Windows/System32/WindowsPowerShell/v1.0"
+task_order:
+  - Frontend dev (mock API)
+  - Frontend dev (Taskdeck API)
+  - Frontend build
+  - Frontend preview
+  - Frontend test
+  - Docs dev
+  - Docs build
+  - Docs preview
+  - Cargo check
+  - Cargo build
+  - Cargo build (release)
+  - Cargo test
+
+# Development tasks are intentionally manual so opening Taskdeck does not
+# start multiple servers or a full Rust build unexpectedly.
+tasks:
+  Frontend dev (mock API):
+    command: "C:/Program Files/nodejs/npm.cmd"
+    args: [run, dev]
+    cwd: "D:/Repository/personal/taskdeck/frontend"
+    shell: true
+    auto_start: false
+    stop_timeout_ms: 3000
+
+  Frontend dev (Taskdeck API):
+    command: "C:/Program Files/nodejs/npm.cmd"
+    args: [run, dev:api]
+    cwd: "D:/Repository/personal/taskdeck/frontend"
+    shell: true
+    auto_start: false
+    stop_timeout_ms: 3000
+    env:
+      TASKDECK_API_TARGET: http://127.0.0.1:9837
+
+  Frontend build:
+    command: "C:/Program Files/nodejs/npm.cmd"
+    args: [run, build]
+    cwd: "D:/Repository/personal/taskdeck/frontend"
+    shell: true
+    auto_start: false
+    stop_timeout_ms: 300000
+    clear_logs_on_restart: true
+
+  Frontend preview:
+    command: "C:/Program Files/nodejs/npm.cmd"
+    args: [run, preview]
+    cwd: "D:/Repository/personal/taskdeck/frontend"
+    shell: true
+    auto_start: false
+    stop_timeout_ms: 3000
+
+  Frontend test:
+    command: "C:/Program Files/nodejs/npm.cmd"
+    args: [run, test]
+    cwd: "D:/Repository/personal/taskdeck/frontend"
+    shell: true
+    auto_start: false
+    stop_timeout_ms: 300000
+    clear_logs_on_restart: true
+
+  Docs dev:
+    command: "C:/Program Files/nodejs/npm.cmd"
+    args: [run, dev]
+    cwd: "D:/Repository/personal/taskdeck/docs-site"
+    shell: true
+    auto_start: false
+    stop_timeout_ms: 3000
+
+  Docs build:
+    command: "C:/Program Files/nodejs/npm.cmd"
+    args: [run, build]
+    cwd: "D:/Repository/personal/taskdeck/docs-site"
+    shell: true
+    auto_start: false
+    stop_timeout_ms: 300000
+    clear_logs_on_restart: true
+
+  Docs preview:
+    command: "C:/Program Files/nodejs/npm.cmd"
+    args: [run, preview]
+    cwd: "D:/Repository/personal/taskdeck/docs-site"
+    shell: true
+    auto_start: false
+    stop_timeout_ms: 3000
+
+  Cargo check:
+    command: "C:/Users/22407/.cargo/bin/cargo.exe"
+    args: [check, --locked]
+    cwd: "D:/Repository/personal/taskdeck"
+    shell: true
+    auto_start: false
+    stop_timeout_ms: 300000
+    clear_logs_on_restart: true
+
+  Cargo build:
+    command: "C:/Users/22407/.cargo/bin/cargo.exe"
+    args: [build, --locked]
+    cwd: "D:/Repository/personal/taskdeck"
+    shell: true
+    auto_start: false
+    stop_timeout_ms: 300000
+    clear_logs_on_restart: true
+
+  Cargo build (release):
+    command: "C:/Users/22407/.cargo/bin/cargo.exe"
+    args: [build, --locked, --release]
+    cwd: "D:/Repository/personal/taskdeck"
+    shell: true
+    auto_start: false
+    stop_timeout_ms: 300000
+    clear_logs_on_restart: true
+
+  Cargo test:
+    command: "C:/Users/22407/.cargo/bin/cargo.exe"
+    args: [test, --locked]
+    cwd: "D:/Repository/personal/taskdeck"
+    shell: true
+    auto_start: false
+    stop_timeout_ms: 300000
+    clear_logs_on_restart: true

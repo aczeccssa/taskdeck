@@ -13,6 +13,7 @@ use crate::protocol::{
 
 use super::*;
 
+#[cfg(not(windows))]
 pub fn inspect_listeners(pids: &[u32]) -> (Vec<ServiceEndpoint>, ServiceInspectionState) {
     if pids.is_empty() {
         return (Vec::new(), ServiceInspectionState::NotRunning);

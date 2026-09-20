@@ -29,6 +29,21 @@ pub const PROJECT_CONFIG: &str = "taskdeck.yaml";
 const DEFAULT_STOP_TIMEOUT_MS: u64 = 3_000;
 pub const MAX_STOP_TIMEOUT_MS: u64 = 300_000;
 
+/// Windows `canonicalize` may return an extended `\\?\\` path. Those paths are
+/// valid for file APIs but are rejected as a child process working directory
+/// by some Windows CreateProcess callers. Keep normal paths at process
+/// boundaries while preserving the extended form for state-file identity.
+pub(crate) fn normalize_process_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let value = path.to_string_lossy();
+        if let Some(stripped) = value.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+    path
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSpec {
     pub label: String,

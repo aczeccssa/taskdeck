@@ -6257,3 +6257,18 @@ dialog.config-drawer[open] .config-form-body {
     right: 6px;
     margin-left: 0;
 }
+/* Release update indicator shared by the React shell and versioned docs flow. */
+.update-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 30px;
+    padding: 0 10px;
+    border: 1px solid var(--accent, #2f6fed);
+    border-radius: 999px;
+    color: var(--accent, #2f6fed);
+    font-size: 12px;
+    font-weight: 700;
+    text-decoration: none;
+    white-space: nowrap;
+}

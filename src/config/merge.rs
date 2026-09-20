@@ -154,7 +154,7 @@ pub(crate) fn compile_task(
 
     let expanded_cwd = expand(&task.cwd, project);
 
-    let cwd = PathBuf::from(&expanded_cwd);
+    let cwd = normalize_process_path(PathBuf::from(&expanded_cwd));
 
     Ok(TaskSpec {
         label: task.label.clone(),
@@ -166,7 +166,7 @@ pub(crate) fn compile_task(
         cwd: if cwd.is_absolute() {
             cwd
         } else {
-            project.join(cwd)
+            normalize_process_path(project.join(cwd))
         },
 
         env: {

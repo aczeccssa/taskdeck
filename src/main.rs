@@ -7,6 +7,8 @@ mod runtime;
 mod service;
 mod state;
 mod tui;
+mod update;
+mod version;
 mod web;
 
 use std::path::PathBuf;
@@ -108,6 +110,15 @@ pub(crate) enum Commands {
     Unregister,
     /// Print Web UI and MCP endpoints.
     Endpoints,
+    /// Check for and install a newer Taskdeck release.
+    Upgrade {
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        install: bool,
+        #[arg(long, hide = true)]
+        background: bool,
+    },
     /// Stop the global daemon and every managed task.
     Shutdown,
     /// Inspect registered workspace aliases.
@@ -263,6 +274,9 @@ async fn run(cli: Cli) -> Result<()> {
     if let Some(Commands::Service { command }) = cli.command {
         return run_service_command(command, json).await;
     }
+    if let Some(Commands::Upgrade { check, install, background }) = cli.command {
+        return run_upgrade_command(check, install, background, json).await;
+    }
 
     ensure_daemon().await?;
     if let Some(Commands::Workspace { command }) = cli.command {
@@ -374,7 +388,8 @@ async fn run(cli: Cli) -> Result<()> {
         | Commands::Node { .. }
         | Commands::Auth { .. }
         | Commands::Workspace { .. }
-        | Commands::Service { .. } => unreachable!(),
+        | Commands::Service { .. }
+        | Commands::Upgrade { .. } => unreachable!(),
     }
 }
 
@@ -406,6 +421,8 @@ mod tests {
             Cli::try_parse_from(["taskdeck", "unregister", "--session", "api"]).unwrap();
         assert!(matches!(unregister.command, Some(Commands::Unregister)));
         assert_eq!(unregister.session.as_deref(), Some("api"));
+        let upgrade = Cli::try_parse_from(["taskdeck", "upgrade", "--check"]).unwrap();
+        assert!(matches!(upgrade.command, Some(Commands::Upgrade { check: true, .. })));
     }
 
     #[test]

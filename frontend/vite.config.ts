@@ -13,6 +13,7 @@ export default defineConfig(({mode}) => ({
     publicDir: "public",
     server: {
         port: 5173,
+        allowedHosts: ["windows-company-hp66"],
         proxy: mode === "api" ? {
             "/api": proxy,
             "/mcp": proxy,

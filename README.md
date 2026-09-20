@@ -1,5 +1,7 @@
 # Taskdeck
 
+Project website and versioned installation guide: [aczeccssa.github.io/taskdeck](https://aczeccssa.github.io/taskdeck/). Binary downloads, checksums, historical documentation, and upgrade notes are published with each GitHub Release.
+
 Taskdeck runs project tasks in a persistent per-user daemon. The same binary can
 run as a standalone worker, a standard leader that also runs local tasks, or a
 pure master that only controls remote workers. CLI, TUI, Web UI, and MCP all

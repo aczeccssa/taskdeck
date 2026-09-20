@@ -142,7 +142,11 @@ impl TaskRuntime {
                 } else {
                     format!("{} {}", self.spec.program, escaped_args.join(" "))
                 };
-                let mut command = Command::new("powershell.exe");
+                let shell = std::env::var_os("SystemRoot")
+                    .map(|root| std::path::PathBuf::from(root).join("System32/WindowsPowerShell/v1.0/powershell.exe"))
+                    .filter(|path| path.is_file())
+                    .unwrap_or_else(|| std::path::PathBuf::from("powershell.exe"));
+                let mut command = Command::new(shell);
                 command
                     .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
                     .arg(script);

@@ -1,0 +1,73 @@
+name: Update smoke test
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-and-web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.14'
+      - name: Build frontend
+        run: bun install --cwd frontend --frozen-lockfile && bun run --cwd frontend build
+      - name: Build documentation
+        run: bun install --cwd docs-site --frozen-lockfile && bun run --cwd docs-site build
+      - name: Test updater twice
+        run: |
+          cargo test --locked update::tests -- --nocapture
+          cargo test --locked update::tests -- --nocapture
+      - name: Compile daemon
+        run: cargo check --locked
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: rust-and-web
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Taskdeck image
+        run: docker build --pull -t taskdeck:update-smoke .
+      - name: Run daemon against a fake Release server
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'docker rm -f taskdeck-smoke release-fixture 2>/dev/null || true; docker network rm taskdeck-update-smoke 2>/dev/null || true; rm -rf fixture' EXIT
+          mkdir -p fixture/download/v0.2.0/payload
+          docker create --name taskdeck-source taskdeck:update-smoke
+          docker cp taskdeck-source:/usr/local/bin/taskdeck fixture/download/v0.2.0/payload/taskdeck
+          docker rm taskdeck-source
+          tar -czf fixture/download/v0.2.0/taskdeck-v0.2.0-x86_64-unknown-linux-gnu.tar.gz -C fixture/download/v0.2.0/payload taskdeck
+          sha256sum fixture/download/v0.2.0/taskdeck-v0.2.0-x86_64-unknown-linux-gnu.tar.gz | awk '{print $1"  taskdeck-v0.2.0-x86_64-unknown-linux-gnu.tar.gz"}' > fixture/download/v0.2.0/SHA256SUMS
+          cat > fixture/latest.json <<'JSON'
+          {"tag_name":"v0.2.0","html_url":"http://fixture:8080/releases/tag/v0.2.0","published_at":"2026-09-20T00:00:00Z","body":"Docker smoke release","assets":[{"name":"taskdeck-v0.2.0-x86_64-unknown-linux-gnu.tar.gz","browser_download_url":"http://fixture:8080/download/v0.2.0/taskdeck-v0.2.0-x86_64-unknown-linux-gnu.tar.gz","size":0}]}
+          JSON
+          docker network create taskdeck-update-smoke
+          docker run -d --name release-fixture --network taskdeck-update-smoke --network-alias fixture -v "$PWD/fixture:/srv" python:3.12-alpine python -m http.server 8080 --directory /srv
+          docker run -d --name taskdeck-smoke --network taskdeck-update-smoke -p 19837:9837 \
+            -e TASKDECK_HOME=/var/lib/taskdeck \
+            -e TASKDECK_ROLE=leader -e TASKDECK_LEADER_MODE=pure_master \
+            -e TASKDECK_BIND_HOST=0.0.0.0 -e TASKDECK_WEB_PORT=9837 \
+            -e TASKDECK_ENROLLMENT_TOKEN=smoke-token \
+            -e TASKDECK_UPDATE_CHECK=0 \
+            -e TASKDECK_UPDATE_API_URL=http://fixture:8080/latest.json \
+            -e TASKDECK_RELEASES_URL=http://fixture:8080 \
+            taskdeck:update-smoke daemon
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:19837/healthz >/dev/null; then break; fi
+            sleep 2
+          done
+          curl --fail --silent http://127.0.0.1:19837/healthz
+          curl --fail --silent http://127.0.0.1:19837/api/version | tee version.json
+          curl --fail --silent -X POST http://127.0.0.1:19837/api/update/check | tee update.json
+          grep -q '"latest_version":"0.2.0"' update.json
+          grep -q '"available":true' update.json
+          docker exec release-fixture wget -qO- http://127.0.0.1:8080/download/v0.2.0/SHA256SUMS >/dev/null
+          docker logs taskdeck-smoke

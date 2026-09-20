@@ -5,16 +5,42 @@ use crate::daemon::{self, request};
 use crate::platform_service::{ServiceAction, service_control, service_status};
 use crate::protocol::{Action, Request};
 use crate::state::{NodeSettingsUpdate, StateStore};
+use crate::{update, version};
 use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+#[cfg(windows)]
+use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
+
 use super::{AuthCommands, NodeCommands, ServiceCommands, WorkspaceCommands};
 
 mod output;
 pub(crate) use output::{print_message, print_response, print_service, print_table, print_value};
+
+pub(crate) async fn run_upgrade_command(check_only: bool, install_requested: bool, background: bool, json: bool) -> Result<()> {
+    if background {
+        let _ = tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let release = tokio::task::spawn_blocking(update::latest)
+        .await
+        .context("release check task failed")??;
+    let status = update::status_from_release(release.clone(), update::timestamp_ms());
+    if install_requested {
+        if !status.available {
+            return print_config_value(&status, "UPGRADE", json);
+        }
+        let _ = daemon::request(&Request::Shutdown).await;
+        let message = update::install_latest_release(release).await?;
+        if json { println!("{}", serde_json::json!({"ok":true,"message":message,"version":version::VERSION})); }
+        else { print_message(&message); }
+        return Ok(());
+    }
+    let _ = check_only;
+    print_config_value(&status, "UPGRADE", json)
+}
 
 pub(crate) async fn run_list_command(json: bool) -> Result<()> {
     if json {

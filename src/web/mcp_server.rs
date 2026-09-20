@@ -61,7 +61,7 @@ pub(crate) async fn mcp(State(state): State<DaemonState>, Json(rpc): Json<Value>
 
             "capabilities": {"tools": {}},
 
-            "serverInfo": {"name": "taskdeck", "version": env!("CARGO_PKG_VERSION")},
+            "serverInfo": {"name": "taskdeck", "version": crate::version::VERSION},
 
             "instructions": if state.public_settings().role == crate::state::NodeRole::Leader {
 

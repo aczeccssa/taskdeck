@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 
 use crate::cluster::{self, RemoteRequest};
 use crate::daemon::{DaemonState, record_audit_value};
+use crate::{update, version};
 use crate::platform_service::{ServiceAction, service_control, service_status};
 #[cfg(test)]
 use crate::protocol::McpCallListPage;
@@ -31,6 +32,7 @@ use crate::protocol::{
     WorkflowGroupActionItemStatus, WorkflowGroupActionSummary, WorkflowGroupInput,
     WorkflowGroupMemberView, WorkflowGroupView, WorkflowGroupsView, WorkflowRevisionsView,
     WorkflowTargetView, WorkspaceQuotaInput, WorkspaceQuotasView, casefold_search_text,
+    Request,
 };
 use crate::state::NodeRole;
 
@@ -78,6 +80,9 @@ pub(crate) fn app(state: DaemonState) -> Router {
         .route("/docs", get(index))
         .route("/settings", get(index))
         .route("/healthz", get(health))
+        .route("/api/version", get(version_info))
+        .route("/api/update", get(update_status).post(update_install))
+        .route("/api/update/check", post(update_check))
         .route("/api/agent/connect", get(agent_connect))
         .route("/api/nodes", get(list_nodes))
         .route(
@@ -207,6 +212,39 @@ pub(crate) fn app(state: DaemonState) -> Router {
 
 pub(crate) async fn health() -> StatusCode {
     StatusCode::OK
+}
+
+pub(crate) async fn version_info() -> Json<Response> {
+    Json(Response::ok("version", version::info()))
+}
+
+pub(crate) async fn update_status(State(state): State<DaemonState>) -> Json<Response> {
+    let status = tokio::task::spawn_blocking(update::check).await.unwrap_or_else(|_| update::UpdateStatus {
+        enabled: update::enabled(), current_version: version::VERSION.to_string(), latest_version: None, available: false,
+        checked_at_ms: None, release_url: None, error: Some("update check task failed".to_string()), asset_name: None,
+    });
+    let _ = state.store.set_metadata("update_last_checked_ms", &status.checked_at_ms.unwrap_or_default().to_string());
+    Json(Response::ok("update status", status))
+}
+
+pub(crate) async fn update_check(State(_state): State<DaemonState>) -> Json<Response> {
+    Json(Response::ok("update status", tokio::task::spawn_blocking(update::check).await.unwrap_or_else(|_| update::UpdateStatus {
+        enabled: update::enabled(), current_version: version::VERSION.to_string(), latest_version: None, available: false,
+        checked_at_ms: None, release_url: None, error: Some("update check task failed".to_string()), asset_name: None,
+    })))
+}
+
+pub(crate) async fn update_install(State(_state): State<DaemonState>) -> Json<Response> {
+    let release = match tokio::task::spawn_blocking(update::latest).await {
+        Ok(Ok(release)) => release,
+        Ok(Err(error)) => return Json(Response::error(format!("update check failed: {error:#}"))),
+        Err(error) => return Json(Response::error(format!("update check task failed: {error:#}"))),
+    };
+    let _ = crate::daemon::request(&Request::Shutdown).await;
+    match update::install_latest_release(release).await {
+        Ok(message) => Json(Response::ok("update queued", serde_json::json!({"message": message}))),
+        Err(error) => Json(Response::error(format!("update failed: {error:#}"))),
+    }
 }
 
 pub(crate) fn current_millis() -> u64 {

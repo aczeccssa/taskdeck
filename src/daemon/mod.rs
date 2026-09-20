@@ -59,6 +59,7 @@ use crate::cluster::spawn_worker_client;
 use crate::protocol::{Envelope, Response};
 use crate::state::NodeRole;
 use crate::web;
+use crate::update;
 use sampler::{panic_message, spawn_task_history_sampler, spawn_task_metrics_sampler};
 use scheduler::spawn_task_scheduler;
 
@@ -112,6 +113,21 @@ pub async fn run(web_port_override: Option<u16>) -> Result<()> {
         .create(&paths.socket)
         .with_context(|| format!("failed to create named pipe {}", paths.socket.display()))?;
     let state = DaemonState::load(&paths)?;
+    if update::enabled() {
+        let update_state = state.clone();
+        tokio::spawn(async move {
+            let now = update::timestamp_ms();
+            let last = update_state.store.metadata("update_last_checked_ms").ok().flatten().and_then(|v| v.parse().ok());
+            if !update::should_check(last, now) { return; }
+            let status = tokio::task::spawn_blocking(update::check).await.ok();
+            if let Some(status) = status {
+                let _ = update_state.store.set_metadata("update_last_checked_ms", &status.checked_at_ms.unwrap_or(now).to_string());
+                if status.available {
+                    let _ = update_state.store.record_event("update", "new Taskdeck release available", serde_json::json!({"version":status.latest_version,"url":status.release_url}));
+                }
+            }
+        });
+    }
     let public_settings = state.public_settings();
     let worker_settings = state.settings.lock().expect("node settings lock").clone();
     let web_port = web_port_override.unwrap_or(public_settings.web_port);

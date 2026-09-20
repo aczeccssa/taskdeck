@@ -1,0 +1,9 @@
+{
+  "name": "taskdeck-docs",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.3.14",
+  "scripts": {"dev": "vite", "build": "tsc --noEmit && vite build", "preview": "vite preview"},
+  "dependencies": {"@vitejs/plugin-react": "6.1.1", "react": "19.2.8", "react-dom": "19.2.8", "vite": "8.2.2"},
+  "devDependencies": {"@types/react": "19.2.7", "@types/react-dom": "19.2.3", "typescript": "7.0.2"}
+}

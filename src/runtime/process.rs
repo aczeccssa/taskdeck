@@ -36,6 +36,7 @@ use crate::protocol::{
 };
 use crate::service;
 
+#[cfg(not(windows))]
 pub(super) fn exit_code_for(status: &ExitStatus) -> Option<i32> {
     status.code()
 }

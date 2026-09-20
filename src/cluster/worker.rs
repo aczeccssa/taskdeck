@@ -64,7 +64,7 @@ pub(super) async fn run_worker_connection(
             protocol: AGENT_PROTOCOL_VERSION,
             node_id: settings.node_id.clone(),
             name: settings.name.clone(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: crate::version::VERSION.to_string(),
             token: settings.enrollment_token.clone(),
         },
     )

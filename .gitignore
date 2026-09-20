@@ -11,6 +11,27 @@ src/.DS_Store
 /frontend/node_modules
 /frontend/dist
 /frontend/.vite
+/docs-site/node_modules
+/docs-site/dist
+/docs-site/.vite
+
+# Local Taskdeck state, logs, and staged updater files when TASKDECK_HOME is
+# pointed at this checkout during development.
+/.taskdeck
+/.taskdeck-home
+
+# Local environment and operating-system/editor noise.
+/.env
+/.env.*
+!.env.example
+**/.DS_Store
+**/Thumbs.db
+*.swp
+*.swo
+
+# Test and coverage output.
+/coverage
+/.nyc_output
 
 /.playwright-cli
 /.tmp
