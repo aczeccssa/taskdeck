@@ -134,7 +134,8 @@ taskdeck node configure --role leader --leader-mode standard \
 
 # A control-plane-only leader.
 taskdeck node configure --role leader --leader-mode pure-master \
-  --name master --bind-host 0.0.0.0 --token "$TASKDECK_TOKEN"
+  --name master --bind-host 0.0.0.0 --allow-remote-bind \
+  --token "$TASKDECK_TOKEN"
 ```
 
 The Web UI Settings page edits the current node and, on a leader, connected or
@@ -191,6 +192,8 @@ network. Node APIs never return the token. Native installs default to
 explicit `--allow-remote-bind` CLI flag (or `allow_remote_bind: true` in the
 Web UI/API). Container/Compose deployments already set
 `TASKDECK_ALLOW_REMOTE_BIND=true` alongside their intentional `0.0.0.0` bind.
+A legacy `taskdeck.json` with a remote bind but without this field fails closed;
+run `taskdeck node configure --allow-remote-bind` once to acknowledge it.
 
 ## Pure master with Compose
 
@@ -315,9 +318,10 @@ use an HttpOnly cookie. API/MCP clients may instead send
 `Authorization: Bearer <access-key>`. Worker enrollment continues using the
 separate node token.
 
-By default the daemon binds to `0.0.0.0:9837`, making its Web, MCP, and worker
-agent endpoints available on every network interface. Use `127.0.0.1` when
-accessing it from the same machine:
+Native installations bind to `127.0.0.1:9837` by default. The provided Compose
+deployment intentionally sets `TASKDECK_BIND_HOST=0.0.0.0` together with
+`TASKDECK_ALLOW_REMOTE_BIND=true`; use `127.0.0.1` when accessing a native
+daemon from the same machine:
 
 - Web UI: `http://127.0.0.1:9837`
 - Streamable HTTP MCP: `http://127.0.0.1:9837/mcp`

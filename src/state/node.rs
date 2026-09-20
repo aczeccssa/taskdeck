@@ -37,12 +37,14 @@ impl StateStore {
     pub fn configure(&self, update: NodeSettingsUpdate) -> Result<NodeSettings> {
         let mut connection = self.connection.lock().expect("state store lock");
         let mut settings = read_node_settings(&connection)?;
-        let previous_network_config = self.user_network_config(&settings)?;
+        let previous_network_config = self.user_network_config_for_update(&settings)?;
         if let Some(config) = &previous_network_config {
             settings.bind_host = config.bind_host.clone();
             settings.web_port = config.web_port;
         }
-        let network_changed = update.bind_host.is_some() || update.web_port.is_some();
+        let network_changed = update.bind_host.is_some()
+            || update.web_port.is_some()
+            || update.allow_remote_bind.is_some();
         if let Some(role) = update.role {
             settings.role = role;
             if role == NodeRole::Worker {
@@ -70,12 +72,11 @@ impl StateStore {
             settings.web_port = web_port;
         }
         settings.validate()?;
-        if user_config::is_remote_bind_host(&settings.bind_host)
-            && !previous_network_config
-                .as_ref()
-                .is_some_and(|config| config.allow_remote_bind)
-            && update.allow_remote_bind != Some(true)
-        {
+        let allow_remote_bind = update
+            .allow_remote_bind
+            .or_else(|| previous_network_config.as_ref().map(|config| config.allow_remote_bind))
+            .unwrap_or(false);
+        if user_config::is_remote_bind_host(&settings.bind_host) && !allow_remote_bind {
             bail!(
                 "remote bind host '{}' requires allow_remote_bind=true",
                 settings.bind_host
@@ -95,7 +96,10 @@ impl StateStore {
                 let mut updated = previous.clone();
                 updated.bind_host = settings.bind_host.clone();
                 updated.web_port = settings.web_port;
-                updated.allow_remote_bind = user_config::is_remote_bind_host(&updated.bind_host);
+                updated.allow_remote_bind = update.allow_remote_bind.unwrap_or_else(|| {
+                    user_config::is_remote_bind_host(&updated.bind_host)
+                        && previous.allow_remote_bind
+                });
                 user_config::write(self.root.as_deref().expect("config root exists"), &updated)?;
             }
         }
@@ -181,6 +185,24 @@ impl StateStore {
             .as_deref()
             .map(|root| {
                 user_config::load_or_create(
+                    root,
+                    user_config::legacy(
+                        legacy_settings.bind_host.clone(),
+                        legacy_settings.web_port,
+                    ),
+                )
+            })
+            .transpose()
+    }
+
+    fn user_network_config_for_update(
+        &self,
+        legacy_settings: &NodeSettings,
+    ) -> Result<Option<user_config::UserNetworkConfig>> {
+        self.root
+            .as_deref()
+            .map(|root| {
+                user_config::load_or_create_for_update(
                     root,
                     user_config::legacy(
                         legacy_settings.bind_host.clone(),

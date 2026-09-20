@@ -157,3 +157,54 @@ fn remote_network_binding_requires_explicit_opt_in() {
             .unwrap();
     assert_eq!(config["allow_remote_bind"], true);
 }
+
+#[test]
+fn remote_opt_in_can_be_revoked_only_with_a_loopback_bind() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = StateStore::open(dir.path()).unwrap();
+    store
+        .configure(NodeSettingsUpdate {
+            bind_host: Some("0.0.0.0".to_string()),
+            allow_remote_bind: Some(true),
+            ..NodeSettingsUpdate::default()
+        })
+        .unwrap();
+
+    let error = store
+        .configure(NodeSettingsUpdate {
+            allow_remote_bind: Some(false),
+            ..NodeSettingsUpdate::default()
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("allow_remote_bind=true"));
+    let config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.path().join("taskdeck.json")).unwrap())
+            .unwrap();
+    assert_eq!(config["allow_remote_bind"], true);
+}
+
+#[test]
+fn legacy_remote_config_requires_and_supports_explicit_opt_in_migration() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = StateStore::open(dir.path()).unwrap();
+    std::fs::write(
+        dir.path().join("taskdeck.json"),
+        r#"{"version":1,"bind_host":"0.0.0.0","web_port":9837}"#,
+    )
+    .unwrap();
+
+    let error = store.node_settings().unwrap_err();
+    assert!(error.to_string().contains("allow_remote_bind=true"));
+
+    let settings = store
+        .configure(NodeSettingsUpdate {
+            allow_remote_bind: Some(true),
+            ..NodeSettingsUpdate::default()
+        })
+        .unwrap();
+    assert_eq!(settings.bind_host, "0.0.0.0");
+    let config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.path().join("taskdeck.json")).unwrap())
+            .unwrap();
+    assert_eq!(config["allow_remote_bind"], true);
+}

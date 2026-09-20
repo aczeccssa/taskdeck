@@ -39,7 +39,7 @@ impl UserNetworkConfig {
         Ok(())
     }
 
-    fn from_value(value: Value, path: &Path) -> Result<Self> {
+    fn from_value(value: Value, path: &Path, validate: bool) -> Result<Self> {
         let raw = value
             .as_object()
             .cloned()
@@ -64,19 +64,21 @@ impl UserNetworkConfig {
             .and_then(Value::as_u64)
             .and_then(|value| u16::try_from(value).ok())
             .with_context(|| format!("{} has invalid web_port", path.display()))?;
-        // v1 files written before the explicit opt-in field are treated as
-        // legacy operator choices and upgraded on the next write.
+        // A remote bind from a pre-opt-in v1 file must be acknowledged before
+        // it can be used again; do not silently carry the exposure forward.
         let allow_remote_bind = raw
             .get("allow_remote_bind")
             .and_then(Value::as_bool)
-            .unwrap_or_else(|| is_remote_bind_host(&bind_host));
+            .unwrap_or(false);
         let config = Self {
             bind_host,
             web_port,
             allow_remote_bind,
             raw,
         };
-        config.validate()?;
+        if validate {
+            config.validate()?;
+        }
         Ok(config)
     }
 
@@ -98,6 +100,14 @@ pub(super) fn config_path(root: &Path) -> PathBuf {
 }
 
 pub(super) fn load(root: &Path) -> Result<Option<UserNetworkConfig>> {
+    load_with_validation(root, true)
+}
+
+pub(super) fn load_for_update(root: &Path) -> Result<Option<UserNetworkConfig>> {
+    load_with_validation(root, false)
+}
+
+fn load_with_validation(root: &Path, validate: bool) -> Result<Option<UserNetworkConfig>> {
     let path = config_path(root);
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -116,7 +126,7 @@ pub(super) fn load(root: &Path) -> Result<Option<UserNetworkConfig>> {
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let value = serde_json::from_str(&content)
         .with_context(|| format!("failed to parse {}", path.display()))?;
-    let config = UserNetworkConfig::from_value(value, &path)?;
+    let config = UserNetworkConfig::from_value(value, &path, validate)?;
     restrict_permissions(&path)?;
     Ok(Some(config))
 }
@@ -132,6 +142,20 @@ pub(super) fn load_or_create(root: &Path, legacy: UserNetworkConfig) -> Result<U
                 bail!("newly written taskdeck.json did not round-trip correctly");
             }
             Ok(created)
+        }
+    }
+}
+
+pub(super) fn load_or_create_for_update(
+    root: &Path,
+    legacy: UserNetworkConfig,
+) -> Result<UserNetworkConfig> {
+    match load_for_update(root)? {
+        Some(config) => Ok(config),
+        None => {
+            legacy.validate()?;
+            write(root, &legacy)?;
+            load_for_update(root)?.context("newly written taskdeck.json was not found")
         }
     }
 }
