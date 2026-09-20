@@ -55,18 +55,31 @@ fn record_scheduled_failure(state: &DaemonState, key: &ScheduleKey, error: impl 
         .lock()
         .ok()
         .and_then(|mut sessions| sessions.get_mut(&key.session)?.snapshot(0).ok())
-        .and_then(|session| session.tasks.into_values().find(|task| task.label == key.task));
-    if let Some(snapshot) = snapshot {
-        let node_id = state.public_settings().node_id;
-        if let Err(persist_error) = state.store.record_task_run_failure(
-            &node_id,
-            &snapshot,
-            "cron",
-            &key.session,
-            error,
-        ) {
-            eprintln!("failed to persist scheduled failure: {persist_error:#}");
-        }
+        .and_then(|session| session.tasks.into_values().find(|task| task.label == key.task))
+        .unwrap_or_else(|| crate::protocol::TaskSnapshot {
+            label: key.task.clone(),
+            status: TaskStatus::Failed,
+            pid: None,
+            command: String::new(),
+            cwd: PathBuf::from("."),
+            auto_start: false,
+            last_exit: None,
+            exit_code: None,
+            logs: Vec::new(),
+            run_generation: 0,
+            started_at_ms: 0,
+            schedule: None,
+            service: Default::default(),
+        });
+    let node_id = state.public_settings().node_id;
+    if let Err(persist_error) = state.store.record_task_run_failure(
+        &node_id,
+        &snapshot,
+        "cron",
+        &key.session,
+        error,
+    ) {
+        eprintln!("failed to persist scheduled failure: {persist_error:#}");
     }
     state
         .run_triggers
@@ -270,4 +283,39 @@ pub(super) fn spawn_task_scheduler(state: DaemonState) -> thread::JoinHandle<()>
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::TaskRunFilter;
+
+    #[test]
+    fn scheduled_failure_is_persisted_when_session_disappears() {
+        let state = DaemonState::new();
+        let key = ScheduleKey {
+            session: "missing-session".to_string(),
+            task: "missing-task".to_string(),
+        };
+
+        record_scheduled_failure(&state, &key, "scheduled session disappeared");
+
+        let runs = state
+            .store
+            .list_task_runs(&TaskRunFilter {
+                session: Some(key.session),
+                task: Some(key.task),
+                status: Some("failed".to_string()),
+                trigger: Some("cron".to_string()),
+                page: 1,
+                page_size: 20,
+            })
+            .unwrap();
+        assert_eq!(runs.total, 1);
+        assert_eq!(
+            runs.items[0].error_message.as_deref(),
+            Some("scheduled session disappeared")
+        );
+        assert!(runs.items[0].finished_at_ms.is_some());
+    }
 }
