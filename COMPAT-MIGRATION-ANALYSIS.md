@@ -98,7 +98,7 @@ Taskdeck 新增用户级配置文件不是一次“全新安装专用”的变�
 
 现有 `taskdeck daemon --web-port` 属于显式 CLI 参数，必须保留最高优先级，或在独立兼容周期内正式废弃；不得处于未定义状态。
 
-环境变量是部署时覆盖，不得自动写回 JSON。Compose / Docker 继续显式设置 `TASKDECK_BIND_HOST=0.0.0.0`，从而保持容器对外监听行为。
+环境变量是部署时覆盖，不得自动写回 JSON。Compose / Docker 继续显式设置 `TASKDECK_BIND_HOST=0.0.0.0` 并配套 `TASKDECK_ALLOW_REMOTE_BIND=true`，从而保持容器对外监听行为。
 
 ### 2.3 旧安装缺少配置文件时的迁移矩阵
 

@@ -186,7 +186,11 @@ remote worker.
 
 The enrollment token protects worker admission. Use TLS directly or at a
 trusted reverse proxy before exposing a leader outside a private development
-network. Node APIs never return the token.
+network. Node APIs never return the token. Native installs default to
+`127.0.0.1`; changing the bind host to a non-loopback address requires the
+explicit `--allow-remote-bind` CLI flag (or `allow_remote_bind: true` in the
+Web UI/API). Container/Compose deployments already set
+`TASKDECK_ALLOW_REMOTE_BIND=true` alongside their intentional `0.0.0.0` bind.
 
 ## Pure master with Compose
 
