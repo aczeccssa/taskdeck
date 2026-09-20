@@ -232,6 +232,7 @@ pub(crate) async fn run_node_command(command: NodeCommands, json: bool) -> Resul
             clear_token,
             bind_host,
             web_port,
+            allow_remote_bind,
         } => {
             let settings = store.configure(NodeSettingsUpdate {
                 role,
@@ -249,6 +250,7 @@ pub(crate) async fn run_node_command(command: NodeCommands, json: bool) -> Resul
                 },
                 bind_host,
                 web_port,
+                allow_remote_bind: allow_remote_bind.then_some(true),
             })?;
             if daemon::is_running().await {
                 let _ = request(&Request::Shutdown).await;

@@ -70,7 +70,7 @@ export interface EditableTaskOrigin { imported: boolean; has_yaml_override: bool
 export interface EditableTask { label: string; command: string; args: string[]; cwd: string; env: Record<string, string>; shell: boolean; auto_start: boolean; stop_timeout_ms: number; clear_logs_on_restart: boolean; schedule?: string | null; origin: EditableTaskOrigin }
 export interface SessionConfigSnapshot { session: string; project: string; source: string; revision: string; workspace_env: Record<string, string>; tasks: EditableTask[] }
 export interface EnvironmentOverride { field: string; variable: string }
-export interface NodeSettingsView { role: string; leader_mode: string; name: string; leader_url?: string | null; bind_host: string; web_port: number; environment_overrides: EnvironmentOverride[]; [setting: string]: JsonValue | EnvironmentOverride[] | undefined }
+export interface NodeSettingsView { role: string; leader_mode: string; name: string; leader_url?: string | null; bind_host: string; web_port: number; allow_remote_bind: boolean; environment_overrides: EnvironmentOverride[]; [setting: string]: JsonValue | EnvironmentOverride[] | undefined }
 export interface ServiceStatus { scope?: "user" | "system"; installed?: boolean; running?: boolean; status?: string; message?: string; [field: string]: JsonValue | undefined }
 
 export interface Page { page: number; page_size: number; total: number; total_pages: number; has_next?: boolean; has_previous?: boolean }

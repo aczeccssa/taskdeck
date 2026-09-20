@@ -14,7 +14,7 @@ use serde_yaml::{Mapping, Value};
 #[cfg(unix)]
 use std::fs::File;
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
@@ -104,6 +104,7 @@ pub(crate) fn load_yaml_document(project: &Path) -> Result<Option<YamlDocument>>
 
     let raw_content =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    restrict_project_config_permissions(&path)?;
 
     let raw_value: Value = serde_yaml::from_str(&raw_content)
         .with_context(|| format!("failed to parse {}", path.display()))?;
@@ -249,6 +250,21 @@ pub(crate) fn clear_known_task_fields(mapping: &mut Mapping) {
     ] {
         mapping.remove(yaml_key(key));
     }
+}
+
+fn restrict_project_config_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(path)
+            .with_context(|| format!("failed to inspect {}", path.display()))?
+            .permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(path, permissions)
+            .with_context(|| format!("failed to restrict permissions on {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 pub(crate) fn yaml_key(key: &str) -> Value {

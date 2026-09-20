@@ -228,6 +228,9 @@ pub(crate) enum NodeCommands {
         bind_host: Option<String>,
         #[arg(long)]
         web_port: Option<u16>,
+        /// Required when changing the daemon bind host to a non-loopback address.
+        #[arg(long)]
+        allow_remote_bind: bool,
     },
 }
 

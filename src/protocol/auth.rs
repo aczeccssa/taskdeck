@@ -32,6 +32,7 @@ pub struct PublicNodeSettings {
     pub has_enrollment_token: bool,
     pub bind_host: String,
     pub web_port: u16,
+    pub allow_remote_bind: bool,
     pub execution_enabled: bool,
 }
 
@@ -79,6 +80,8 @@ pub struct NodeSettingsPatch {
     pub bind_host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_remote_bind: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

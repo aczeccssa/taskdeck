@@ -323,6 +323,7 @@ function mockNode(online = true, name = "Mock device"): Json {
         leader_url: "http://leader:9837",
         bind_host: "127.0.0.1",
         web_port: 9837,
+        allow_remote_bind: false,
         enrollment_token: null,
         sessions: ["mock-workspace"],
         last_seen_ms: now()

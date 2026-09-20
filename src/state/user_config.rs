@@ -5,6 +5,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
@@ -15,6 +18,7 @@ const USER_CONFIG_VERSION: u64 = 1;
 pub(super) struct UserNetworkConfig {
     pub(super) bind_host: String,
     pub(super) web_port: u16,
+    pub(super) allow_remote_bind: bool,
     raw: Map<String, Value>,
 }
 
@@ -25,6 +29,12 @@ impl UserNetworkConfig {
         }
         if self.web_port == 0 {
             bail!("taskdeck.json web_port must be greater than zero");
+        }
+        if is_remote_bind_host(&self.bind_host) && !self.allow_remote_bind {
+            bail!(
+                "taskdeck.json bind_host '{}' is remote; set allow_remote_bind=true to opt in",
+                self.bind_host
+            );
         }
         Ok(())
     }
@@ -54,9 +64,16 @@ impl UserNetworkConfig {
             .and_then(Value::as_u64)
             .and_then(|value| u16::try_from(value).ok())
             .with_context(|| format!("{} has invalid web_port", path.display()))?;
+        // v1 files written before the explicit opt-in field are treated as
+        // legacy operator choices and upgraded on the next write.
+        let allow_remote_bind = raw
+            .get("allow_remote_bind")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| is_remote_bind_host(&bind_host));
         let config = Self {
             bind_host,
             web_port,
+            allow_remote_bind,
             raw,
         };
         config.validate()?;
@@ -68,6 +85,10 @@ impl UserNetworkConfig {
         raw.insert("version".to_string(), json!(USER_CONFIG_VERSION));
         raw.insert("bind_host".to_string(), json!(self.bind_host));
         raw.insert("web_port".to_string(), json!(self.web_port));
+        raw.insert(
+            "allow_remote_bind".to_string(),
+            json!(self.allow_remote_bind),
+        );
         Value::Object(raw)
     }
 }
@@ -95,7 +116,9 @@ pub(super) fn load(root: &Path) -> Result<Option<UserNetworkConfig>> {
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let value = serde_json::from_str(&content)
         .with_context(|| format!("failed to parse {}", path.display()))?;
-    UserNetworkConfig::from_value(value, &path).map(Some)
+    let config = UserNetworkConfig::from_value(value, &path)?;
+    restrict_permissions(&path)?;
+    Ok(Some(config))
 }
 
 pub(super) fn load_or_create(root: &Path, legacy: UserNetworkConfig) -> Result<UserNetworkConfig> {
@@ -159,10 +182,34 @@ pub(super) fn write(root: &Path, config: &UserNetworkConfig) -> Result<()> {
 
 pub(super) fn legacy(bind_host: String, web_port: u16) -> UserNetworkConfig {
     UserNetworkConfig {
+        allow_remote_bind: is_remote_bind_host(&bind_host),
         bind_host,
         web_port,
         raw: Map::new(),
     }
+}
+
+pub(super) fn is_remote_bind_host(host: &str) -> bool {
+    match host.trim() {
+        "localhost" | "ip6-localhost" => false,
+        value => value
+            .parse::<std::net::IpAddr>()
+            .map(|address| !address.is_loopback())
+            .unwrap_or(true),
+    }
+}
+
+fn restrict_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(path, permissions)
+            .with_context(|| format!("failed to restrict permissions on {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn sync_parent(root: &Path) -> Result<()> {

@@ -205,11 +205,13 @@ pub(crate) fn write_temp_config_file(path: &Path, content: &str) -> Result<PathB
         file.write_all(content.as_bytes())
             .with_context(|| format!("failed to write {}", temp.display()))?;
 
-        if let Some(permissions) = target_permissions(path)
-            .with_context(|| format!("failed to determine permissions for {}", path.display()))?
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = file.metadata()?.permissions();
+            permissions.set_mode(0o600);
             fs::set_permissions(&temp, permissions)
-                .with_context(|| format!("failed to apply permissions to {}", temp.display()))?;
+                .with_context(|| format!("failed to restrict permissions on {}", temp.display()))?;
         }
 
         file.sync_all()
@@ -223,16 +225,6 @@ pub(crate) fn write_temp_config_file(path: &Path, content: &str) -> Result<PathB
     }
 
     result
-}
-
-pub(crate) fn target_permissions(path: &Path) -> Result<Option<fs::Permissions>> {
-    match fs::metadata(path) {
-        Ok(metadata) => Ok(Some(metadata.permissions())),
-
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-
-        Err(error) => Err(error.into()),
-    }
 }
 
 pub(crate) fn sync_parent_directory(path: &Path) -> Result<()> {

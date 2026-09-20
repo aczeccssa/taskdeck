@@ -16,9 +16,21 @@ impl StateStore {
         let connection = self.connection.lock().expect("state store lock");
         let mut settings = read_node_settings(&connection)?;
         drop(connection);
+        let user_config = self.user_network_config(&settings)?;
         self.apply_user_network_config(&mut settings)?;
         apply_environment(&mut settings)?;
         settings.validate()?;
+        if user_config
+            .as_ref()
+            .is_none_or(|config| !config.allow_remote_bind)
+            && user_config::is_remote_bind_host(&settings.bind_host)
+            && !environment_remote_bind_opt_in()?
+        {
+            bail!(
+                "remote bind host '{}' requires allow_remote_bind=true",
+                settings.bind_host
+            );
+        }
         Ok(settings)
     }
 
@@ -58,6 +70,17 @@ impl StateStore {
             settings.web_port = web_port;
         }
         settings.validate()?;
+        if user_config::is_remote_bind_host(&settings.bind_host)
+            && !previous_network_config
+                .as_ref()
+                .is_some_and(|config| config.allow_remote_bind)
+            && update.allow_remote_bind != Some(true)
+        {
+            bail!(
+                "remote bind host '{}' requires allow_remote_bind=true",
+                settings.bind_host
+            );
+        }
         if !settings.execution_enabled() {
             let count: i64 =
                 connection.query_row("SELECT COUNT(*) FROM registrations", [], |row| row.get(0))?;
@@ -72,6 +95,7 @@ impl StateStore {
                 let mut updated = previous.clone();
                 updated.bind_host = settings.bind_host.clone();
                 updated.web_port = settings.web_port;
+                updated.allow_remote_bind = user_config::is_remote_bind_host(&updated.bind_host);
                 user_config::write(self.root.as_deref().expect("config root exists"), &updated)?;
             }
         }
@@ -130,6 +154,7 @@ impl StateStore {
             },
             bind_host: patch.bind_host.map(|value| value.trim().to_string()),
             web_port: patch.web_port,
+            allow_remote_bind: patch.allow_remote_bind,
         };
         let written = self.configure(update)?;
         let restart_required = original != written;
@@ -283,6 +308,7 @@ impl NodeSettings {
             has_enrollment_token: self.enrollment_token.is_some(),
             bind_host: self.bind_host.clone(),
             web_port: self.web_port,
+            allow_remote_bind: user_config::is_remote_bind_host(&self.bind_host),
             execution_enabled: self.execution_enabled(),
         }
     }
@@ -322,6 +348,7 @@ pub struct NodeSettingsUpdate {
     pub enrollment_token: Option<Option<String>>,
     pub bind_host: Option<String>,
     pub web_port: Option<u16>,
+    pub allow_remote_bind: Option<bool>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeSettingsWrite {
@@ -366,6 +393,16 @@ pub(super) fn write_node_settings(connection: &Connection, settings: &NodeSettin
     Ok(())
 }
 
+fn environment_remote_bind_opt_in() -> Result<bool> {
+    match env::var("TASKDECK_ALLOW_REMOTE_BIND") {
+        Ok(value) => value
+            .parse::<bool>()
+            .with_context(|| "invalid TASKDECK_ALLOW_REMOTE_BIND; expected true or false"),
+        Err(env::VarError::NotPresent) => Ok(false),
+        Err(error) => Err(error).context("failed to read TASKDECK_ALLOW_REMOTE_BIND"),
+    }
+}
+
 pub(super) fn apply_environment(settings: &mut NodeSettings) -> Result<()> {
     if let Ok(value) = env::var("TASKDECK_ROLE") {
         settings.role = NodeRole::parse(&value)?;
@@ -405,6 +442,7 @@ pub fn environment_overrides() -> Vec<crate::protocol::EnvironmentOverride> {
         ("enrollment_token", "TASKDECK_ENROLLMENT_TOKEN"),
         ("bind_host", "TASKDECK_BIND_HOST"),
         ("web_port", "TASKDECK_WEB_PORT"),
+        ("allow_remote_bind", "TASKDECK_ALLOW_REMOTE_BIND"),
     ]
     .into_iter()
     .filter_map(|(field, variable)| {

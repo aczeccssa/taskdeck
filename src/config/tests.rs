@@ -2,6 +2,9 @@
 
 use super::*;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 #[test]
 fn discovers_vscode_tasks_and_yaml_overrides() {
     let dir = tempfile::tempdir().unwrap();
@@ -550,4 +553,44 @@ fn yaml_save_with_explicit_env_clear_removes_existing_task_env() {
 
     let saved = read_session_config(dir.path(), "demo").unwrap();
     assert!(saved.tasks[0].env.is_empty());
+}
+
+#[test]
+fn config_write_restricts_taskdeck_yaml_permissions() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(PROJECT_CONFIG),
+        "version: 1\ntasks:\n  api:\n    command: echo ready\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(
+        dir.path().join(PROJECT_CONFIG),
+        std::os::unix::fs::PermissionsExt::from_mode(0o644),
+    )
+    .unwrap();
+
+    let snapshot = read_session_config(dir.path(), "demo").unwrap();
+
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(dir.path().join(PROJECT_CONFIG))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    write_session_config(dir.path(), &snapshot.revision, snapshot.tasks_to_inputs()).unwrap();
+
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(dir.path().join(PROJECT_CONFIG))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
 }

@@ -4,6 +4,9 @@ use std::fs::{self, File, OpenOptions};
 use std::path::Path;
 use std::sync::Mutex;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
@@ -31,6 +34,7 @@ impl StateStore {
         };
         let connection = Connection::open(&database)
             .with_context(|| format!("failed to open {}/{}", root.display(), DATABASE_FILE))?;
+        restrict_database_permissions(&database)?;
         if let Some(version) = legacy_version.filter(|version| *version < current_schema_version())
         {
             create_backup(&connection, root, version)?;
@@ -277,6 +281,8 @@ impl StateStore {
                  updated_at_ms INTEGER NOT NULL
              );",
         )?;
+        restrict_database_permissions(&database)?;
+        restrict_database_sidecar_permissions(&database)?;
         let store = Self {
             connection: Mutex::new(connection),
             root: Some(root.to_path_buf()),
@@ -297,6 +303,32 @@ impl StateStore {
     }
 }
 
+fn restrict_database_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(path)
+            .with_context(|| format!("failed to inspect {}", path.display()))?
+            .permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(path, permissions)
+            .with_context(|| format!("failed to restrict permissions on {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn restrict_database_sidecar_permissions(path: &Path) -> Result<()> {
+    for suffix in ["-wal", "-shm"] {
+        let sidecar_path = format!("{}{suffix}", path.display());
+        let sidecar = Path::new(&sidecar_path);
+        if sidecar.exists() {
+            restrict_database_permissions(sidecar)?;
+        }
+    }
+    Ok(())
+}
+
 fn current_schema_version() -> u32 {
     SCHEMA_VERSION.parse().expect("schema version is numeric")
 }
@@ -311,6 +343,7 @@ fn acquire_migration_lock(root: &Path) -> Result<File> {
         .with_context(|| format!("failed to open {}", path.display()))?;
     lock.lock_exclusive()
         .with_context(|| format!("failed to acquire migration lock {}", path.display()))?;
+    restrict_database_permissions(&path)?;
     Ok(lock)
 }
 
@@ -399,6 +432,7 @@ fn create_backup(connection: &Connection, root: &Path, version: u32) -> Result<(
     connection
         .execute_batch(&format!("VACUUM INTO '{destination}'"))
         .with_context(|| format!("failed to create migration backup {}", backup.display()))?;
+    restrict_database_permissions(&backup)?;
     let backup_connection = Connection::open_with_flags(&backup, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let integrity: String =
         backup_connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
