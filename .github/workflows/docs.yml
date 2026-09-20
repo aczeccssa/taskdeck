@@ -24,7 +24,7 @@ jobs:
         env:
           BASE_PATH: /${{ github.event.repository.name }}/
           VITE_TASKDECK_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '0.1.0' }}
-        run: bun install && bun run build
+        run: npm install --no-package-lock && npm run build
       - name: Assemble version index
         shell: bash
         run: |
@@ -34,14 +34,19 @@ jobs:
             [ -z "$tag" ] && continue
             mkdir -p "docs-site/dist/versions/$tag"
             if [ "$tag" = "${GITHUB_REF_NAME:-}" ]; then
-              cp -R docs-site/dist/. "docs-site/dist/versions/$tag/"
+              latest_dist="$RUNNER_TEMP/taskdeck-latest-docs"
+              rm -rf "$latest_dist"
+              cp -R docs-site/dist "$latest_dist"
+              rm -rf docs-site/dist/versions
+              mkdir -p "docs-site/dist/versions/$tag"
+              cp -R "$latest_dist/." "docs-site/dist/versions/$tag/"
             else
               archive="$RUNNER_TEMP/docs-$tag"
               rm -rf "$archive"
               mkdir -p "$archive"
               git archive "$tag" docs-site | tar -x -C "$archive"
               if [ -f "$archive/docs-site/package.json" ]; then
-                (cd "$archive/docs-site" && bun install --frozen-lockfile && BASE_PATH="/taskdeck/versions/$tag/" VITE_TASKDECK_VERSION="$(echo "$tag" | cut -c2-)" bun run build)
+                (cd "$archive/docs-site" && npm install --no-package-lock && BASE_PATH="/taskdeck/versions/$tag/" VITE_TASKDECK_VERSION="$(echo "$tag" | cut -c2-)" npm run build)
                 cp -R "$archive/docs-site/dist/." "docs-site/dist/versions/$tag/"
               fi
             fi

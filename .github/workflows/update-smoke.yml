@@ -20,7 +20,7 @@ jobs:
       - name: Build frontend
         run: bun install --cwd frontend --frozen-lockfile && bun run --cwd frontend build
       - name: Build documentation
-        run: bun install --cwd docs-site --frozen-lockfile && bun run --cwd docs-site build
+        run: npm install --prefix docs-site --no-package-lock && npm run build --prefix docs-site
       - name: Test updater twice
         run: |
           cargo test --locked update::tests -- --nocapture
