@@ -53,15 +53,15 @@ jobs:
               fi
             fi
           done
-          python3 - "$tags" "${GITHUB_REF_NAME:-v0.1.0}" <<'PY'
+          python3 - "$tags" <<'PY'
           import json, subprocess, sys
           tags = [tag for tag in sys.argv[1].splitlines() if tag]
           rows = []
           for tag in tags:
-              published = subprocess.check_output(["git", "show", "-s", "--format=%cI", tag], text=True).strip()
+              published = subprocess.check_output(["git", "log", "-1", "--format=%cI", f"{tag}^{{commit}}"], text=True).strip()
               rows.append({"tag": tag, "publishedAt": published, "path": f"/versions/{tag}/", "releaseUrl": f"https://github.com/aczeccssa/taskdeck/releases/tag/{tag}", "checksumsUrl": f"https://github.com/aczeccssa/taskdeck/releases/download/{tag}/SHA256SUMS"})
           with open("docs-site/dist/versions/index.json", "w", encoding="utf-8") as f:
-              json.dump({"latest": sys.argv[2], "versions": rows}, f, indent=2)
+              json.dump({"latest": tags[0] if tags else None, "versions": rows}, f, indent=2)
               f.write("\n")
           PY
           cp docs-site/dist/index.html docs-site/dist/404.html
