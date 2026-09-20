@@ -288,6 +288,8 @@ pub(crate) fn default_task_input(label: &str) -> EditableTaskInput {
 
         env: BTreeMap::new(),
 
+        clear_env: false,
+
         shell: true,
 
         auto_start: false,
@@ -343,7 +345,19 @@ pub(crate) fn build_imported_task_mapping(
         raw.insert(yaml_key("cwd"), yaml_string(&submitted.cwd));
     }
 
-    let env_diff = build_imported_env_diff(base, submitted);
+    let env_diff = if submitted.clear_env {
+        let mut diff = base
+            .env
+            .keys()
+            .map(|key| (key.clone(), None))
+            .collect::<BTreeMap<_, _>>();
+        for (key, value) in &submitted.env {
+            diff.insert(key.clone(), Some(value.clone()));
+        }
+        diff
+    } else {
+        build_imported_env_diff(base, submitted)
+    };
 
     if !env_diff.is_empty() {
         raw.insert(yaml_key("env"), yaml_optional_string_map(&env_diff));

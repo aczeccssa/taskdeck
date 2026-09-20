@@ -37,7 +37,7 @@ export function EnvironmentDialog({
     const rows = scope === "workspace" ? workspaceRows : selectedTask?.envRows ?? [];
     const setRows = (nextRows: EnvironmentRow[]): void => {
         if (scope === "workspace") setWorkspaceRows(nextRows);
-        else updateTask((task) => ({ ...task, envRows: nextRows }));
+        else updateTask((task) => ({ ...task, envRows: nextRows, envChanged: true }));
         setDirty(true);
     };
     const scopeLabel = scope === "workspace" ? "Workspace" : selectedTask?.label || "Current task";

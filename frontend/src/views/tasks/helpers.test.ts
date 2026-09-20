@@ -59,10 +59,12 @@ describe("log matching and stale response reconciliation", () => {
 });
 
 describe("configuration validation", () => {
-    const task = {label: "web", command: "bun run dev", args: [], cwd: ".", envRows: [{key: "A", value: "1"}], shell: true, auto_start: false, stop_timeout_ms: 3000, clear_logs_on_restart: false, schedule: " * * * * * ", origin: {imported: false, has_yaml_override: false}};
+    const task = {label: "web", command: "bun run dev", args: [], cwd: ".", envRows: [{key: "A", value: "1"}], envChanged: false, shell: true, auto_start: false, stop_timeout_ms: 3000, clear_logs_on_restart: false, schedule: " * * * * * ", origin: {imported: false, has_yaml_override: false}};
     test("trims values and rejects invalid configuration", () => {
         const [validated] = validateConfigTasks([{...task, _key: "one"}]);
         expect(validated.schedule).toBe("* * * * *");
+        expect(validated.clear_env).toBe(false);
+        expect(validateConfigTasks([{...task, _key: "one", envRows: [], envChanged: true}])[0].clear_env).toBe(true);
         expect(() => validateConfigTasks([{...task, _key: "one", command: " "}])).toThrow("web: command is required");
         expect(() => validateConfigTasks([{...task, _key: "one"}, {...task, _key: "two"}])).toThrow("Duplicate task label: web");
         expect(() => validateConfigTasks([{...task, _key: "one", stop_timeout_ms: 0}])).toThrow("web: stop timeout must be 1-300000 ms");

@@ -185,6 +185,7 @@ fn write_config_validates_editable_tasks() {
             args: Vec::new(),
             cwd: "".to_string(),
             env: BTreeMap::new(),
+            clear_env: false,
             shell: true,
             auto_start: false,
             stop_timeout_ms: 0,
@@ -369,6 +370,7 @@ fn write_config_rejects_stop_timeout_above_maximum() {
             args: Vec::new(),
             cwd: ".".to_string(),
             env: BTreeMap::new(),
+            clear_env: false,
             shell: true,
             auto_start: false,
             stop_timeout_ms: 300_001,
@@ -507,4 +509,45 @@ fn init_project_creates_empty_template_and_refuses_overwrite() {
 
     let error = init_project(dir.path(), None).unwrap_err().to_string();
     assert!(error.contains("refusing to overwrite"));
+}
+
+#[test]
+fn yaml_save_without_env_preserves_existing_task_env() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(PROJECT_CONFIG),
+        "version: 1\nsession: demo\ntasks:\n  api:\n    command: cargo run\n    cwd: .\n    env:\n      BIFROST_URL: http://127.0.0.1:20080\n",
+    )
+    .unwrap();
+
+    let snapshot = read_session_config(dir.path(), "demo").unwrap();
+    let mut task = snapshot.tasks_to_inputs().remove(0);
+    task.env.clear();
+    task.clear_env = false;
+    write_session_config(dir.path(), &snapshot.revision, vec![task]).unwrap();
+
+    let saved = read_session_config(dir.path(), "demo").unwrap();
+    assert_eq!(
+        saved.tasks[0].env.get("BIFROST_URL").map(String::as_str),
+        Some("http://127.0.0.1:20080")
+    );
+}
+
+#[test]
+fn yaml_save_with_explicit_env_clear_removes_existing_task_env() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(PROJECT_CONFIG),
+        "version: 1\nsession: demo\ntasks:\n  api:\n    command: cargo run\n    cwd: .\n    env:\n      BIFROST_URL: http://127.0.0.1:20080\n",
+    )
+    .unwrap();
+
+    let snapshot = read_session_config(dir.path(), "demo").unwrap();
+    let mut task = snapshot.tasks_to_inputs().remove(0);
+    task.env.clear();
+    task.clear_env = true;
+    write_session_config(dir.path(), &snapshot.revision, vec![task]).unwrap();
+
+    let saved = read_session_config(dir.path(), "demo").unwrap();
+    assert!(saved.tasks[0].env.is_empty());
 }

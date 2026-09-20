@@ -35,7 +35,10 @@ pub struct EditableTaskInput {
     pub command: String,
     pub args: Vec<String>,
     pub cwd: String,
+    #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub clear_env: bool,
     pub shell: bool,
     pub auto_start: bool,
     pub stop_timeout_ms: u64,
@@ -67,6 +70,7 @@ impl SessionConfigSnapshot {
                 args: task.args.clone(),
                 cwd: task.cwd.clone(),
                 env: task.env.clone(),
+                clear_env: false,
                 shell: task.shell,
                 auto_start: task.auto_start,
                 stop_timeout_ms: task.stop_timeout_ms,

@@ -116,6 +116,8 @@ pub(crate) fn load_vscode_tasks(project: &Path) -> Result<LoadedVscodeTasks> {
 
             env: task.options.env,
 
+            clear_env: false,
+
             shell: task.kind == "shell",
 
             auto_start: false,

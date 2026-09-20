@@ -190,6 +190,7 @@ pub(crate) fn load_yaml_document(project: &Path) -> Result<Option<YamlDocument>>
 }
 
 pub(crate) fn build_yaml_task_mapping(submitted: &EditableTaskInput, mut raw: Mapping) -> Mapping {
+    let existing_env = raw.get(yaml_key("env")).cloned();
     clear_known_task_fields(&mut raw);
 
     raw.insert(yaml_key("command"), yaml_string(&submitted.command));
@@ -198,7 +199,11 @@ pub(crate) fn build_yaml_task_mapping(submitted: &EditableTaskInput, mut raw: Ma
 
     raw.insert(yaml_key("cwd"), yaml_string(&submitted.cwd));
 
-    raw.insert(yaml_key("env"), yaml_string_map(&submitted.env));
+    if submitted.clear_env || !submitted.env.is_empty() {
+        raw.insert(yaml_key("env"), yaml_string_map(&submitted.env));
+    } else if let Some(existing_env) = existing_env {
+        raw.insert(yaml_key("env"), existing_env);
+    }
 
     raw.insert(yaml_key("shell"), Value::Bool(submitted.shell));
 

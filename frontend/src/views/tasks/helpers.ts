@@ -95,6 +95,7 @@ export type ConfigTaskDraft = {
     args: string[];
     cwd: string;
     envRows: Array<{key: string; value: string}>;
+    envChanged: boolean;
     shell: boolean;
     auto_start: boolean;
     stop_timeout_ms: number;
@@ -113,6 +114,7 @@ export function taskToDraft(task: Partial<ConfigTaskDraft> & Pick<ConfigTaskDraf
         args: [...(task.args ?? [])],
         cwd: task.cwd || ".",
         envRows: task.envRows ? task.envRows.map((row) => ({...row})) : [],
+        envChanged: Boolean(task.envChanged),
         shell: Boolean(task.shell),
         auto_start: Boolean(task.auto_start),
         stop_timeout_ms: Number(task.stop_timeout_ms || 3000),
@@ -123,7 +125,7 @@ export function taskToDraft(task: Partial<ConfigTaskDraft> & Pick<ConfigTaskDraf
 }
 
 export type ValidatedTask = {
-    label: string; command: string; args: string[]; cwd: string; env: Record<string, string>;
+    label: string; command: string; args: string[]; cwd: string; env: Record<string, string>; clear_env: boolean;
     shell: boolean; auto_start: boolean; stop_timeout_ms: number; clear_logs_on_restart: boolean; schedule: string | null;
 };
 
@@ -147,6 +149,7 @@ export function validateConfigTasks(tasks: readonly ConfigTaskDraft[]): Validate
         });
         return {
             label, command, args: [...task.args], cwd: task.cwd.trim() || ".", env,
+            clear_env: task.envChanged && Object.keys(env).length === 0,
             shell: task.shell, auto_start: task.auto_start, stop_timeout_ms: timeout,
             clear_logs_on_restart: Boolean(task.clear_logs_on_restart),
             schedule: task.schedule ? String(task.schedule).trim() : null,

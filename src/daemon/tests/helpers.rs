@@ -40,6 +40,8 @@ pub(super) fn task_input(label: &str, command: &str) -> EditableTaskInput {
 
         env: Default::default(),
 
+        clear_env: false,
+
         shell: true,
 
         auto_start: false,
