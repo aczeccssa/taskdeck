@@ -26,6 +26,7 @@ ENV TASKDECK_HOME=/var/lib/taskdeck \
     TASKDECK_ROLE=leader \
     TASKDECK_LEADER_MODE=pure_master \
     TASKDECK_BIND_HOST=0.0.0.0 \
+    TASKDECK_ALLOW_REMOTE_BIND=true \
     TASKDECK_WEB_PORT=9837
 
 VOLUME ["/var/lib/taskdeck"]
