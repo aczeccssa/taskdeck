@@ -5,9 +5,9 @@ use std::path::Path;
 use std::sync::Mutex;
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{anyhow, Context, Result, bail};
 use fs2::FileExt;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
@@ -346,14 +346,23 @@ fn current_schema_version() -> u32 {
 
 fn acquire_migration_lock(root: &Path) -> Result<File> {
     let path = root.join("state-migration.lock");
-    let lock = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let lock = options
         .open(&path)
         .with_context(|| format!("failed to open {}", path.display()))?;
-    lock.lock_exclusive()
-        .with_context(|| format!("failed to acquire migration lock {}", path.display()))?;
+    lock.try_lock_exclusive().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            anyhow!(
+                "state migration is already in progress for {}; retry shortly",
+                root.display()
+            )
+        } else {
+            anyhow!(error).context(format!("failed to acquire migration lock {}", path.display()))
+        }
+    })?;
     restrict_database_permissions(&path)?;
     Ok(lock)
 }

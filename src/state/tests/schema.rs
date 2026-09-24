@@ -2,8 +2,9 @@
 
 use std::fs::OpenOptions;
 use std::path::Path;
+use std::process::Command;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 
@@ -104,6 +105,65 @@ fn opening_current_database_does_not_wait_for_migration_lock() {
         receiver.recv_timeout(Duration::from_millis(250)).unwrap(),
         true
     );
+}
+
+#[test]
+fn opening_database_with_migration_in_progress_returns_retryable_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = StateStore::open(dir.path()).unwrap();
+    {
+        let connection = store.connection.lock().unwrap();
+        connection
+            .execute_batch(
+                "UPDATE metadata SET value='7' WHERE key='schema_version'; PRAGMA user_version=7",
+            )
+            .unwrap();
+    }
+    drop(store);
+
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "state::tests::schema::migration_lock_holder_process",
+        ])
+        .env("TASKDECK_TEST_MIGRATION_LOCK_ROOT", dir.path())
+        .spawn()
+        .unwrap();
+    let marker = dir.path().join("lock-held");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !marker.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !marker.exists() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("migration lock helper did not acquire the lock");
+    }
+
+    let result = StateStore::open(dir.path());
+    let _ = child.kill();
+    let _ = child.wait();
+    let error = result.err().expect("held migration lock must fail quickly");
+    assert!(error.to_string().contains("state migration is already in progress"));
+    assert!(error.to_string().contains("retry shortly"));
+}
+
+#[test]
+#[ignore = "spawned as a subprocess by the migration-lock contention test"]
+fn migration_lock_holder_process() {
+    let Ok(root) = std::env::var("TASKDECK_TEST_MIGRATION_LOCK_ROOT") else {
+        return;
+    };
+    let root = Path::new(&root);
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.join("state-migration.lock"))
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    std::fs::write(root.join("lock-held"), b"locked").unwrap();
+    std::thread::sleep(Duration::from_secs(10));
 }
 
 #[test]
