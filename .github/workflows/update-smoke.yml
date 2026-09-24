@@ -44,14 +44,14 @@ jobs:
         run: |
           set -euo pipefail
           trap 'docker rm -f taskdeck-smoke release-fixture 2>/dev/null || true; docker network rm taskdeck-update-smoke 2>/dev/null || true; rm -rf fixture' EXIT
-          mkdir -p fixture/download/v0.2.0/payload
+          mkdir -p fixture/download/v0.3.0/payload
           docker create --name taskdeck-source taskdeck:update-smoke
-          docker cp taskdeck-source:/usr/local/bin/taskdeck fixture/download/v0.2.0/payload/taskdeck
+          docker cp taskdeck-source:/usr/local/bin/taskdeck fixture/download/v0.3.0/payload/taskdeck
           docker rm taskdeck-source
-          tar -czf fixture/download/v0.2.0/taskdeck-v0.2.0-x86_64-unknown-linux-gnu.tar.gz -C fixture/download/v0.2.0/payload taskdeck
-          sha256sum fixture/download/v0.2.0/taskdeck-v0.2.0-x86_64-unknown-linux-gnu.tar.gz | awk '{print $1"  taskdeck-v0.2.0-x86_64-unknown-linux-gnu.tar.gz"}' > fixture/download/v0.2.0/SHA256SUMS
+          tar -czf fixture/download/v0.3.0/taskdeck-v0.3.0-x86_64-unknown-linux-gnu.tar.gz -C fixture/download/v0.3.0/payload taskdeck
+          sha256sum fixture/download/v0.3.0/taskdeck-v0.3.0-x86_64-unknown-linux-gnu.tar.gz | awk '{print $1"  taskdeck-v0.3.0-x86_64-unknown-linux-gnu.tar.gz"}' > fixture/download/v0.3.0/SHA256SUMS
           cat > fixture/latest.json <<'JSON'
-          {"tag_name":"v0.2.0","html_url":"http://fixture:8080/releases/tag/v0.2.0","published_at":"2026-09-20T00:00:00Z","body":"Docker smoke release","assets":[{"name":"taskdeck-v0.2.0-x86_64-unknown-linux-gnu.tar.gz","browser_download_url":"http://fixture:8080/download/v0.2.0/taskdeck-v0.2.0-x86_64-unknown-linux-gnu.tar.gz","size":0}]}
+          {"tag_name":"v0.3.0","html_url":"http://fixture:8080/releases/tag/v0.3.0","published_at":"2026-09-20T00:00:00Z","body":"Docker smoke release","assets":[{"name":"taskdeck-v0.3.0-x86_64-unknown-linux-gnu.tar.gz","browser_download_url":"http://fixture:8080/download/v0.3.0/taskdeck-v0.3.0-x86_64-unknown-linux-gnu.tar.gz","size":0}]}
           JSON
           docker network create taskdeck-update-smoke
           docker run -d --name release-fixture --network taskdeck-update-smoke --network-alias fixture -v "$PWD/fixture:/srv" python:3.12-alpine python -m http.server 8080 --directory /srv
@@ -71,7 +71,7 @@ jobs:
           curl --fail --silent http://127.0.0.1:19837/healthz
           curl --fail --silent http://127.0.0.1:19837/api/version | tee version.json
           curl --fail --silent -X POST http://127.0.0.1:19837/api/update/check | tee update.json
-          grep -q '"latest_version":"0.2.0"' update.json
+          grep -q '"latest_version":"0.3.0"' update.json
           grep -q '"available":true' update.json
-          docker exec release-fixture wget -qO- http://127.0.0.1:8080/download/v0.2.0/SHA256SUMS >/dev/null
+          docker exec release-fixture wget -qO- http://127.0.0.1:8080/download/v0.3.0/SHA256SUMS >/dev/null
           docker logs taskdeck-smoke

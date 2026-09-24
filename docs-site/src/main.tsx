@@ -29,7 +29,7 @@ type Theme = "system" | "light" | "dark";
 type PageId = "quickstart"|"install"|"configure"|"cli"|"webui"|"cluster"|"api"|"mcp"|"operations"|"upgrade"|"troubleshooting"|"releases";
 type Block = {title?: string; text?: string; code?: string; list?: string[]; note?: string};
 type Page = {id:PageId; label:string; group:string; intro:string; blocks:Block[]};
-const version=(import.meta.env.VITE_TASKDECK_VERSION??"0.1.0").replace(/^v/,"");
+const version=(import.meta.env.VITE_TASKDECK_VERSION??"0.2.0").replace(/^v/,"");
 const repo="https://github.com/aczeccssa/taskdeck";
 const release=`${repo}/releases/tag/v${version}`;
 const download=`${repo}/releases/download/v${version}`;
@@ -70,7 +70,7 @@ cargo build --release
 ./scripts/deploy-compose.sh
 # or
 TASKDECK_PORT=9837 docker compose up -d`},
-{title:"Platform requirements",list:["Linux: glibc target x86_64 or arm64; systemd is optional.","macOS: Intel or Apple Silicon; launchd user service is available.","Windows: x86_64 or arm64; Task Scheduler integration uses PowerShell.","The daemon listens on 0.0.0.0:9837 by default; use 127.0.0.1 for local-only access."]}]},
+{title:"Platform requirements",list:["Linux: glibc target x86_64 or arm64; systemd is optional.","macOS: Intel or Apple Silicon; launchd user service is available.","Windows: x86_64 or arm64; Task Scheduler integration uses PowerShell.","Native installs bind to 127.0.0.1 by default. Compose intentionally binds to 0.0.0.0 and opts in with TASKDECK_ALLOW_REMOTE_BIND=true."]}]},
 {id:"configure",label:"Configuration",group:"start",intro:"Configure tasks, environment, node identity and authentication without losing state.",blocks:[
 {title:"taskdeck.yaml",text:"The optional project file overlays imported VS Code tasks. Workspace values are inherited by every task; task env wins over workspace_env.",code:`version: 1
 session: api
@@ -110,6 +110,7 @@ taskdeck resume --session NAME --task TASK
 taskdeck restart --session NAME --task TASK
 taskdeck stop --session NAME`},
 {title:"Node and service management",code:`taskdeck node show
+taskdeck node integrity-check
 taskdeck node configure --role worker --name laptop \
   --leader-url http://leader:9837 --token "$TASKDECK_TOKEN"
 taskdeck service status
@@ -131,7 +132,8 @@ taskdeck status --session api --json`}]},
 {title:"Configure a standard leader",code:`taskdeck node configure --role leader --leader-mode standard \
   --name workstation --token "$TASKDECK_TOKEN"`},
 {title:"Configure a pure master",code:`taskdeck node configure --role leader --leader-mode pure-master \
-  --name master --bind-host 0.0.0.0 --token "$TASKDECK_TOKEN"`},
+  --name master --bind-host 0.0.0.0 --allow-remote-bind \
+  --token "$TASKDECK_TOKEN"`},
 {title:"SSH and reverse proxy",text:"Workers initiate WebSocket connections, so worker ingress is not required. Put TLS directly on Taskdeck or at a trusted reverse proxy before exposing a leader outside a private network. scripts/deploy-ssh.sh probes PowerShell before Unix commands and installs to the platform's user directory."}]},
 {id:"api",label:"REST API",group:"operate",intro:"Automate Taskdeck with the authenticated HTTP API on port 9837.",blocks:[
 {title:"Authentication and version",code:`curl -H "Authorization: Bearer tdk_..." http://127.0.0.1:9837/api/sessions
@@ -178,7 +180,8 @@ taskdeck service start
 
 sudo taskdeck service install --scope system --home /var/lib/taskdeck
 sudo taskdeck service start --scope system`},
-{title:"State and logs",text:"Registrations, task runs, events, workflow revisions and integration records live in TASKDECK_HOME/state.db. Process logs are retained in memory and can be read through the Web UI or logs API."}]},
+{title:"State and logs",text:"Registrations, task runs, events, workflow revisions and integration records live in TASKDECK_HOME/state.db. Process logs are retained in memory and can be read through the Web UI or logs API."},
+{title:"Audit storage and search",text:'Successful Web Snapshot, TaskLogs and TaskMetrics polling requests are not audited. Replicated audit history keeps the newest 10,000 records. While a worker is offline, the oldest 10,000 pending records are kept for replication and the newest 10,000 for local history; pending records in between are discarded once the backlog exceeds 20,000. Search indexes at most the first 4 KiB of each request, response and details JSON field; open a record to inspect its full stored detail. SQLite reuses pages freed by retention, so pruning does not shrink an existing state.db. To reclaim space, stop the daemon, back up TASKDECK_HOME, then run `sqlite3 "${TASKDECK_HOME:-$HOME/.taskdeck}/state.db" "VACUUM; PRAGMA wal_checkpoint(TRUNCATE);"` before restarting. Enrollment tokens are stored as plaintext in the local state.db; protect the state directory and clear unused tokens. Node APIs redact enrollment tokens.'}]},
 {id:"upgrade",label:"Upgrade and rollback",group:"reference",intro:"Updates are release-only, checksum-verified and always user-confirmed.",blocks:[
 {title:"Check or install",code:`taskdeck upgrade --check
 taskdeck upgrade --install
@@ -224,7 +227,7 @@ const detailedDescriptions:Record<string,string>={
   "install:Release binaries":"Release archives are the safest installation path for a machine that does not need a Rust toolchain. Download the archive and checksum file from the same tag, verify before extracting, and install the executable only after the checksum succeeds. The archive also carries the example configuration and license so an installation can be reproduced without checking out the source repository.",
   "install:Build from source":"A source build is useful when testing an unreleased change or packaging Taskdeck for an internal platform. The frontend is compiled into the Rust binary, so the frontend lockfile must be installed before `cargo build`; a successful build can then be copied to a clean host without shipping `node_modules` or a JavaScript runtime.",
   "install:Docker / Compose":"Compose runs a pure-master control plane and keeps project execution on workers that have the real toolchains. Treat the enrollment token as a bootstrap secret: pass it through the environment or a secret store, enroll workers, then rotate or remove it. Bind the port to a private interface until authentication and TLS are configured.",
-  "install:Platform requirements":"The supported archive name encodes both operating system and CPU architecture, which is why a build for macOS arm64 cannot be substituted for Linux arm64. The daemon defaults to port 9837 and binds broadly for cluster use; local development should prefer `127.0.0.1`, while a service deployment should make the bind and firewall policy explicit.",
+  "install:Platform requirements":"The supported archive name encodes both operating system and CPU architecture, which is why a build for macOS arm64 cannot be substituted for Linux arm64. The daemon defaults to port 9837 and binds to `127.0.0.1`; remote access requires the explicit `--allow-remote-bind` option. The Compose example opts in through `TASKDECK_ALLOW_REMOTE_BIND=true`, so protect its port with authentication, TLS, and a private network policy.",
   "configure:taskdeck.yaml":"The project file is intentionally declarative: it can be reviewed, committed, and applied again without losing the daemon database. Workspace environment values form the base, task-level `env` overrides them, and command arguments remain separate from the shell so quoting behaves consistently across platforms. Use `task_order` when the UI needs a stable presentation order; it does not replace dependency gates.",
   "configure:Node roles":"Role selection determines both execution authority and what remote clients can see. A worker owns local processes and may connect outbound; a standard leader also runs its own tasks; a pure master stores coordination state and delegates execution. Choose one stable node name per installation and avoid reusing an identity for two machines, because node IDs are used in API and event records.",
   "configure:Authentication":"Access-key authentication protects HTTP, Web UI, and MCP requests; it is independent from the enrollment token used when a worker first joins a leader. Store the key outside the repository, enable authentication before binding a leader to a shared network, and use `auth status` to verify whether the daemon is enforcing it. Keys are persisted as hashes, so a lost key must be replaced rather than read back.",
@@ -279,7 +282,7 @@ Object.assign(zhIntro,{
   troubleshooting:"任务系统出问题时，要先区分 daemon 健康、进程启动、网络可达性和配置错误。本页按照从本机最便宜的检查到服务和构建诊断的顺序组织排查路径。",
   releases:"Release 不只是上传一个二进制：版本号、校验和、文档快照、服务行为和回滚路径必须一致。本页既说明如何安全使用 Release，也说明发布前如何核对仓库。"
 });
-const zhTitles:Record<string,string>={"Install and open the project":"安装并打开项目","Register a workspace":"注册工作区","Run and inspect a task":"运行并检查任务","Release binaries":"Release 二进制","Build from source":"源码构建","Docker / Compose":"Docker / Compose","Platform requirements":"平台要求","taskdeck.yaml":"taskdeck.yaml 配置文件","Node roles":"节点角色","Authentication":"认证","Environment variables":"环境变量","Workspace lifecycle":"工作区生命周期","Task lifecycle":"任务生命周期","Node and service management":"节点与服务管理","JSON output":"JSON 输出","Web UI":"Web UI","TUI":"TUI 终端界面","Workflow groups":"工作流组","Boards, alerts and history":"看板、告警与历史","Configure a worker":"配置 worker","Configure a standard leader":"配置 standard leader","Configure a pure master":"配置 pure master","SSH and reverse proxy":"SSH 与反向代理","Authentication and version":"认证与版本","Core routes":"核心路由","Boards, tokens and updates":"看板、令牌与更新","Endpoint and configuration":"端点与配置","Scopes":"作用域","Safe automation":"安全自动化","Quotas and dependencies":"配额与依赖","Autoscaling":"自动扩缩容","Native service manager":"原生服务管理","State and logs":"状态与日志","Check or install":"检查或安装","What happens during an upgrade":"升级过程","Manual fallback":"手动回退","Program not found":"找不到程序","Web UI cannot connect":"Web UI 无法连接","Worker is offline":"Worker 离线","Build failures":"构建失败","Versioned docs":"版本化文档","Release checklist":"发布检查清单"};
+const zhTitles:Record<string,string>={"Install and open the project":"安装并打开项目","Register a workspace":"注册工作区","Run and inspect a task":"运行并检查任务","Release binaries":"Release 二进制","Build from source":"源码构建","Docker / Compose":"Docker / Compose","Platform requirements":"平台要求","taskdeck.yaml":"taskdeck.yaml 配置文件","Node roles":"节点角色","Authentication":"认证","Environment variables":"环境变量","Workspace lifecycle":"工作区生命周期","Task lifecycle":"任务生命周期","Node and service management":"节点与服务管理","JSON output":"JSON 输出","Web UI":"Web UI","TUI":"TUI 终端界面","Workflow groups":"工作流组","Boards, alerts and history":"看板、告警与历史","Configure a worker":"配置 worker","Configure a standard leader":"配置 standard leader","Configure a pure master":"配置 pure master","SSH and reverse proxy":"SSH 与反向代理","Authentication and version":"认证与版本","Core routes":"核心路由","Boards, tokens and updates":"看板、令牌与更新","Endpoint and configuration":"端点与配置","Scopes":"作用域","Safe automation":"安全自动化","Quotas and dependencies":"配额与依赖","Autoscaling":"自动扩缩容","Native service manager":"原生服务管理","State and logs":"状态与日志","Audit storage and search":"审计存储与搜索","Check or install":"检查或安装","What happens during an upgrade":"升级过程","Manual fallback":"手动回退","Program not found":"找不到程序","Web UI cannot connect":"Web UI 无法连接","Worker is offline":"Worker 离线","Build failures":"构建失败","Versioned docs":"版本化文档","Release checklist":"发布检查清单"};
 const pages=(lang:Language)=>lang==="en"?enPages:enPages.map(p=>({...p,label:zhLabels[p.id],intro:zhIntro[p.id],blocks:p.blocks.map(b=>({...b,title:b.title?(zhTitles[b.title]??b.title):b.title,note:b.note?"Taskdeck 会在不影响 daemon 运行的情况下记录状态；需要时可从 GitHub Release 手动安装。":b.note}))}));
 const ui={en:{tagline:"PERSISTENT TASK CONTROL PLANE",hero:"Run every project task with a durable control plane.",heroText:"Taskdeck keeps local processes, remote workers, workflows, logs and automation in one observable workspace. One binary powers the CLI, TUI, Web UI and MCP server.",start:"Start in five minutes",releases:"GitHub Releases",search:"Search documentation…",groups:{start:"Get started",work:"Work with Taskdeck",operate:"Operate",reference:"Reference"}},zh:{tagline:"持久化任务控制平面",hero:"让每个项目任务都有可靠的控制平面。",heroText:"Taskdeck 将本地进程、远程 worker、工作流、日志和自动化统一到可观测的工作区。一个二进制同时提供 CLI、TUI、Web UI 和 MCP。",start:"五分钟开始",releases:"GitHub Releases",search:"搜索文档…",groups:{start:"开始使用",work:"使用 Taskdeck",operate:"运行与运维",reference:"参考"}}} as const;
 

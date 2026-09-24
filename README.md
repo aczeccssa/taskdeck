@@ -123,6 +123,7 @@ Inspect and configure the local installation:
 
 ```bash
 taskdeck node show
+taskdeck node integrity-check
 
 # Link this installation to a leader. The worker initiates the connection.
 taskdeck node configure --role worker --name laptop \
@@ -143,8 +144,8 @@ known workers. It never returns an enrollment token. Token updates use
 explicit `keep`, `set`, and `clear` actions. Saving stores settings atomically
 and reports `restart_required` when role, listener, or upstream settings
 changed; Taskdeck does not restart the daemon during the HTTP request. If
-`TASKDECK_*` variables control a field, the UI shows the override and leaves
-that field disabled.
+`TASKDECK_*` variables control a field, the settings API reports the override;
+environment values take precedence over the saved configuration until unset.
 
 Changing node configuration stops the active daemon; the next command starts
 it with the new settings. A standard leader cannot switch to pure master while
@@ -194,6 +195,9 @@ Web UI/API). Container/Compose deployments already set
 `TASKDECK_ALLOW_REMOTE_BIND=true` alongside their intentional `0.0.0.0` bind.
 A legacy `taskdeck.json` with a remote bind but without this field fails closed;
 run `taskdeck node configure --allow-remote-bind` once to acknowledge it.
+The enrollment token is stored as plaintext in the local `state.db`; keep the
+state directory private and clear tokens that are no longer needed. Unix state
+files are created with owner-only permissions.
 
 ## Pure master with Compose
 
@@ -369,6 +373,18 @@ leader's state database and audited on writes.
 
 Task runs, events, and MCP calls are durably stored in each executor/control
 node's SQLite database. Logs remain in memory only.
+
+**Audit retention and search.** Successful Web `Snapshot`, `TaskLogs`, and
+`TaskMetrics` polling requests are not audited. Replicated history keeps the
+newest 10,000 records. While a worker is offline, Taskdeck keeps the oldest
+10,000 pending records for replication and the newest 10,000 for local history;
+pending records between those ranges are discarded when the backlog exceeds
+20,000. Search indexes at most the first 4 KiB of each request, response, and
+details JSON field; opening an audit record shows its full stored detail.
+
+Retention frees SQLite pages for reuse but does not shrink an existing database
+file. To reclaim disk space, stop the daemon and back up the entire state home,
+then run `sqlite3 "${TASKDECK_HOME:-$HOME/.taskdeck}/state.db" "VACUUM; PRAGMA wal_checkpoint(TRUNCATE);"` before restarting Taskdeck.
 
 ## Orchestration, quotas, alerts, and scaling
 

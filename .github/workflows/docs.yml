@@ -25,8 +25,11 @@ jobs:
         working-directory: docs-site
         env:
           BASE_PATH: /${{ github.event.repository.name }}/
-          VITE_TASKDECK_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '0.1.0' }}
-        run: npm install --no-package-lock && npm run build
+          VITE_TASKDECK_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+        run: |
+          VERSION="${VITE_TASKDECK_VERSION:-$(sed -n 's/^version = \"\(.*\)\"/\1/p' ../Cargo.toml | head -1)}"
+          npm install --no-package-lock
+          BASE_PATH="/${GITHUB_REPOSITORY#*/}/" VITE_TASKDECK_VERSION="$VERSION" npm run build
       - name: Assemble version index
         shell: bash
         run: |

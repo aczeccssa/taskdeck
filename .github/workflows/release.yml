@@ -77,13 +77,34 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: {path: artifacts, merge-multiple: true}
+      - name: Prepare release notes
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          tag = os.environ["RELEASE_TAG"]
+          version = tag.removeprefix("v")
+          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          heading = f"## [{version}]"
+          start = changelog.find(heading)
+          if start < 0:
+              raise SystemExit(f"missing changelog section for {tag}")
+          end = changelog.find("\n## ", start + len(heading))
+          notes = changelog[start:end if end >= 0 else None].rstrip()
+          notes += f"\n\nVersioned documentation: https://aczeccssa.github.io/taskdeck/versions/{tag}/\n\nChecksums: SHA256SUMS\n"
+          Path("release-notes.md").write_text(notes, encoding="utf-8")
+          PY
       - name: Checksums
         working-directory: artifacts
         run: sha256sum taskdeck-* > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
-          generate_release_notes: true
-          body: "Versioned documentation: https://aczeccssa.github.io/taskdeck/versions/${{ github.ref_name }}/\n\nChecksums: SHA256SUMS"
+          body_path: release-notes.md
+          generate_release_notes: false
