@@ -35,10 +35,18 @@ jobs:
         run: |
           mkdir -p docs-site/dist/versions
           tags=$(git tag --list 'v*.*.*' --sort=-version:refname)
+          current_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          current_tag="v$current_version"
           git tag --list 'v*.*.*' --sort=-version:refname | while read tag; do
             [ -z "$tag" ] && continue
             mkdir -p "docs-site/dist/versions/$tag"
-            if [ "$tag" = "${GITHUB_REF_NAME:-}" ]; then
+            if [ "$tag" = "$current_tag" ] && git diff --quiet "$tag" HEAD -- Cargo.toml Cargo.lock build.rs src frontend Dockerfile compose.yaml compose/internal-cluster/compose.yaml taskdeck.example.yaml; then
+              versioned_dist="$RUNNER_TEMP/taskdeck-current-version-docs"
+              rm -rf "$versioned_dist"
+              mkdir -p "$versioned_dist"
+              (cd docs-site && BASE_PATH="/${GITHUB_REPOSITORY#*/}/versions/$tag/" VITE_TASKDECK_VERSION="$current_version" npm run build -- --outDir "$versioned_dist")
+              cp -R "$versioned_dist/." "docs-site/dist/versions/$tag/"
+            elif [ "$tag" = "${GITHUB_REF_NAME:-}" ]; then
               latest_dist="$RUNNER_TEMP/taskdeck-latest-docs"
               rm -rf "$latest_dist"
               cp -R docs-site/dist "$latest_dist"

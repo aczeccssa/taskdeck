@@ -2,7 +2,7 @@
 
 Taskdeck 是项目任务的持久控制平面。请先阅读[安装指南](../../#install)，然后配置 worker 或 leader，并在 9837 端口打开 Web UI。
 
-文档内容与 Release 一起维护，因此每个 Git tag 都可以发布对应版本的文档快照。
+每个 Git tag 都有独立的版本文档。Cargo manifest 和运行时代码仍与当前 Release tag 一致时，`master` 上的文档修正也会更新该版本路径；更早的版本继续使用各自 tag 中的文档。
 
 ## 当前版本：v0.2.0
 
