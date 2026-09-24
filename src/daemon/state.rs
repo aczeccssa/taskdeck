@@ -123,6 +123,12 @@ impl DaemonState {
 
         let settings = store.node_settings()?;
 
+        store.finish_running_task_runs(
+            &settings.node_id,
+            "failed",
+            "daemon restarted before run completion",
+        )?;
+
         let cluster = LeaderCluster::new(store.clone(), settings.enrollment_token.clone())?;
 
         let node_metrics = cluster.node_metrics();

@@ -221,6 +221,12 @@ pub(super) fn spawn_task_scheduler(state: DaemonState) -> thread::JoinHandle<()>
                         );
                     }
                     Some(Ok(false)) => {
+                        let snapshot = sessions
+                            .get_mut(&key.session)
+                            .and_then(|runtime| runtime.snapshot(0).ok())
+                            .and_then(|session| {
+                                session.tasks.into_values().find(|task| task.label == key.task)
+                            });
                         drop(sessions);
                         state
                             .run_triggers
@@ -232,6 +238,18 @@ pub(super) fn spawn_task_scheduler(state: DaemonState) -> thread::JoinHandle<()>
                             "scheduled task already running; execution skipped",
                             serde_json::json!({"session":key.session,"task":key.task}),
                         );
+                        if let Some(snapshot) = snapshot {
+                            let node_id = state.public_settings().node_id;
+                            if let Err(error) = state.store.record_task_run_skipped(
+                                &node_id,
+                                &snapshot,
+                                "cron",
+                                &key.session,
+                                "task was already running; scheduled execution skipped",
+                            ) {
+                                eprintln!("failed to persist skipped scheduled run: {error:#}");
+                            }
+                        }
                         let _ = record_audit_value(
                             &state,
                             AuditContext::new(AuditSource::Scheduler, AuditTransport::Internal),

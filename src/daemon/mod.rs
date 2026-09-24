@@ -235,4 +235,13 @@ fn stop_all(state: &DaemonState) {
     for session in sessions.values_mut() {
         session.stop_all();
     }
+    drop(sessions);
+    let node_id = state.public_settings().node_id;
+    if let Err(error) = state.store.finish_running_task_runs(
+        &node_id,
+        "stopped",
+        "daemon stopped while run was active",
+    ) {
+        eprintln!("failed to finish task run history during shutdown: {error:#}");
+    }
 }

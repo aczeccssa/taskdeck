@@ -122,17 +122,78 @@ impl StateStore {
         session: &str,
         error_message: impl Into<String>,
     ) -> Result<Option<TaskRunRecord>> {
+        self.record_terminal_task_run_attempt(
+            node_id,
+            snapshot,
+            trigger,
+            session,
+            "failed",
+            error_message,
+        )
+    }
+
+    pub fn record_task_run_skipped(
+        &self,
+        node_id: &str,
+        snapshot: &crate::protocol::TaskSnapshot,
+        trigger: &str,
+        session: &str,
+        reason: impl Into<String>,
+    ) -> Result<Option<TaskRunRecord>> {
+        self.record_terminal_task_run_attempt(
+            node_id, snapshot, trigger, session, "skipped", reason,
+        )
+    }
+
+    fn record_terminal_task_run_attempt(
+        &self,
+        node_id: &str,
+        snapshot: &crate::protocol::TaskSnapshot,
+        trigger: &str,
+        session: &str,
+        status: &str,
+        error_message: impl Into<String>,
+    ) -> Result<Option<TaskRunRecord>> {
         let finished_at_ms = current_timestamp_ms();
         let mut attempt = snapshot.clone();
         attempt.started_at_ms = finished_at_ms;
-        self.start_task_run(
-            node_id,
-            &attempt,
-            trigger,
-            session,
-            Some(error_message.into()),
-            Some(finished_at_ms),
-        )
+        let command = attempt.command.clone();
+        let cwd = attempt.cwd.to_string_lossy().into_owned();
+        let error_message = error_message.into();
+        let connection = self.connection.lock().expect("state store lock");
+        connection.execute("INSERT INTO task_runs(node_id,session,task,trigger,status,started_at_ms,finished_at_ms,duration_ms,command,cwd,pid,run_generation,exit_code,error_message) VALUES (?1,?2,?3,?4,?5,?6,?7,0,?8,?9,?10,?11,?12,?13)", params![node_id,session,attempt.label,trigger,status,finished_at_ms as i64,finished_at_ms as i64,command,cwd,attempt.pid.map(|v| v as i64),attempt.run_generation as i64,None::<i64>,error_message])?;
+        Ok(Some(TaskRunRecord {
+            id: connection.last_insert_rowid() as u64,
+            node_id: node_id.to_string(),
+            session: session.to_string(),
+            task: attempt.label,
+            trigger: trigger.to_string(),
+            status: status.to_string(),
+            started_at_ms: finished_at_ms,
+            finished_at_ms: Some(finished_at_ms),
+            duration_ms: Some(0),
+            command,
+            cwd: attempt.cwd,
+            pid: attempt.pid,
+            run_generation: attempt.run_generation,
+            exit_code: None,
+            error_message: Some(error_message),
+        }))
+    }
+
+    pub fn finish_running_task_runs(
+        &self,
+        node_id: &str,
+        status: &str,
+        reason: &str,
+    ) -> Result<usize> {
+        let finished = current_timestamp_ms();
+        let connection = self.connection.lock().expect("state store lock");
+        let updated = connection.execute(
+            "UPDATE task_runs SET status=?2,finished_at_ms=?3,duration_ms=MAX(0,?3-started_at_ms),error_message=?4 WHERE node_id=?1 AND status='running'",
+            params![node_id, status, finished as i64, reason],
+        )?;
+        Ok(updated)
     }
 
     /// Avoid the scheduler/history sampler double-write without treating a
