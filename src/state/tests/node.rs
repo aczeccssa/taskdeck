@@ -132,6 +132,22 @@ fn default_network_config_is_loopback_and_secret_files_are_private() {
 }
 
 #[test]
+fn explicit_remote_bind_opt_in_is_reported_even_while_bound_to_loopback() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = StateStore::open(dir.path()).unwrap();
+    let result = store
+        .configure_patch(NodeSettingsPatch {
+            allow_remote_bind: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+
+    assert_eq!(result.settings.bind_host, "127.0.0.1");
+    assert!(result.settings.allow_remote_bind);
+    assert!(store.node_settings().unwrap().public().allow_remote_bind);
+}
+
+#[test]
 fn remote_network_binding_requires_explicit_opt_in() {
     let dir = tempfile::tempdir().unwrap();
     let store = StateStore::open(dir.path()).unwrap();

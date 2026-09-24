@@ -20,17 +20,22 @@ impl StateStore {
         self.apply_user_network_config(&mut settings)?;
         apply_environment(&mut settings)?;
         settings.validate()?;
+        let environment_allows_remote_bind = environment_remote_bind_opt_in()?;
         if user_config
             .as_ref()
             .is_none_or(|config| !config.allow_remote_bind)
             && user_config::is_remote_bind_host(&settings.bind_host)
-            && !environment_remote_bind_opt_in()?
+            && !environment_allows_remote_bind
         {
             bail!(
                 "remote bind host '{}' requires allow_remote_bind=true",
                 settings.bind_host
             );
         }
+        settings.allow_remote_bind = user_config
+            .as_ref()
+            .is_some_and(|config| config.allow_remote_bind)
+            || environment_allows_remote_bind;
         Ok(settings)
     }
 
@@ -41,6 +46,7 @@ impl StateStore {
         if let Some(config) = &previous_network_config {
             settings.bind_host = config.bind_host.clone();
             settings.web_port = config.web_port;
+            settings.allow_remote_bind = config.allow_remote_bind;
         }
         let network_changed = update.bind_host.is_some()
             || update.web_port.is_some()
@@ -76,6 +82,7 @@ impl StateStore {
             .allow_remote_bind
             .or_else(|| previous_network_config.as_ref().map(|config| config.allow_remote_bind))
             .unwrap_or(false);
+        settings.allow_remote_bind = allow_remote_bind;
         if user_config::is_remote_bind_host(&settings.bind_host) && !allow_remote_bind {
             bail!(
                 "remote bind host '{}' requires allow_remote_bind=true",
@@ -160,7 +167,8 @@ impl StateStore {
             web_port: patch.web_port,
             allow_remote_bind: patch.allow_remote_bind,
         };
-        let written = self.configure(update)?;
+        self.configure(update)?;
+        let written = self.node_settings()?;
         let restart_required = original != written;
         Ok(crate::protocol::NodeSettingsWriteResult {
             settings: written.public(),
@@ -313,6 +321,7 @@ pub struct NodeSettings {
     pub enrollment_token: Option<String>,
     pub bind_host: String,
     pub web_port: u16,
+    pub allow_remote_bind: bool,
 }
 
 impl NodeSettings {
@@ -330,7 +339,7 @@ impl NodeSettings {
             has_enrollment_token: self.enrollment_token.is_some(),
             bind_host: self.bind_host.clone(),
             web_port: self.web_port,
-            allow_remote_bind: user_config::is_remote_bind_host(&self.bind_host),
+            allow_remote_bind: self.allow_remote_bind,
             execution_enabled: self.execution_enabled(),
         }
     }
@@ -397,6 +406,7 @@ pub(super) fn read_node_settings(connection: &Connection) -> Result<NodeSettings
         enrollment_token: get_metadata(connection, "enrollment_token")?,
         bind_host: required_metadata(connection, "bind_host")?,
         web_port,
+        allow_remote_bind: false,
     })
 }
 
