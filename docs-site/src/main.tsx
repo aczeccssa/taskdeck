@@ -37,13 +37,13 @@ externalizeLinks();
 
 const enPages:Page[]=[
 {id:"quickstart",label:"Quick start",group:"start",intro:"Install one binary, register a workspace, and start a task.",blocks:[
-{title:"Install and open the project",text:"Use the installer for your platform, then run Taskdeck from the project directory. The first run creates ~/.taskdeck/state.db.",code:`# macOS / Linux
-./scripts/install-local.sh
+{title:"Install and open the project",text:"Use the release installer for your platform, then run Taskdeck from the project directory. The first run creates ~/.taskdeck/state.db.",code:`# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/aczeccssa/taskdeck/master/scripts/install.sh | bash
 cd /path/to/project
 taskdeck
 
 # Windows PowerShell
-.\\scripts\\install-local.ps1
+irm https://raw.githubusercontent.com/aczeccssa/taskdeck/master/scripts/install.ps1 | iex
 Set-Location C:\\path\\to\\project
 taskdeck.exe`},
 {title:"Register a workspace",text:"init imports .vscode/tasks.json when present and creates taskdeck.yaml. register only records an existing configuration.",code:`taskdeck init --project ./my-app --session api
@@ -55,7 +55,10 @@ taskdeck logs --session api --task "Run Backend API"
 taskdeck stop --session api`},
 {note:"Running taskdeck without a subcommand opens the TUI. Detaching the TUI does not stop managed tasks."}]},
 {id:"install",label:"Installation",group:"start",intro:"Choose a release binary, build from source, or run a pure master with Compose.",blocks:[
-{title:"Release binaries",text:"Every stable tag publishes Linux x86_64/arm64, macOS x86_64/arm64 and Windows x86_64/arm64 archives with LICENSE, README.md, taskdeck.example.yaml and SHA256SUMS.",code:`# Linux x86_64 example
+{title:"Release binaries",text:"Every stable tag publishes Linux x86_64/arm64, macOS x86_64/arm64 and Windows x86_64/arm64 archives with LICENSE, README.md, taskdeck.example.yaml and SHA256SUMS. The shell and PowerShell installers select the matching platform archive and verify it before installing.",code:`# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/aczeccssa/taskdeck/master/scripts/install.sh | bash
+
+# Download a release archive manually
 curl -LO ${download}/taskdeck-v${version}-x86_64-unknown-linux-gnu.tar.gz
 curl -LO ${download}/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing

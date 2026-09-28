@@ -14,18 +14,27 @@ operate on the daemon's live state.
 ## Install and standalone use
 
 ```bash
-./scripts/install-local.sh
+curl -fsSL https://raw.githubusercontent.com/aczeccssa/taskdeck/master/scripts/install.sh | bash
 cd /path/to/project
 taskdeck
 ```
 
-On Windows, use PowerShell:
+The installer downloads the matching Linux/macOS release and verifies its
+SHA256 checksum before replacing the executable. It installs to
+`~/.cargo/bin` by default; set `TASKDECK_INSTALL_DIR` to choose another
+directory. To build from the current source checkout, use
+`./scripts/install-local.sh` instead.
+
+On Windows, install the matching release binary with PowerShell:
 
 ```powershell
-.\scripts\install-local.ps1
+irm https://raw.githubusercontent.com/aczeccssa/taskdeck/master/scripts/install.ps1 | iex
 Set-Location C:\path\to\project
 taskdeck.exe
 ```
+
+To build from the current source checkout, use
+`./scripts/install-local.ps1` instead.
 
 The default installation is an unlinked `worker`, preserving the normal local
 workflow. Project registrations and node settings are stored in
