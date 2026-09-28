@@ -43,15 +43,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          trap 'docker rm -f taskdeck-smoke release-fixture 2>/dev/null || true; docker network rm taskdeck-update-smoke 2>/dev/null || true; rm -rf fixture' EXIT
-          mkdir -p fixture/download/v0.3.0/payload
+          trap 'docker rm -f taskdeck-smoke release-fixture taskdeck-source 2>/dev/null || true; docker network rm taskdeck-update-smoke 2>/dev/null || true; rm -rf fixture' EXIT
+          # The smoke run must see a release that is strictly newer than the binary under
+          # test, so derive the fake tag instead of pinning one. A hardcoded v0.3.0 stopped
+          # working the moment the crate version reached 0.3.0: latest > current was no
+          # longer true, so the update was correctly reported as unavailable.
+          current=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ -n "$current" ] || { echo 'could not read Cargo.toml version' >&2; exit 1; }
+          next=$(python3 -c "import sys; v=[int(p) for p in sys.argv[1].split('.')]; print(f'{v[0]}.{v[1]}.{v[2] + 1}')" "$current")
+          tag="v$next"
+          asset="taskdeck-$tag-x86_64-unknown-linux-gnu.tar.gz"
+          echo "binary under test: $current; fake release: $tag"
+          mkdir -p "fixture/download/$tag/payload"
           docker create --name taskdeck-source taskdeck:update-smoke
-          docker cp taskdeck-source:/usr/local/bin/taskdeck fixture/download/v0.3.0/payload/taskdeck
+          docker cp taskdeck-source:/usr/local/bin/taskdeck "fixture/download/$tag/payload/taskdeck"
           docker rm taskdeck-source
-          tar -czf fixture/download/v0.3.0/taskdeck-v0.3.0-x86_64-unknown-linux-gnu.tar.gz -C fixture/download/v0.3.0/payload taskdeck
-          sha256sum fixture/download/v0.3.0/taskdeck-v0.3.0-x86_64-unknown-linux-gnu.tar.gz | awk '{print $1"  taskdeck-v0.3.0-x86_64-unknown-linux-gnu.tar.gz"}' > fixture/download/v0.3.0/SHA256SUMS
-          cat > fixture/latest.json <<'JSON'
-          {"tag_name":"v0.3.0","html_url":"http://fixture:8080/releases/tag/v0.3.0","published_at":"2026-09-20T00:00:00Z","body":"Docker smoke release","assets":[{"name":"taskdeck-v0.3.0-x86_64-unknown-linux-gnu.tar.gz","browser_download_url":"http://fixture:8080/download/v0.3.0/taskdeck-v0.3.0-x86_64-unknown-linux-gnu.tar.gz","size":0}]}
+          tar -czf "fixture/download/$tag/$asset" -C "fixture/download/$tag/payload" taskdeck
+          sha256sum "fixture/download/$tag/$asset" | awk -v name="$asset" '{print $1"  "name}' > "fixture/download/$tag/SHA256SUMS"
+          cat > fixture/latest.json <<JSON
+          {"tag_name":"$tag","html_url":"http://fixture:8080/releases/tag/$tag","published_at":"2026-09-20T00:00:00Z","body":"Docker smoke release","assets":[{"name":"$asset","browser_download_url":"http://fixture:8080/download/$tag/$asset","size":0}]}
           JSON
           docker network create taskdeck-update-smoke
           docker run -d --name release-fixture --network taskdeck-update-smoke --network-alias fixture -v "$PWD/fixture:/srv" python:3.12-alpine python -m http.server 8080 --directory /srv
@@ -71,7 +81,7 @@ jobs:
           curl --fail --silent http://127.0.0.1:19837/healthz
           curl --fail --silent http://127.0.0.1:19837/api/version | tee version.json
           curl --fail --silent -X POST http://127.0.0.1:19837/api/update/check | tee update.json
-          grep -q '"latest_version":"0.3.0"' update.json
+          grep -q "\"latest_version\":\"$next\"" update.json
           grep -q '"available":true' update.json
-          docker exec release-fixture wget -qO- http://127.0.0.1:8080/download/v0.3.0/SHA256SUMS >/dev/null
+          docker exec release-fixture wget -qO- "http://127.0.0.1:8080/download/$tag/SHA256SUMS" >/dev/null
           docker logs taskdeck-smoke
