@@ -142,6 +142,10 @@ pub(crate) fn init_project(
     validate_session_name(&session)?;
 
     let mut root = Mapping::new();
+    root.insert(
+        yaml_key("$schema"),
+        Value::String(crate::schema::DEFAULT_SCHEMA_URL.to_owned()),
+    );
     root.insert(yaml_key("version"), Value::from(1u32));
     root.insert(yaml_key("session"), yaml_string(&session));
     root.insert(

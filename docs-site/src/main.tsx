@@ -72,7 +72,8 @@ cargo build --release
 TASKDECK_PORT=9837 docker compose up -d`},
 {title:"Platform requirements",list:["Linux: glibc target x86_64 or arm64; systemd is optional.","macOS: Intel or Apple Silicon; launchd user service is available.","Windows: x86_64 or arm64; Task Scheduler integration uses PowerShell.","Native installs bind to 127.0.0.1 by default. Compose intentionally binds to 0.0.0.0 and opts in with TASKDECK_ALLOW_REMOTE_BIND=true."]}]},
 {id:"configure",label:"Configuration",group:"start",intro:"Configure tasks, environment, node identity and authentication without losing state.",blocks:[
-{title:"taskdeck.yaml",text:"The optional project file overlays imported VS Code tasks. Workspace values are inherited by every task; task env wins over workspace_env.",code:`version: 1
+{title:"taskdeck.yaml",text:"The optional project file overlays imported VS Code tasks. Workspace values are inherited by every task; task env wins over workspace_env.",code:`$schema: https://aczeccssa.github.io/taskdeck/schema.json
+version: 1
 session: api
 workspace_env:
   APP_ENV: development
@@ -118,6 +119,8 @@ taskdeck service install --scope user
 taskdeck service start
 taskdeck service stop
 taskdeck service uninstall`},
+{title:"Schema validation",text:"New taskdeck.yaml files point editors at the published schema. Config loading validates offline against a valid updated cache or bundled schema; this command checks the remote schema first, then the synchronized cache and bundled fallback.",code:`taskdeck schema check --project PATH
+taskdeck schema update`,note:"Schema metadata uses its own x-taskdeck-schema-version, currently 1.0.0, independent of the Taskdeck binary release."},
 {title:"JSON output",code:`taskdeck --json list
 taskdeck status --session api --json`}]},
 {id:"webui",label:"Web UI, TUI and workflows",group:"work",intro:"Use the same daemon state from a browser, terminal or automation client.",blocks:[
@@ -283,8 +286,9 @@ Object.assign(zhIntro,{
   troubleshooting:"任务系统出问题时，要先区分 daemon 健康、进程启动、网络可达性和配置错误。本页按照从本机最便宜的检查到服务和构建诊断的顺序组织排查路径。",
   releases:"Release 不只是上传一个二进制：版本号、校验和、文档快照、服务行为和回滚路径必须一致。本页既说明如何安全使用 Release，也说明发布前如何核对仓库。"
 });
-const zhTitles:Record<string,string>={"Install and open the project":"安装并打开项目","Register a workspace":"注册工作区","Run and inspect a task":"运行并检查任务","Release binaries":"Release 二进制","Build from source":"源码构建","Docker / Compose":"Docker / Compose","Platform requirements":"平台要求","taskdeck.yaml":"taskdeck.yaml 配置文件","Node roles":"节点角色","Authentication":"认证","Environment variables":"环境变量","Workspace lifecycle":"工作区生命周期","Task lifecycle":"任务生命周期","Node and service management":"节点与服务管理","JSON output":"JSON 输出","Web UI":"Web UI","TUI":"TUI 终端界面","Workflow groups":"工作流组","Boards, alerts and history":"看板、告警与历史","Configure a worker":"配置 worker","Configure a standard leader":"配置 standard leader","Configure a pure master":"配置 pure master","SSH and reverse proxy":"SSH 与反向代理","Authentication and version":"认证与版本","Core routes":"核心路由","Boards, tokens and updates":"看板、令牌与更新","Endpoint and configuration":"端点与配置","Scopes":"作用域","Safe automation":"安全自动化","Quotas and dependencies":"配额与依赖","Autoscaling":"自动扩缩容","Native service manager":"原生服务管理","State and logs":"状态与日志","Audit storage and search":"审计存储与搜索","Check or install":"检查或安装","What happens during an upgrade":"升级过程","Manual fallback":"手动回退","Program not found":"找不到程序","Web UI cannot connect":"Web UI 无法连接","Worker is offline":"Worker 离线","Build failures":"构建失败","Known limits":"已知限制","Versioned docs":"版本化文档","Release checklist":"发布检查清单"};
+const zhTitles:Record<string,string>={"Install and open the project":"安装并打开项目","Register a workspace":"注册工作区","Run and inspect a task":"运行并检查任务","Release binaries":"Release 二进制","Build from source":"源码构建","Docker / Compose":"Docker / Compose","Platform requirements":"平台要求","taskdeck.yaml":"taskdeck.yaml 配置文件","Node roles":"节点角色","Authentication":"认证","Environment variables":"环境变量","Workspace lifecycle":"工作区生命周期","Task lifecycle":"任务生命周期","Node and service management":"节点与服务管理","Schema validation":"Schema 校验","JSON output":"JSON 输出","Web UI":"Web UI","TUI":"TUI 终端界面","Workflow groups":"工作流组","Boards, alerts and history":"看板、告警与历史","Configure a worker":"配置 worker","Configure a standard leader":"配置 standard leader","Configure a pure master":"配置 pure master","SSH and reverse proxy":"SSH 与反向代理","Authentication and version":"认证与版本","Core routes":"核心路由","Boards, tokens and updates":"看板、令牌与更新","Endpoint and configuration":"端点与配置","Scopes":"作用域","Safe automation":"安全自动化","Quotas and dependencies":"配额与依赖","Autoscaling":"自动扩缩容","Native service manager":"原生服务管理","State and logs":"状态与日志","Audit storage and search":"审计存储与搜索","Check or install":"检查或安装","What happens during an upgrade":"升级过程","Manual fallback":"手动回退","Program not found":"找不到程序","Web UI cannot connect":"Web UI 无法连接","Worker is offline":"Worker 离线","Build failures":"构建失败","Known limits":"已知限制","Versioned docs":"版本化文档","Release checklist":"发布检查清单"};
 const zhTexts:Record<string,string>={
+  "cli:Schema validation":"新 taskdeck.yaml 会包含供编辑器使用的 schema URL。配置加载时离线使用有效缓存或内嵌 schema 校验；显式 check 按远程、已同步缓存、内嵌副本的顺序选择来源。schema 版本由 x-taskdeck-schema-version 单独管理，当前为 1.0.0，与 Taskdeck 二进制版本无关。",
   [`releases:v${version}`]:"Taskdeck 0.2.0 聚焦运维可靠性和更安全的默认值：审计历史采用有界保留并限制搜索摘要；当前 schema 数据库打开时不再争抢迁移锁；更多定时任务结果会写入历史；原生安装需要显式授权才能远程监听。本版还说明 SQLite 空间回收步骤和已知后续限制。下载时请从同一个 tag 获取平台归档和 SHA256SUMS。",
   "releases:Known limits":"Taskdeck 离线期间错过的定时触发不会补跑。本次复审未能独立复现所报告的生产历史缺口或任务服务重启问题；范围和后续验证要求见 CHANGELOG.md。",
   "releases:Versioned docs":"官网根路径提供当前文档，每个稳定 tag 在 `/versions/<tag>/` 下有独立版本路径。只有当 Cargo 版本和运行时代码仍与当前 Release tag 一致时，master 上的文档修正才会同步到该版本路径；更早版本仍从各自 tag 构建。版本索引列出 Release、校验和及文档链接。",

@@ -497,6 +497,7 @@ fn init_project_materializes_vscode_tasks_without_overwriting_source() {
     );
     let yaml = fs::read_to_string(initialized.config_path).unwrap();
     assert!(yaml.contains("session: demo"));
+    assert!(yaml.contains("$schema: https://aczeccssa.github.io/taskdeck/schema.json"));
     assert!(yaml.contains("command: cargo"));
     assert!(yaml.contains("command: npm"));
     assert!(yaml.contains("task_order:"));
@@ -507,11 +508,26 @@ fn init_project_creates_empty_template_and_refuses_overwrite() {
     let dir = tempfile::tempdir().unwrap();
     let initialized = init_project(dir.path(), None).unwrap();
     let yaml = fs::read_to_string(&initialized.config_path).unwrap();
+    assert!(yaml.contains("$schema: https://aczeccssa.github.io/taskdeck/schema.json"));
     assert!(yaml.contains("version: 1"));
     assert!(yaml.contains("tasks: {}"));
 
     let error = init_project(dir.path(), None).unwrap_err().to_string();
     assert!(error.contains("refusing to overwrite"));
+}
+
+#[test]
+fn historical_yaml_without_schema_pointer_remains_valid() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(PROJECT_CONFIG),
+        "version: 1\nsession: legacy\ntasks:\n  api:\n    command: cargo\n    args: [run]\n",
+    )
+    .unwrap();
+
+    let definition = discover(dir.path(), None).unwrap();
+    assert_eq!(definition.session, "legacy");
+    assert_eq!(definition.tasks["api"].program, "cargo");
 }
 
 #[test]

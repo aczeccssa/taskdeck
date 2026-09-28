@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://aczeccssa.github.io/taskdeck/schema.json",
+  "title": "Taskdeck project configuration",
+  "description": "Validates taskdeck.yaml project configuration files.",
+  "x-taskdeck-schema-version": "1.0.0",
+  "type": ["object", "null"],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "const": "https://aczeccssa.github.io/taskdeck/schema.json",
+      "description": "URL used by YAML editor integrations."
+    },
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "session": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "workspace_env": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "task_order": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "tasks": {
+      "type": ["object", "null"],
+      "propertyNames": { "type": "string", "minLength": 1 },
+      "additionalProperties": {
+        "type": ["object", "null"],
+        "properties": {
+          "enabled": { "type": ["boolean", "null"] },
+          "command": { "type": ["string", "null"] },
+          "args": {
+            "type": ["array", "null"],
+            "items": { "type": "string" }
+          },
+          "cwd": { "type": ["string", "null"] },
+          "env": {
+            "type": ["object", "null"],
+            "additionalProperties": { "type": ["string", "null"] }
+          },
+          "shell": { "type": ["boolean", "null"] },
+          "auto_start": { "type": ["boolean", "null"] },
+          "stop_timeout_ms": {
+            "type": ["integer", "null"],
+            "minimum": 1,
+            "maximum": 300000
+          },
+          "clear_logs_on_restart": { "type": ["boolean", "null"] },
+          "schedule": { "type": ["string", "null"], "minLength": 1 }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

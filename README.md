@@ -60,6 +60,8 @@ taskdeck init --project /path/to/project --session api
 # Register an existing configuration without creating files.
 taskdeck register --project /path/to/project --session api
 taskdeck update --project /path/to/project --session api
+taskdeck schema check --project /path/to/project
+taskdeck schema update
 taskdeck list
 taskdeck workspace list
 taskdeck workspace set-alias --session api --alias "Backend API"
@@ -81,6 +83,20 @@ flag for the original machine-readable response format, for example
 to overwrite an existing `taskdeck.yaml` and leaves `.vscode/tasks.json`
 untouched; `remove` remains available as a compatibility alias for the
 unregister operation.
+
+`taskdeck init` adds a `$schema` URL to new `taskdeck.yaml` files for editor
+validation. Existing files may omit it; Taskdeck keeps those files compatible
+and validates them offline against the valid cached Draft 7 schema when it is
+at least as new as the bundled copy, otherwise the bundled schema.
+`taskdeck schema check` prefers the published schema, then the local
+`$TASKDECK_HOME/schema.json` cache (by default `~/.taskdeck/schema.json`), then
+the bundled copy.
+`taskdeck schema update` downloads the published schema and atomically
+synchronizes that cache.
+The schema document tracks its own `x-taskdeck-schema-version` (currently
+`1.0.0`), independently of the Taskdeck binary version. Remote schema checks
+have a five-second timeout and a 1 MiB response limit; config loading never
+needs a network connection. Set `TASKDECK_SCHEMA_URL` to use a mirror.
 
 A workspace alias is only a display name in the Web UI, CLI, and TUI. The
 stable `session` identifier, project path, `taskdeck.yaml`, and MCP arguments

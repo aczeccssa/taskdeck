@@ -173,6 +173,8 @@ pub(crate) fn load_yaml_document(project: &Path) -> Result<Option<YamlDocument>>
         }
     }
 
+    crate::schema::validate_local_yaml_value(&Value::Mapping(root.clone()), &path)?;
+
     Ok(Some(YamlDocument {
         workspace_env: config.workspace_env,
 

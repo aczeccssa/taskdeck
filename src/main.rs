@@ -4,6 +4,7 @@ mod daemon;
 mod platform_service;
 mod protocol;
 mod runtime;
+mod schema;
 mod service;
 mod state;
 mod tui;
@@ -131,11 +132,24 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: ServiceCommands,
     },
+    /// Check taskdeck.yaml against the published Taskdeck schema.
+    Schema {
+        #[command(subcommand)]
+        command: SchemaCommands,
+    },
     /// Configure single-user access-key authentication.
     Auth {
         #[command(subcommand)]
         command: AuthCommands,
     },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum SchemaCommands {
+    /// Validate the project config using remote, cached, then bundled schema.
+    Check,
+    /// Download and synchronize the remote schema into the local cache.
+    Update,
 }
 
 #[derive(Subcommand)]
@@ -282,6 +296,9 @@ async fn run(cli: Cli) -> Result<()> {
     if let Some(Commands::Upgrade { check, install, background }) = cli.command {
         return run_upgrade_command(check, install, background, json).await;
     }
+    if let Some(Commands::Schema { command }) = cli.command {
+        return schema::run_command(command, &cli.project, json);
+    }
 
     ensure_daemon().await?;
     if let Some(Commands::Workspace { command }) = cli.command {
@@ -394,6 +411,7 @@ async fn run(cli: Cli) -> Result<()> {
         | Commands::Auth { .. }
         | Commands::Workspace { .. }
         | Commands::Service { .. }
+        | Commands::Schema { .. }
         | Commands::Upgrade { .. } => unreachable!(),
     }
 }
@@ -428,6 +446,14 @@ mod tests {
         assert_eq!(unregister.session.as_deref(), Some("api"));
         let upgrade = Cli::try_parse_from(["taskdeck", "upgrade", "--check"]).unwrap();
         assert!(matches!(upgrade.command, Some(Commands::Upgrade { check: true, .. })));
+
+        let schema_check = Cli::try_parse_from(["taskdeck", "schema", "check"]).unwrap();
+        assert!(matches!(
+            schema_check.command,
+            Some(Commands::Schema {
+                command: SchemaCommands::Check
+            })
+        ));
     }
 
     #[test]

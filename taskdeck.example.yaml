@@ -1,3 +1,5 @@
+# Schema used by YAML editor integrations. Older files may omit this key.
+$schema: https://aczeccssa.github.io/taskdeck/schema.json
 version: 1
 session: my-project
 

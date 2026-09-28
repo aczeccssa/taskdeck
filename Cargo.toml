@@ -20,6 +20,7 @@ crossterm = "0.29"
 fs2 = "0.4"
 futures-util = "0.3.33"
 json5 = "0.4"
+jsonschema = { version = "0.33.0", default-features = false }
 ratatui = { version = "0.26", features = ["crossterm"] }
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

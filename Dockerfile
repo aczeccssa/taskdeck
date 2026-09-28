@@ -8,6 +8,7 @@ COPY Cargo.toml Cargo.lock build.rs ./
 COPY frontend/package.json frontend/bun.lock ./frontend/
 RUN bun install --cwd frontend --frozen-lockfile
 COPY src ./src
+COPY docs-site/public/schema.json ./docs-site/public/schema.json
 COPY frontend ./frontend
 RUN cargo build --locked --release
 

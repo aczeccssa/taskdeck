@@ -6,6 +6,7 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-env-changed=BUN");
     println!("cargo:rerun-if-env-changed=TASKDECK_FRONTEND_SKIP_INSTALL");
+    println!("cargo:rerun-if-changed=docs-site/public/schema.json");
     for path in [
         "frontend/package.json",
         "frontend/bun.lock",
