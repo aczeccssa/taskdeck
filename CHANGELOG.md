@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0] - 2026-09-28
+
+### Added
+
+- `taskdeck.yaml` is validated against a published JSON Schema 1.0.0. The same document is embedded in the binary at build time and published with the documentation site, so editor integrations and the CLI share one source of truth. `taskdeck schema check` resolves the schema from the published document, then a valid cache, then the bundled copy. `taskdeck schema update` downloads and atomically caches it, and refuses to overwrite a newer cache with an older version. Configuration loading validates offline and never requires network access. `taskdeck init` writes `$schema` into new files; files without it stay compatible, and unknown extension fields remain allowed. Schema metadata carries its own `x-taskdeck-schema-version`, currently 1.0.0, independent of the binary version.
+- One-line installers for release archives: `curl -fsSL https://raw.githubusercontent.com/aczeccssa/taskdeck/master/scripts/install.sh | bash` on Linux and macOS, and `irm https://raw.githubusercontent.com/aczeccssa/taskdeck/master/scripts/install.ps1 | iex` on Windows. Each selects the matching platform archive, verifies its SHA256 checksum before installing, stops an existing daemon, and stages the new binary so a failed download cannot leave a half-written executable. `install-local.sh` and `install-local.ps1` remain the from-source path.
+
+### Operations and security
+
+- The installers refuse unsupported platforms and point at the right alternative instead of guessing. `TASKDECK_VERSION`, `TASKDECK_INSTALL_DIR`, `TASKDECK_RELEASES_URL` and `TASKDECK_REPOSITORY` override the defaults, and the PowerShell installer records the install directory on the user PATH on a first install.
+- `scripts/test-install-docker.sh` and `scripts/test-install-powershell.ps1` exercise both installers against a local release fixture: the happy path and rejection of a bad checksum. All release traffic stays on localhost, so the smoke tests need no network access.
+
 ## [0.2.0] - 2026-09-24
 
 ### Changed
