@@ -6,6 +6,25 @@ function Assert-True {
 }
 
 $installerPath = Join-Path $PSScriptRoot 'install.ps1'
+
+# The fixture server needs a working Python 3 interpreter. Prefer a real installation and
+# keep the Microsoft Store App Execution Alias as a last resort: that stub lives under
+# WindowsApps, resolves through Get-Command, but cannot actually be launched.
+$python = $null
+$storeStub = $null
+foreach ($candidate in 'python3', 'python', 'py') {
+    $command = Get-Command $candidate -ErrorAction SilentlyContinue
+    if (-not $command) { continue }
+    if ($command.Source -like '*\WindowsApps\*') {
+        if (-not $storeStub) { $storeStub = $command.Source }
+        continue
+    }
+    $python = $command.Source
+    break
+}
+if (-not $python) { $python = $storeStub }
+if (-not $python) { throw 'A Python 3 interpreter is required to serve the local release fixture' }
+
 $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
 $target = switch ($architecture) {
     'X64' { 'x86_64-pc-windows-msvc' }
@@ -38,13 +57,19 @@ try {
     $listener.Start()
     $port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
     $listener.Stop()
-    $serverProcess = Start-Process -FilePath 'python3' -ArgumentList @('-m', 'http.server', "$port", '--bind', '127.0.0.1', '--directory', $fixtureRoot) `
-        -PassThru -RedirectStandardOutput $serverOutput -RedirectStandardError $serverError
+    # Redirect stdin as well. A process that inherits the caller's stdin keeps that
+    # handle open, which stops a wrapping ssh session or CI job from ever exiting.
+    $stdinNull = Join-Path $temporaryRoot 'stdin.null'
+    Set-Content -LiteralPath $stdinNull -Value '' -NoNewline -Encoding Ascii
+    $serverProcess = Start-Process -FilePath $python -ArgumentList @('-m', 'http.server', "$port", '--bind', '127.0.0.1', '--directory', $fixtureRoot) `
+        -PassThru -RedirectStandardOutput $serverOutput -RedirectStandardError $serverError -RedirectStandardInput $stdinNull
     $serverUrl = "http://127.0.0.1:$port"
     $serverReady = $false
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
         try {
-            $null = Invoke-WebRequest -Uri "$serverUrl/latest.json" -TimeoutSec 1
+            # -UseBasicParsing skips the Internet Explorer engine, which is unavailable in a
+            # headless session and would make every probe fail even with the server running.
+            $null = Invoke-WebRequest -Uri "$serverUrl/latest.json" -TimeoutSec 1 -UseBasicParsing
             $serverReady = $true
             break
         } catch { Start-Sleep -Milliseconds 200 }
@@ -86,6 +111,9 @@ finally {
     foreach ($name in $oldEnvironment.Keys) {
         [Environment]::SetEnvironmentVariable($name, $oldEnvironment[$name], 'Process')
     }
-    if ($serverProcess -and -not $serverProcess.HasExited) { Stop-Process -Id $serverProcess.Id -Force }
+    # /T kills the whole tree. `Stop-Process -Id` alone leaves the interpreter running
+    # whenever it was resolved through a launcher, and that orphan keeps the temp files
+    # open, so the recursive delete below would fail with an IOException.
+    if ($serverProcess) { & taskkill /PID $serverProcess.Id /T /F *> $null }
     if (Test-Path -LiteralPath $temporaryRoot) { Remove-Item -LiteralPath $temporaryRoot -Recurse -Force }
 }
